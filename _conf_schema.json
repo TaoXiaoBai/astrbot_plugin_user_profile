@@ -1,0 +1,50 @@
+{
+  "basic": {
+    "description": "基础",
+    "type": "object",
+    "items": {
+      "public_query": {
+        "description": "公开查询",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后任何人都能用 /画像 查别人；关闭则仅管理员可用"
+      },
+      "passive_collect": {
+        "description": "被动采集发言",
+        "type": "bool",
+        "default": true,
+        "hint": "静默统计每个 QQ 的发言数与原话；关闭后不再采集，已有数据保留"
+      },
+      "max_tracked_users": {
+        "description": "最多跟踪人数",
+        "type": "int",
+        "default": 5000,
+        "hint": "超过后自动清掉最不活跃的用户，防数据无限涨"
+      }
+    }
+  },
+  "profile": {
+    "description": "画像生成",
+    "type": "object",
+    "items": {
+      "llm_summary": {
+        "description": "LLM 印象小结",
+        "type": "bool",
+        "default": true,
+        "hint": "查询时把最近原话浓缩成 100 字印象；发言数没变就用缓存，不重复花钱"
+      },
+      "llm_provider_id": {
+        "description": "小结用模型",
+        "type": "string",
+        "default": "",
+        "hint": "生成印象小结用的 LLM，留空用 AstrBot 默认模型"
+      },
+      "quote_keep": {
+        "description": "原话保留条数",
+        "type": "int",
+        "default": 10,
+        "hint": "每个 QQ 保留最近多少条发言原话"
+      }
+    }
+  }
+}
