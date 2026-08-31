@@ -28,8 +28,6 @@ INVITE_GUARD_PLUGIN_ID = "kimi/astrbot_plugin_group_invite_guard"
 QQ_TOOLS_STAR_NAME = "astrbot_plugin_qq_tools"
 
 _QUOTE_MAX_LEN = 200  # 单条原话最长保留字符数
-_FLUSH_INTERVAL_SEC = 60  # 内存统计落盘间隔
-_SUMMARY_MAX_CHARS = 100  # LLM 印象小结字数上限
 _HISTORY_QUOTE_KEEP = 10  # 会话历史补充原话的最大条数
 
 _STATS_KEY = "up_stats"
@@ -69,7 +67,7 @@ def _new_stat() -> dict:
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "公开可查的 QQ 用户画像：被动采集发言统计与原话，LLM 浓缩印象小结，联动加群邀请守卫的前科记录",
+    "独立的 QQ 用户画像分析：被动采集发言统计、LLM 印象小结、活跃度与原话摘录；可深度联动加群邀请守卫的前科与黑名单记录",
     "1.0.0",
 )
 class UserProfilePlugin(Star):
@@ -83,6 +81,9 @@ class UserProfilePlugin(Star):
         self._store_lock = asyncio.Lock()
         self._summary_lock = asyncio.Lock()  # 防止并发查询重复调 LLM
 
+    def _enabled(self) -> bool:
+        return bool(self.config.get("enable", True))
+
     # ---------------- 被动采集（零 LLM 零网络） ----------------
 
     @filter.event_message_type(
@@ -90,6 +91,8 @@ class UserProfilePlugin(Star):
     )
     async def on_message(self, event: AstrMessageEvent):
         """静默统计每个 QQ 的发言；不打断事件，不影响正常回复流程。"""
+        if not self._enabled():
+            return
         if not self.config.get("passive_collect", True):
             return
         qq = str(event.get_sender_id() or "").strip()
@@ -100,8 +103,13 @@ class UserProfilePlugin(Star):
         if self_id and self_id == qq:
             return
 
-        text = (event.get_message_str() or "").strip()
         group_id = str(event.get_group_id() or "").strip()
+        if not group_id and not self.config.get("collect_private", True):
+            return
+        if group_id and not self._group_allowed(group_id):
+            return
+
+        text = (event.get_message_str() or "").strip()
         now = int(time.time())
 
         await self._ensure_loaded()
@@ -144,6 +152,8 @@ class UserProfilePlugin(Star):
 
     @filter.command("画像")
     async def profile_command(self, event: AstrMessageEvent):
+        if not self._enabled():
+            return
         text = (event.get_message_str() or "").strip()
         match = re.search(r"\d{5,12}", text)
         if not match:
@@ -162,15 +172,11 @@ class UserProfilePlugin(Star):
                 pass  # is_admin 不可用时按公开处理
 
         profile = await self._build_profile(qq, event)
+        chain = [Plain(profile)]
+        if self.config.get("show_avatar", True):
+            chain.insert(0, Image.fromURL(f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"))
         try:
-            await event.send(
-                MessageChain(
-                    chain=[
-                        Image.fromURL(f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"),
-                        Plain(profile),
-                    ]
-                )
-            )
+            await event.send(MessageChain(chain=chain))
         except Exception:
             # 头像发不出来（非 QQ 平台/网络问题）时回退纯文本
             try:
@@ -180,8 +186,10 @@ class UserProfilePlugin(Star):
 
     @filter.llm_tool(name="user_profile_query")
     async def user_profile_query(self, event, qq: str):
-        """查询指定 QQ 号用户的画像：发言活跃度、发言风格印象、加群邀请守卫前科与黑名单记录。需要了解某个 QQ 用户的背景时调用。"""
+        """查询指定 QQ 号用户的画像：发言活跃度、发言风格印象、以及（若装了加群邀请守卫）邀请前科与黑名单记录。需要了解某个 QQ 用户的背景时调用。"""
         event = _unwrap_event(event)
+        if not self._enabled():
+            return "用户画像插件当前未启用。"
         qq = str(qq or "").strip()
         if not re.fullmatch(r"\d{5,12}", qq):
             return "查询失败：请提供 5-12 位纯数字 QQ 号。"
@@ -207,7 +215,7 @@ class UserProfilePlugin(Star):
 
         # 自己没采集到时，用 AstrBot 会话历史补充原话
         history_lines = []
-        if not quotes:
+        if not quotes and self.config.get("history_fallback", True):
             history_lines = await self._search_history_quotes(qq)
 
         summary = ""
@@ -249,6 +257,8 @@ class UserProfilePlugin(Star):
         event 可传 None：缺少 OneBot 上下文时自动跳过昵称/头像段。
         未采集到该用户任何数据时返回空字符串（方便调用方拼 prompt 时判空）。
         """
+        if not self._enabled():
+            return ""
         qq = str(qq or "").strip()
         if not re.fullmatch(r"\d{5,12}", qq):
             return ""
@@ -279,7 +289,7 @@ class UserProfilePlugin(Star):
         if summary:
             parts.append(f"印象小结：{summary}")
         if quotes:
-            shown = quotes[-5:]
+            shown = quotes[-self._quote_show() :]
             lines = [
                 f"[{_fmt_time(q.get('t'))}] ({q.get('src')}) {q.get('text')}"
                 for q in shown
@@ -329,7 +339,7 @@ class UserProfilePlugin(Star):
             )
             prompt = (
                 f"以下是 QQ 用户 {qq} 的最近发言摘录：\n{material}\n\n"
-                f"请用不超过 {_SUMMARY_MAX_CHARS} 字概括这个人的发言风格和给人的印象，"
+                f"请用不超过 {self._summary_max_chars()} 字概括这个人的发言风格和给人的印象，"
                 "只输出小结本身，不要解释，不要任何前缀。"
             )
             try:
@@ -355,7 +365,7 @@ class UserProfilePlugin(Star):
 
     async def _load_invite_guard_records(self, qq: str) -> list:
         """读取加群邀请守卫的邀请/拉群/禁言记录中与此 QQ 相关的条目；未装守卫或读取失败返回空。"""
-        if sp is None:
+        if sp is None or not self.config.get("link_invite_guard", True):
             return []
         try:
             if self.context.get_registered_star(INVITE_GUARD_STAR_NAME) is None:
@@ -405,6 +415,8 @@ class UserProfilePlugin(Star):
 
     async def _load_ban_entry(self, qq: str) -> list:
         """读取 qq_tools 黑名单中此 QQ 的条目；未装 qq_tools 或读取失败返回空。"""
+        if not self.config.get("link_qq_tools_ban", True):
+            return []
         try:
             md = self.context.get_registered_star(QQ_TOOLS_STAR_NAME)
         except Exception as exc:
@@ -525,7 +537,7 @@ class UserProfilePlugin(Star):
 
     async def _flush_loop(self):
         while True:
-            await asyncio.sleep(_FLUSH_INTERVAL_SEC)
+            await asyncio.sleep(self._flush_interval())
             try:
                 await self._flush()
             except asyncio.CancelledError:
@@ -551,7 +563,7 @@ class UserProfilePlugin(Star):
         except Exception as exc:
             logger.warning(f"user_profile: final flush failed: {exc}")
 
-    # ---------------- 工具 ----------------
+    # ---------------- 配置读取 ----------------
 
     def _quote_keep(self) -> int:
         try:
@@ -559,11 +571,37 @@ class UserProfilePlugin(Star):
         except (TypeError, ValueError):
             return 10
 
+    def _quote_show(self) -> int:
+        try:
+            return max(1, int(self.config.get("quote_show", 5) or 5))
+        except (TypeError, ValueError):
+            return 5
+
+    def _summary_max_chars(self) -> int:
+        try:
+            return max(20, int(self.config.get("summary_max_chars", 100) or 100))
+        except (TypeError, ValueError):
+            return 100
+
     def _max_tracked(self) -> int:
         try:
             return max(100, int(self.config.get("max_tracked_users", 5000) or 5000))
         except (TypeError, ValueError):
             return 5000
+
+    def _flush_interval(self) -> int:
+        try:
+            return max(10, int(self.config.get("flush_interval", 60) or 60))
+        except (TypeError, ValueError):
+            return 60
+
+    def _group_allowed(self, group_id: str) -> bool:
+        """配置了采集群列表时，只采集列表内的群；留空采集全部。"""
+        raw = str(self.config.get("collect_groups", "") or "")
+        if not raw.strip():
+            return True
+        allow = {g.strip() for g in re.split(r"[,，\s]+", raw) if g.strip()}
+        return group_id in allow
 
     def _prune_oldest(self, cap: int):
         """按最近活跃时间清掉最不活跃的用户直到规模回到 cap。调用方需持有 _store_lock。"""
@@ -577,6 +615,8 @@ class UserProfilePlugin(Star):
             self._stats.pop(old_qq, None)
             if self._quotes is not None:
                 self._quotes.pop(old_qq, None)
+
+    # ---------------- 工具 ----------------
 
     async def _fetch_stranger_info(self, qq: str, event) -> dict | None:
         """取昵称等信息（OneBot get_stranger_info）；非 OneBot 平台或失败返回 None。"""

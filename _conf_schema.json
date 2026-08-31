@@ -3,23 +3,65 @@
     "description": "基础",
     "type": "object",
     "items": {
+      "enable": {
+        "description": "启用插件",
+        "type": "bool",
+        "default": true,
+        "hint": "总开关；关闭后停止采集、/画像 与 LLM 工具都不再响应"
+      },
       "public_query": {
         "description": "公开查询",
         "type": "bool",
         "default": true,
         "hint": "开启后任何人都能用 /画像 查别人；关闭则仅管理员可用"
       },
+      "show_avatar": {
+        "description": "回复带头像",
+        "type": "bool",
+        "default": true,
+        "hint": "/画像 回复里附上对方 QQ 头像；非 QQ 平台发不出来会自动回退纯文本"
+      }
+    }
+  },
+  "collect": {
+    "description": "数据采集",
+    "type": "object",
+    "items": {
       "passive_collect": {
         "description": "被动采集发言",
         "type": "bool",
         "default": true,
         "hint": "静默统计每个 QQ 的发言数与原话；关闭后不再采集，已有数据保留"
       },
+      "collect_private": {
+        "description": "采集私聊",
+        "type": "bool",
+        "default": true,
+        "hint": "是否统计私聊发言；在意隐私可关掉，只留群聊"
+      },
+      "collect_groups": {
+        "description": "采集群列表",
+        "type": "string",
+        "default": "",
+        "hint": "只采集这些群，逗号分隔群号；留空采集全部群"
+      },
+      "quote_keep": {
+        "description": "原话保留条数",
+        "type": "int",
+        "default": 10,
+        "hint": "每个 QQ 保留最近多少条发言原话"
+      },
       "max_tracked_users": {
         "description": "最多跟踪人数",
         "type": "int",
         "default": 5000,
         "hint": "超过后自动清掉最不活跃的用户，防数据无限涨"
+      },
+      "flush_interval": {
+        "description": "落盘间隔（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "采集数据先攒在内存，每隔这么久批量写入一次磁盘"
       }
     }
   },
@@ -31,7 +73,7 @@
         "description": "LLM 印象小结",
         "type": "bool",
         "default": true,
-        "hint": "查询时把最近原话浓缩成 100 字印象；发言数没变就用缓存，不重复花钱"
+        "hint": "查询时把最近原话浓缩成印象小结；发言数没变就用缓存，不重复花钱"
       },
       "llm_provider_id": {
         "description": "小结用模型",
@@ -39,11 +81,41 @@
         "default": "",
         "hint": "生成印象小结用的 LLM，留空用 AstrBot 默认模型"
       },
-      "quote_keep": {
-        "description": "原话保留条数",
+      "summary_max_chars": {
+        "description": "小结字数上限",
         "type": "int",
-        "default": 10,
-        "hint": "每个 QQ 保留最近多少条发言原话"
+        "default": 100,
+        "hint": "印象小结最多多少字"
+      },
+      "quote_show": {
+        "description": "原话展示条数",
+        "type": "int",
+        "default": 5,
+        "hint": "画像里展示最近几条发言摘录"
+      },
+      "history_fallback": {
+        "description": "会话历史补充",
+        "type": "bool",
+        "default": true,
+        "hint": "自己没采集到此人时，改用 AstrBot 会话历史搜 TA 的发言原话"
+      }
+    }
+  },
+  "link": {
+    "description": "插件联动",
+    "type": "object",
+    "items": {
+      "link_invite_guard": {
+        "description": "联动邀请守卫",
+        "type": "bool",
+        "default": true,
+        "hint": "画像里显示加群邀请守卫记录的邀请/拉群/被禁言前科；没装该插件自动跳过"
+      },
+      "link_qq_tools_ban": {
+        "description": "联动黑名单",
+        "type": "bool",
+        "default": true,
+        "hint": "画像里显示 qq_tools 黑名单中此人的条目（含原因）；没装自动跳过"
       }
     }
   }

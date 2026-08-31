@@ -1,5 +1,5 @@
 name: astrbot_plugin_user_profile
-desc: 公开可查的 QQ 用户画像：被动采集发言统计与原话，LLM 浓缩印象小结；装了加群邀请守卫时自动联动其邀请/被禁言/黑名单前科记录
+desc: 独立的 QQ 用户画像分析：被动采集发言统计与原话，LLM 浓缩印象小结，活跃度一目了然；可深度联动加群邀请守卫的前科与黑名单记录
 author: Kimi
 version: 1.0.0
 display_name: 用户画像
