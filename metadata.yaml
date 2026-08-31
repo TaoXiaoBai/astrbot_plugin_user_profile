@@ -1,9 +1,9 @@
 name: astrbot_plugin_user_profile
-desc: 独立的 QQ 用户画像分析：被动采集发言统计与原话，LLM 浓缩印象小结，活跃度一目了然；可深度联动加群邀请守卫的前科与黑名单记录
+desc: QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，按规则快速打上活跃度、风险、社交等基础标签，再由 LLM 打语义标签，供加群邀请守卫等插件在决策时调用
 author: Kimi
-version: 1.0.0
+version: 1.1.0
 display_name: 用户画像
-short_desc: 发言统计 + LLM 印象 + 前科联动
+short_desc: 发言统计 + 自动标签 + 邀请守卫联动
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.16"

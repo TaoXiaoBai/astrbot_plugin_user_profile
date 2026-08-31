@@ -65,39 +65,57 @@
       }
     }
   },
-  "profile": {
-    "description": "画像生成",
+  "tags": {
+    "description": "标签生成",
     "type": "object",
     "items": {
-      "llm_summary": {
-        "description": "LLM 印象小结",
+      "llm_tags": {
+        "description": "LLM 语义标签",
         "type": "bool",
         "default": true,
-        "hint": "查询时把最近原话浓缩成印象小结；发言数没变就用缓存，不重复花钱"
+        "hint": "由 LLM 根据最近原话自动打 spam_suspect / ad_suspect / troll 等语义标签；发言数没变就用缓存"
       },
       "llm_provider_id": {
-        "description": "小结用模型",
+        "description": "标签用模型",
         "type": "string",
         "default": "",
-        "hint": "生成印象小结用的 LLM，留空用 AstrBot 默认模型"
-      },
-      "summary_max_chars": {
-        "description": "小结字数上限",
-        "type": "int",
-        "default": 100,
-        "hint": "印象小结最多多少字"
+        "hint": "生成 LLM 标签用的模型，留空用 AstrBot 默认模型"
       },
       "quote_show": {
         "description": "原话展示条数",
         "type": "int",
         "default": 5,
-        "hint": "画像里展示最近几条发言摘录"
+        "hint": "/画像 里展示最近几条发言摘录"
       },
       "history_fallback": {
         "description": "会话历史补充",
         "type": "bool",
         "default": true,
         "hint": "自己没采集到此人时，改用 AstrBot 会话历史搜 TA 的发言原话"
+      },
+      "tag_active_high_threshold": {
+        "description": "高活跃阈值",
+        "type": "int",
+        "default": 100,
+        "hint": "累计发言数达到多少打 active_high 标签"
+      },
+      "tag_active_med_threshold": {
+        "description": "中活跃阈值",
+        "type": "int",
+        "default": 20,
+        "hint": "累计发言数达到多少打 active_medium 标签"
+      },
+      "tag_newcomer_days": {
+        "description": "新人判定天数",
+        "type": "int",
+        "default": 7,
+        "hint": "首次记录在多少天内打 newcomer 标签"
+      },
+      "tag_multi_group_threshold": {
+        "description": "多群判定阈值",
+        "type": "int",
+        "default": 3,
+        "hint": "活跃群数达到多少打 multi_group 标签"
       }
     }
   },
@@ -109,13 +127,13 @@
         "description": "联动邀请守卫",
         "type": "bool",
         "default": true,
-        "hint": "画像里显示加群邀请守卫记录的邀请/拉群/被禁言前科；没装该插件自动跳过"
+        "hint": "读取加群邀请守卫的前科记录生成 ban_history / frequent_inviter 等标签；没装该插件自动跳过"
       },
       "link_qq_tools_ban": {
         "description": "联动黑名单",
         "type": "bool",
         "default": true,
-        "hint": "画像里显示 qq_tools 黑名单中此人的条目（含原因）；没装自动跳过"
+        "hint": "读取 qq_tools 黑名单生成 ban_history 标签；没装自动跳过"
       }
     }
   }
