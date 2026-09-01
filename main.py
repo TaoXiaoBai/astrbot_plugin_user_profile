@@ -1,7 +1,11 @@
 import asyncio
+import base64
 import inspect
+import io
 import json
+import os
 import re
+import textwrap
 import time
 from datetime import datetime
 from typing import Any
@@ -21,6 +25,13 @@ try:
 except Exception:  # 兼容旧版 / 内部 API 缺失
     ContextWrapper = None
 
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
 
 # 加群邀请守卫的 plugin_id（author/name 全小写，见 StarMetadata.plugin_id）
 INVITE_GUARD_STAR_NAME = "astrbot_plugin_group_invite_guard"
@@ -34,6 +45,89 @@ _STATS_KEY = "up_stats"
 _QUOTES_KEY = "up_quotes"
 _TAGS_KEY = "up_tags"
 
+# 标签人类可读名（对 LLM 和人类都友好）
+_TAG_DISPLAY_NAMES = {
+    "active_high": "高活跃",
+    "active_medium": "较活跃",
+    "active_low": "低活跃",
+    "newcomer": "新人",
+    "long_inactive": "长期沉寂",
+    "multi_group": "多群出现",
+    "private_active": "私聊活跃",
+    "ban_history": "黑名单记录",
+    "kick_history": "拉群前科",
+    "mute_history": "禁言前科",
+    "frequent_inviter": "频繁邀请",
+    "inviter": "曾邀请进群",
+    "invite_rejected": "邀请被拒",
+    "image_spammer": "图片刷屏",
+    "link_spammer": "链接刷屏",
+    "qr_spammer": "二维码刷屏",
+    "mention_heavy": "频繁@人",
+    "verbose": "话痨",
+    "night_active": "夜间活跃",
+    "spam_suspect": "刷屏嫌疑",
+    "ad_suspect": "广告嫌疑",
+    "troll": "抬杠/钓鱼",
+    "friendly": "语气友好",
+    "helpful": "乐于助人",
+    "nsfw_tendency": "不适宜内容",
+    "political_sensitive": "敏感倾向",
+    "scam_suspect": "诈骗嫌疑",
+    "repetitive": "重复内容",
+    "normal": "表现正常",
+}
+
+# 默认风险权重：正数为风险，负数为信任
+_RISK_WEIGHTS_DEFAULT = {
+    "ban_history": 40,
+    "invite_rejected": 25,
+    "kick_history": 25,
+    "mute_history": 20,
+    "frequent_inviter": 20,
+    "ad_suspect": 20,
+    "scam_suspect": 20,
+    "spam_suspect": 15,
+    "troll": 15,
+    "nsfw_tendency": 15,
+    "political_sensitive": 15,
+    "qr_spammer": 15,
+    "link_spammer": 10,
+    "image_spammer": 10,
+    "newcomer": 5,
+    "private_active": 5,
+    "night_active": 5,
+    "active_high": -5,
+    "active_medium": -5,
+    "helpful": -10,
+    "friendly": -10,
+    "normal": -15,
+}
+
+
+def _tag_display(tag: str) -> str:
+    return _TAG_DISPLAY_NAMES.get(tag, tag)
+
+
+def _risk_level(score: int, cfg: dict) -> str:
+    if score >= int(cfg.get("risk_level_extreme", 80) or 80):
+        return "极高"
+    if score >= int(cfg.get("risk_level_high", 60) or 60):
+        return "高"
+    if score >= int(cfg.get("risk_level_low", 30) or 30):
+        return "中"
+    return "低"
+
+
+def _risk_color(score: int) -> str:
+    if score >= 80:
+        return "#d32f2f"
+    if score >= 60:
+        return "#f57c00"
+    if score >= 30:
+        return "#fbc02d"
+    return "#388e3c"
+
 
 class TagEngine:
     """标签生成引擎：把原始统计、原话、前科转换成结构化标签。"""
@@ -42,7 +136,7 @@ class TagEngine:
         self.config = config or {}
 
     def generate_base_tags(self, qq: str, st: dict, quotes: list, guard_records: dict, ban_lines: list) -> list[dict]:
-        """零 LLM、零网络，从统计和规则里秒出基础标签。"""
+        """零 LLM、零网络，从统计和行为规则里秒出基础标签。"""
         st = st or {}
         tags = []
         now = int(time.time())
@@ -83,6 +177,40 @@ class TagEngine:
         # 沉寂/回归
         if last_seen and (now - last_seen) > 30 * 86400:
             tags.append(self._tag("long_inactive", 0.75, "stats", f"最近发言 {_fmt_time(last_seen)}"))
+
+        # 内容/行为信号标签
+        if total > 0:
+            images = int(st.get("images") or 0)
+            links = int(st.get("links") or 0)
+            qrs = int(st.get("qrs") or 0)
+            mentions = int(st.get("mentions") or 0)
+            total_chars = int(st.get("total_chars") or 0)
+            night_count = int(st.get("night_count") or 0)
+
+            img_ratio = images / total
+            link_ratio = links / total
+            mention_ratio = mentions / total
+            night_ratio = night_count / total
+            avg_len = total_chars / total
+
+            img_th = float(self.config.get("tag_image_threshold", 0.5) or 0.5)
+            link_th = float(self.config.get("tag_link_threshold", 0.3) or 0.3)
+            mention_th = float(self.config.get("tag_mention_threshold", 0.3) or 0.3)
+            verbose_th = float(self.config.get("tag_verbose_threshold", 80) or 80)
+            night_th = float(self.config.get("tag_night_threshold", 0.3) or 0.3)
+
+            if img_ratio >= img_th:
+                tags.append(self._tag("image_spammer", round(min(0.5 + img_ratio, 0.95), 2), "stats", f"图片消息占比 {img_ratio:.0%}"))
+            if link_ratio >= link_th:
+                tags.append(self._tag("link_spammer", round(min(0.5 + link_ratio, 0.95), 2), "stats", f"含链接消息 {links} 条"))
+            if qrs > 0:
+                tags.append(self._tag("qr_spammer", 0.75, "stats", f"检测到二维码相关内容 {qrs} 次"))
+            if mention_ratio >= mention_th:
+                tags.append(self._tag("mention_heavy", round(min(0.5 + mention_ratio, 0.95), 2), "stats", f"含@消息 {mentions} 条"))
+            if avg_len >= verbose_th:
+                tags.append(self._tag("verbose", 0.7, "stats", f"平均消息长度 {avg_len:.0f} 字"))
+            if night_ratio >= night_th:
+                tags.append(self._tag("night_active", round(min(0.5 + night_ratio, 0.9), 2), "stats", f"夜间发言 {night_count} 条"))
 
         # 风险前科标签
         invite_records = guard_records.get("invite") or {}
@@ -148,12 +276,23 @@ class TagEngine:
         material = "\n".join(
             f"- {q.get('text')}" for q in quotes[-20:] if q.get("text")
         )
-        base_desc = ", ".join(t["tag"] for t in base_tags[:8]) or "无"
+        base_desc = ", ".join(f"{_tag_display(t['tag'])}({t['confidence']})" for t in base_tags[:8]) or "无"
+
+        # 行为信号补充
+        signals = []
+        total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
+        if total > 0:
+            signals.append(f"图片消息占比 {int(st.get('images') or 0) / total:.0%}")
+            signals.append(f"含链接消息占比 {int(st.get('links') or 0) / total:.0%}")
+            signals.append(f"含@消息占比 {int(st.get('mentions') or 0) / total:.0%}")
+            signals.append(f"夜间发言占比 {int(st.get('night_count') or 0) / total:.0%}")
+        signal_text = "；".join(signals) if signals else "无额外信号"
 
         prompt = (
             f"你正在为一个 QQ 用户打标签，用于辅助判断此人进群是否有风险。\n"
             f"QQ: {qq}\n"
             f"基础统计标签：{base_desc}\n"
+            f"行为信号：{signal_text}\n"
             f"最近发言摘录（按时间从早到晚）：\n{material}\n\n"
             "请从以下维度中挑选 0-5 个最显著的标签返回 JSON 数组，不要返回任何解释：\n"
             "- spam_suspect（刷屏/垃圾信息嫌疑）\n"
@@ -246,14 +385,20 @@ def _new_stat() -> dict:
         "p_count": 0,
         "p_first": 0,
         "p_last": 0,
+        "images": 0,
+        "links": 0,
+        "qrs": 0,
+        "mentions": 0,
+        "total_chars": 0,
+        "night_count": 0,
     }
 
 
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，供加群邀请守卫等插件在决策时调用",
-    "1.1.0",
+    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，供加群邀请守卫等插件决策调用",
+    "1.2.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -261,11 +406,10 @@ class UserProfilePlugin(Star):
         self.config = config or {}
         self._stats: dict | None = None  # qq -> 统计（懒加载，定期落盘）
         self._quotes: dict | None = None  # qq -> 最近原话列表
-        self._tags: dict | None = None  # qq -> 标签缓存
         self._dirty = False
         self._flush_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
-        self._tag_lock = asyncio.Lock()  # 防止并发查询重复调 LLM 打标签
+        self._tag_lock = asyncio.Lock()  # 防止并发查询重复调 LLM
         self._tag_engine = TagEngine(self.config)
 
     def _enabled(self) -> bool:
@@ -298,6 +442,7 @@ class UserProfilePlugin(Star):
 
         text = (event.get_message_str() or "").strip()
         now = int(time.time())
+        hour = datetime.fromtimestamp(now).hour
 
         await self._ensure_loaded()
         async with self._store_lock:
@@ -314,6 +459,20 @@ class UserProfilePlugin(Star):
                 st["p_last"] = now
                 if not st.get("p_first"):
                     st["p_first"] = now
+
+            # 内容信号统计
+            if text:
+                st["total_chars"] = int(st.get("total_chars") or 0) + len(text)
+                st["links"] = int(st.get("links") or 0) + len(re.findall(r"https?://\S+|www\.\S+", text))
+                st["qrs"] = int(st.get("qrs") or 0) + (1 if re.search(r"二维码|qr.?code|qrcode", text, re.I) else 0)
+                st["mentions"] = int(st.get("mentions") or 0) + len(re.findall(r"[@＠]\w+", text))
+            else:
+                # 空文本大概率是图片/表情/文件等富媒体
+                st["images"] = int(st.get("images") or 0) + 1
+
+            # 夜间活跃：0-5 点
+            if 0 <= hour < 6:
+                st["night_count"] = int(st.get("night_count") or 0) + 1
 
             if text and not text.startswith("/"):
                 if len(text) > _QUOTE_MAX_LEN:
@@ -359,45 +518,47 @@ class UserProfilePlugin(Star):
                 pass  # is_admin 不可用时按公开处理
 
         profile = await self._build_profile_text(qq, event)
-        chain = [Plain(profile)]
-        if self.config.get("show_avatar", True):
-            chain.insert(0, Image.fromURL(f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"))
+        chain = await self._render_message_chain(qq, profile, event)
         try:
             await event.send(MessageChain(chain=chain))
-        except Exception:
-            # 头像发不出来（非 QQ 平台/网络问题）时回退纯文本
+        except Exception as exc:
+            logger.error(f"user_profile: send profile failed: {exc}")
             try:
                 await event.send(MessageChain(chain=[Plain(profile)]))
-            except Exception as exc:
-                logger.error(f"user_profile: send profile failed: {exc}")
+            except Exception as exc2:
+                logger.error(f"user_profile: fallback send failed: {exc2}")
 
     @filter.llm_tool(name="user_profile_query")
     async def user_profile_query(self, event, qq: str):
-        """查询指定 QQ 号用户的画像标签：活跃度、风险标签、LLM 语义标签。用于判断该用户是否可信、是否适合进群。需要了解某个 QQ 用户的背景时调用。"""
+        """查询指定 QQ 号用户的画像标签与综合风险分：活跃度、风险标签、LLM 语义标签。用于判断该用户是否可信、是否适合进群。需要了解某个 QQ 用户的背景时调用。"""
         event = _unwrap_event(event)
         if not self._enabled():
             return "用户画像插件当前未启用。"
         qq = str(qq or "").strip()
         if not re.fullmatch(r"\d{5,12}", qq):
             return "查询失败：请提供 5-12 位纯数字 QQ 号。"
-        tags = await self.get_profile_tags(qq, event)
+        result = await self.get_profile_tags_with_score(qq, event)
+        tags = result.get("tags") or []
         if not tags:
             return f"QQ {qq} 暂无画像记录。"
-        lines = [f"QQ {qq} 的标签："]
+        lines = [
+            f"QQ {qq} 的综合风险分：{result['score']}（{result['level']}）",
+            "标签：",
+        ]
         for t in tags:
-            lines.append(f"- {t['tag']}（置信度 {t['confidence']}，来源 {t['source']}）{t.get('evidence', '')}")
+            lines.append(f"- {_tag_display(t['tag'])}（置信度 {t['confidence']}，来源 {t['source']}）{t.get('evidence', '')}")
         return "\n".join(lines)
 
     # ---------------- 画像组装 ----------------
 
     async def _build_profile_text(self, qq: str, event) -> str:
         """给 /画像 命令用：返回人类可读文本。"""
-        tags = await self.get_profile_tags(qq, event)
+        result = await self.get_profile_tags_with_score(qq, event)
+        tags = result.get("tags") or []
         if not tags:
             return f"【用户画像】QQ {qq}\n暂无记录：未采集到该用户的发言，也没有前科数据。"
 
         await self._ensure_loaded()
-        st = self._quotes.get(qq) or {}
 
         base = [t for t in tags if t["source"] != "llm"]
         llm = [t for t in tags if t["source"] == "llm"]
@@ -410,17 +571,20 @@ class UserProfilePlugin(Star):
         if nickname:
             lines[0] += f"（{nickname}）"
 
+        # 风险分
+        lines.append(f"综合风险分：{result['score']} / 100（{result['level']}）")
+
         # 基础标签
         if base:
             tag_line = " | ".join(
-                f"{t['tag']}({int(t['confidence'] * 100)}%)" for t in base
+                f"{_tag_display(t['tag'])}({int(t['confidence'] * 100)}%)" for t in base
             )
             lines.append(f"基础标签：{tag_line}")
 
         # LLM 标签
         if llm:
             tag_line = " | ".join(
-                f"{t['tag']}({int(t['confidence'] * 100)}%)" for t in llm
+                f"{_tag_display(t['tag'])}({int(t['confidence'] * 100)}%)" for t in llm
             )
             lines.append(f"LLM 标签：{tag_line}")
 
@@ -446,7 +610,120 @@ class UserProfilePlugin(Star):
 
         return "\n\n".join(lines)
 
+    async def _render_message_chain(self, qq: str, profile_text: str, event) -> list:
+        """根据配置返回文本或图片消息链。"""
+        if not self.config.get("image_output", False):
+            return [Plain(profile_text)]
+        if not HAS_PIL:
+            return [Plain(profile_text + "\n\n[图片输出未启用：缺少 Pillow 依赖]")]
+        path = self._render_profile_image(qq, profile_text)
+        if path:
+            return [Image.fromFileSystem(path)]
+        return [Plain(profile_text)]
+
+    def _render_profile_image(self, qq: str, text: str) -> str | None:
+        """把画像文本渲染成图片，返回临时文件路径。"""
+        if not HAS_PIL:
+            return None
+        try:
+            width = 900
+            padding = 40
+            line_height = 34
+            title_height = 80
+
+            # 预估算行数
+            lines = text.splitlines()
+            wrapped = []
+            for line in lines:
+                if len(line) <= 50:
+                    wrapped.append(line)
+                else:
+                    wrapped.extend(textwrap.wrap(line, width=50))
+
+            height = max(500, title_height + len(wrapped) * line_height + padding * 2)
+
+            img = PILImage.new("RGB", (width, height), color=(250, 250, 250))
+            draw = ImageDraw.Draw(img)
+
+            # 字体
+            font_paths = [
+                "C:/Windows/Fonts/msyh.ttc",
+                "C:/Windows/Fonts/simhei.ttf",
+                "C:/Windows/Fonts/simsun.ttc",
+            ]
+            font = None
+            for fp in font_paths:
+                try:
+                    font = ImageFont.truetype(fp, 24)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+            try:
+                title_font = ImageFont.truetype(font_paths[0], 32) if font_paths else ImageFont.load_default()
+            except Exception:
+                title_font = font
+
+            # 标题背景
+            draw.rectangle([(0, 0), (width, title_height)], fill=(33, 150, 243))
+            draw.text((padding, 20), f"用户画像  QQ {qq}", fill=(255, 255, 255), font=title_font)
+
+            y = title_height + padding
+            for raw_line in lines:
+                line = raw_line
+                color = (33, 33, 33)
+                # 风险分高亮
+                if line.startswith("综合风险分："):
+                    score_match = re.search(r"(\d+)\s*/\s*100", line)
+                    if score_match:
+                        color = _risk_color(int(score_match.group(1)))
+                    draw.text((padding, y), line, fill=color, font=font)
+                    y += line_height
+                    continue
+
+                # 标签行按不同颜色块渲染
+                if line.startswith("基础标签：") or line.startswith("LLM 标签："):
+                    prefix = line.split("：")[0] + "："
+                    draw.text((padding, y), prefix, fill=(66, 66, 66), font=font)
+                    x = padding + draw.textlength(prefix, font=font) + 8
+                    rest = line[len(prefix):]
+                    for part in rest.split(" | "):
+                        tag_name = part.split("(")[0]
+                        # 简单背景块
+                        bbox = draw.textbbox((0, 0), tag_name, font=font)
+                        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                        draw.rounded_rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], radius=6, fill=(225, 245, 254))
+                        draw.text((x, y), tag_name, fill=(2, 119, 189), font=font)
+                        x += tw + 24
+                    y += line_height
+                    continue
+
+                # 普通文本自动换行
+                if len(line) > 50:
+                    for sub in textwrap.wrap(line, width=50):
+                        draw.text((padding, y), sub, fill=color, font=font)
+                        y += line_height
+                else:
+                    draw.text((padding, y), line, fill=color, font=font)
+                    y += line_height
+
+            tmp_dir = os.path.join(os.path.dirname(__file__), "tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+            path = os.path.join(tmp_dir, f"profile_{qq}_{int(time.time())}.png")
+            img.save(path, "PNG")
+            return path
+        except Exception as exc:
+            logger.warning(f"user_profile: render image failed: {exc}")
+            return None
+
     # ---------------- 对外 API（供加群邀请守卫等插件读取标签） ----------------
+
+    async def get_profile_tags_with_score(self, qq: str, event=None) -> dict:
+        """返回标签列表 + 综合风险分 + 风险等级。"""
+        tags = await self.get_profile_tags(qq, event)
+        score = self._calc_risk_score(tags)
+        return {"score": score, "level": _risk_level(score, self.config), "tags": tags}
 
     async def get_profile_tags(self, qq: str, event=None) -> list[dict]:
         """返回指定 QQ 的结构化标签列表，供加群邀请守卫等插件在决策时调用。
@@ -457,6 +734,8 @@ class UserProfilePlugin(Star):
             instance = getattr(md, "star_cls", None)
             if instance is not None and hasattr(instance, "get_profile_tags"):
                 tags = await instance.get_profile_tags(inviter_qq, event)
+                # 或带风险分
+                result = await instance.get_profile_tags_with_score(inviter_qq, event)
 
         event 可传 None：缺少 OneBot 上下文时自动跳过昵称/头像。
         未采集到该用户任何数据时返回 []（方便调用方直接判空）。
@@ -510,6 +789,40 @@ class UserProfilePlugin(Star):
             return ""
         profile = await self._build_profile_text(qq, event)
         return "" if "暂无记录" in profile else profile
+
+    async def get_risk_score(self, qq: str, event=None) -> int:
+        """返回指定 QQ 的综合风险分（0-100）。"""
+        result = await self.get_profile_tags_with_score(qq, event)
+        return result.get("score", 0)
+
+    def _calc_risk_score(self, tags: list) -> int:
+        """根据标签和权重计算综合风险分。"""
+        weights = self._risk_weights()
+        score = 0.0
+        for t in tags:
+            w = weights.get(t["tag"], 0)
+            score += w * float(t.get("confidence") or 0)
+        # 以 50 为中性基准，正负权重在此基础上波动
+        score = 50 + score
+        return max(0, min(100, int(score)))
+
+    def _risk_weights(self) -> dict:
+        """读取风险权重配置，JSON 字符串或 dict。"""
+        raw = self.config.get("risk_weights", "")
+        if isinstance(raw, dict):
+            merged = dict(_RISK_WEIGHTS_DEFAULT)
+            merged.update(raw)
+            return merged
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    merged = dict(_RISK_WEIGHTS_DEFAULT)
+                    merged.update(parsed)
+                    return merged
+            except Exception as exc:
+                logger.warning(f"user_profile: risk_weights parse failed: {exc}")
+        return dict(_RISK_WEIGHTS_DEFAULT)
 
     # ---------------- LLM 标签（按发言数缓存） ----------------
 
@@ -567,6 +880,10 @@ class UserProfilePlugin(Star):
         firsts = [x for x in (st.get("g_first"), st.get("p_first")) if x]
         if firsts:
             lines.append(f"- 首次记录：{_fmt_time(min(firsts))}")
+        total = g + p
+        if total > 0:
+            lines.append(f"- 图片/链接/@：{st.get('images', 0)} / {st.get('links', 0)} / {st.get('mentions', 0)}")
+            lines.append(f"- 夜间发言：{st.get('night_count', 0)} 条")
         return "\n".join(lines)
 
     # ---------------- 前科联动（均优雅降级） ----------------

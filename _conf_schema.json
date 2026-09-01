@@ -19,7 +19,13 @@
         "description": "回复带头像",
         "type": "bool",
         "default": true,
-        "hint": "/画像 回复里附上对方 QQ 头像；非 QQ 平台发不出来会自动回退纯文本"
+        "hint": "/画像 回复里附上对方 QQ 头像（仅文字模式生效）"
+      },
+      "image_output": {
+        "description": "图片形式输出",
+        "type": "bool",
+        "default": false,
+        "hint": "/画像 以图片形式发送，避免刷屏；需要环境安装 Pillow"
       }
     }
   },
@@ -116,6 +122,66 @@
         "type": "int",
         "default": 3,
         "hint": "活跃群数达到多少打 multi_group 标签"
+      },
+      "tag_image_threshold": {
+        "description": "图片刷屏阈值",
+        "type": "float",
+        "default": 0.5,
+        "hint": "图片消息占比超过多少打 image_spammer 标签"
+      },
+      "tag_link_threshold": {
+        "description": "链接刷屏阈值",
+        "type": "float",
+        "default": 0.3,
+        "hint": "含链接消息占比超过多少打 link_spammer 标签"
+      },
+      "tag_mention_threshold": {
+        "description": "频繁@阈值",
+        "type": "float",
+        "default": 0.3,
+        "hint": "含@消息占比超过多少打 mention_heavy 标签"
+      },
+      "tag_verbose_threshold": {
+        "description": "话痨阈值",
+        "type": "int",
+        "default": 80,
+        "hint": "平均消息长度超过多少字打 verbose 标签"
+      },
+      "tag_night_threshold": {
+        "description": "夜间活跃阈值",
+        "type": "float",
+        "default": 0.3,
+        "hint": "夜间（0-5点）发言占比超过多少打 night_active 标签"
+      }
+    }
+  },
+  "risk": {
+    "description": "风险评分",
+    "type": "object",
+    "items": {
+      "risk_weights": {
+        "description": "风险权重",
+        "type": "string",
+        "default": "",
+        "hint": "JSON 对象，自定义每个标签对风险分的影响，例如 {\"ban_history\":40,\"normal\":-15}；留空用默认权重"
+      },
+      "risk_level_low": {
+        "description": "低→中风险分界线",
+        "type": "int",
+        "default": 30,
+        "hint": "风险分达到多少显示为"中""
+      },
+      "risk_level_high": {
+        "description": "中→高风险分界线",
+        "type": "int",
+        "default": 60,
+        "hint": "风险分达到多少显示为"高""
+      },
+      "risk_level_extreme": {
+        "description": "高→极高风险分界线",
+        "type": "int",
+        "default": 80,
+        "hint": "风险分达到多少显示为"极高""
       }
     }
   },
