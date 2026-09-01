@@ -169,19 +169,19 @@
         "description": "低→中风险分界线",
         "type": "int",
         "default": 30,
-        "hint": "风险分达到多少显示为"中""
+        "hint": "风险分达到多少显示为 \"中\" "
       },
       "risk_level_high": {
         "description": "中→高风险分界线",
         "type": "int",
         "default": 60,
-        "hint": "风险分达到多少显示为"高""
+        "hint": "风险分达到多少显示为 \"高\" "
       },
       "risk_level_extreme": {
         "description": "高→极高风险分界线",
         "type": "int",
         "default": 80,
-        "hint": "风险分达到多少显示为"极高""
+        "hint": "风险分达到多少显示为 \"极高\" "
       }
     }
   },
