@@ -541,7 +541,14 @@ class UserProfilePlugin(Star):
         if not self._enabled():
             return
         text = (event.get_message_str() or "").strip()
-        logger.debug(f"user_profile: profile_command triggered, text={text!r}")
+        logger.info(f"user_profile: /画像 triggered, text={text!r}")
+
+        # 兜底：如果 AstrBot 把 /我的画像 /查自己 路由到 /画像，转去查自己
+        if text in ("我的画像", "查自己"):
+            logger.info("user_profile: routing self-like command to self profile")
+            await self._send_self_profile(event)
+            return
+
         match = re.search(r"\d{5,12}", text)
         if not match:
             await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号>")]))
@@ -555,17 +562,27 @@ class UserProfilePlugin(Star):
 
         await self._send_profile(qq, event)
 
+    @filter.command("我")
+    async def self_profile_command_short(self, event: AstrMessageEvent):
+        """快捷命令 /我：查自己的画像（最不容易被 AstrBot 命令解析器吞掉）。"""
+        logger.info("user_profile: /我 triggered")
+        await self._send_self_profile(event)
+
     @filter.command("我的画像", alias=["查自己"])
     async def self_profile_command(self, event: AstrMessageEvent):
-        logger.debug("user_profile: self_profile_command triggered")
+        logger.info("user_profile: /我的画像 triggered")
+        await self._send_self_profile(event)
+
+    async def _send_self_profile(self, event: AstrMessageEvent):
+        """查询并发送发送者自己的画像。"""
         if not self._enabled():
-            logger.debug("user_profile: self_profile_command skipped, plugin disabled")
+            logger.info("user_profile: self profile skipped, plugin disabled")
             return
         if not self.config.get("enable_self_command", True):
-            logger.debug("user_profile: self_profile_command skipped, enable_self_command=false")
+            logger.info("user_profile: self profile skipped, enable_self_command=false")
             return
         sender = str(event.get_sender_id() or "").strip()
-        logger.debug(f"user_profile: self_profile_command sender={sender!r}")
+        logger.info(f"user_profile: self profile sender={sender!r}")
         if not re.fullmatch(r"\d{5,12}", sender):
             await event.send(MessageChain(chain=[Plain("无法获取你的 QQ 号")]))
             return
@@ -573,7 +590,7 @@ class UserProfilePlugin(Star):
 
     async def _send_profile(self, qq: str, event: AstrMessageEvent):
         """查询并发送画像的公共逻辑。"""
-        logger.debug(f"user_profile: _send_profile qq={qq!r}")
+        logger.info(f"user_profile: _send_profile qq={qq!r}")
         try:
             profile = await self._build_profile_text(qq, event)
         except Exception as exc:
