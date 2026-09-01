@@ -434,13 +434,17 @@ class UserProfilePlugin(Star):
             if group_id in allowed:
                 return True, ""
 
-        # 3. 仅允许查自己
+        # 3. 自查询快捷命令放行：/我的画像 /查自己 /我 /画像 自己
+        if sender and sender == target_qq and self.config.get("enable_self_command", True):
+            return True, ""
+
+        # 4. 仅允许查自己
         if self.config.get("self_query_only", False):
             if sender and sender == target_qq:
                 return True, ""
             return False, "当前仅允许查询自己的画像（管理员除外）。"
 
-        # 4. 全局公开查询
+        # 5. 全局公开查询
         if self.config.get("public_query", True):
             return True, ""
 
