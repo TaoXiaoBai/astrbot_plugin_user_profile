@@ -87,7 +87,8 @@
 | `llm_tags` | `true` | 是否由 LLM 生成语义标签；关闭后只出基础标签 |
 | `llm_provider_id` | `""` | 标签用模型，留空用 AstrBot 默认模型 |
 | `llm_tag_cache_ttl` | `86400` | LLM 标签缓存多少秒后刷新；0 表示每次都重新生成 |
-| `quote_show` | `5` | /画像 里展示最近几条原话摘录 |
+| `show_quotes` | `true` | /画像 里是否显示最近发言原话 |
+| `quote_show` | `5` | show_quotes 开启时，展示最近几条原话摘录 |
 | `history_fallback` | `true` | 未采集到此人时用 AstrBot 会话历史补充 |
 | `tag_active_high_threshold` | `100` | 累计发言数达到多少打 `高活跃` |
 | `tag_active_med_threshold` | `20` | 累计发言数达到多少打 `较活跃` |

@@ -117,11 +117,17 @@
         "default": "",
         "hint": "生成 LLM 标签用的模型，留空用 AstrBot 默认模型"
       },
+      "show_quotes": {
+        "description": "展示发言摘录",
+        "type": "bool",
+        "default": true,
+        "hint": "/画像 里是否显示最近发言原话；关闭后只出标签、风险分和活跃度"
+      },
       "quote_show": {
         "description": "原话展示条数",
         "type": "int",
         "default": 5,
-        "hint": "/画像 里展示最近几条发言摘录"
+        "hint": "show_quotes 开启时，/画像 里展示最近几条发言摘录"
       },
       "history_fallback": {
         "description": "会话历史补充",

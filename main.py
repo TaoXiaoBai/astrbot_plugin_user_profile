@@ -721,19 +721,20 @@ class UserProfilePlugin(Star):
         if activity:
             lines.append(activity)
 
-        # 最近原话
-        quotes = list(self._quotes.get(qq) or [])
-        if not quotes:
-            history_lines = await self._search_history_quotes(qq)
-            if history_lines:
-                lines.append("历史会话中的发言（来自 AstrBot 会话记录补充）：\n" + "\n".join(history_lines))
-        else:
-            shown = quotes[-self._quote_show() :]
-            q_lines = [
-                f"[{_fmt_time(q.get('t'))}] ({q.get('src')}) {q.get('text')}"
-                for q in shown
-            ]
-            lines.append("最近发言摘录：\n" + "\n".join(q_lines))
+        # 最近原话（可开关）
+        if self.config.get("show_quotes", True):
+            quotes = list(self._quotes.get(qq) or [])
+            if not quotes:
+                history_lines = await self._search_history_quotes(qq)
+                if history_lines:
+                    lines.append("历史会话中的发言（来自 AstrBot 会话记录补充）：\n" + "\n".join(history_lines))
+            else:
+                shown = quotes[-self._quote_show() :]
+                q_lines = [
+                    f"[{_fmt_time(q.get('t'))}] ({q.get('src')}) {q.get('text')}"
+                    for q in shown
+                ]
+                lines.append("最近发言摘录：\n" + "\n".join(q_lines))
 
         return "\n\n".join(lines)
 
