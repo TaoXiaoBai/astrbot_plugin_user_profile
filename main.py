@@ -573,6 +573,50 @@ class UserProfilePlugin(Star):
         logger.info("user_profile: /我的画像 triggered")
         await self._send_self_profile(event)
 
+    @filter.regex(r"^/(?:画像|我的画像|查自己|我)")
+    async def slash_command_fallback(self, event: AstrMessageEvent):
+        """兜底：当 AstrBot 的 wake_prefix 不是 '/' 时，直接以 '/' 开头的命令
+        不会被标准 command filter 捕获。此正则在所有平台统一处理 /画像 /我的画像
+        /查自己 /我，并避开 wake_prefix='/' 时已由 command filter 处理的情况。"""
+        if not self._enabled():
+            return
+        raw = (event.get_message_str() or "").strip()
+        # 如果 AstrBot 已经通过标准 command 唤醒，且剥离 wake_prefix 后不再以
+        # '/' 开头，说明 command handler 会处理，这里不再重复响应。
+        if event.is_at_or_wake_command and not raw.startswith("/"):
+            return
+
+        logger.info(f"user_profile: slash fallback triggered, raw={raw!r}")
+
+        # /我的画像 /查自己 /我 -> 查自己
+        if raw == "/我的画像" or raw == "/查自己" or raw == "/我":
+            await self._send_self_profile(event)
+            event.stop_event()
+            return
+
+        # /画像 ...
+        if raw.startswith("/画像"):
+            rest = raw[len("/画像"):].strip()
+            # /画像 自己 /画像 我 /画像 me /画像 不带参数 -> 查自己
+            if not rest or rest.lower() in ("自己", "我", "me"):
+                await self._send_self_profile(event)
+                event.stop_event()
+                return
+            match = re.search(r"\d{5,12}", rest)
+            if not match:
+                await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号>")]))
+                event.stop_event()
+                return
+            qq = match.group(0)
+            allowed, reason = self._check_query_permission(qq, event)
+            if not allowed:
+                await event.send(MessageChain(chain=[Plain(reason)]))
+                event.stop_event()
+                return
+            await self._send_profile(qq, event)
+            event.stop_event()
+            return
+
     async def _send_self_profile(self, event: AstrMessageEvent):
         """查询并发送发送者自己的画像。"""
         if not self._enabled():
@@ -600,12 +644,6 @@ class UserProfilePlugin(Star):
         chain = await self._render_message_chain(qq, profile)
         try:
             await event.send(MessageChain(chain=chain))
-        except Exception as exc:
-            logger.error(f"user_profile: send profile failed: {exc}")
-            try:
-                await event.send(MessageChain(chain=[Plain(profile)]))
-            except Exception as exc2:
-                logger.error(f"user_profile: fallback send failed: {exc2}")
         except Exception as exc:
             logger.error(f"user_profile: send profile failed: {exc}")
             try:
@@ -703,8 +741,9 @@ class UserProfilePlugin(Star):
             return [Plain(profile_text + "\n\n[图片输出未启用：缺少 Pillow 依赖]")]
         path = self._render_profile_image(qq, profile_text)
         if path:
-            # 与邀请守卫保持一致：直接传本地路径给 Image(file=...)
-            return [Image(file=path)]
+            logger.info(f"user_profile: sending image output {path}")
+            return [Image.fromFileSystem(path)]
+        logger.warning("user_profile: image render returned None, fallback to text")
         return [Plain(profile_text)]
 
     def _render_profile_image(self, qq: str, text: str) -> str | None:
