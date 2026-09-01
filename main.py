@@ -395,8 +395,8 @@ def _new_stat() -> dict:
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，供加群邀请守卫等插件决策调用",
-    "1.2.0",
+    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
+    "1.3.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -412,6 +412,48 @@ class UserProfilePlugin(Star):
 
     def _enabled(self) -> bool:
         return bool(self.config.get("enable", True))
+
+    def _check_query_permission(self, target_qq: str, event: AstrMessageEvent) -> tuple[bool, str]:
+        """统一查询权限判断。返回 (是否允许, 拒绝原因)。管理员始终允许。"""
+        target_qq = str(target_qq or "").strip()
+        sender = str(event.get_sender_id() or "").strip()
+
+        # 1. 管理员放行
+        try:
+            if event.is_admin():
+                return True, ""
+        except Exception:
+            pass
+
+        group_id = str(event.get_group_id() or "").strip()
+
+        # 2. 指定公开群全员可查
+        raw_groups = str(self.config.get("group_public_query_groups", "") or "").strip()
+        if raw_groups and group_id:
+            allowed = {g.strip() for g in re.split(r"[,，\s]+", raw_groups) if g.strip()}
+            if group_id in allowed:
+                return True, ""
+
+        # 3. 仅允许查自己
+        if self.config.get("self_query_only", False):
+            if sender and sender == target_qq:
+                return True, ""
+            return False, "当前仅允许查询自己的画像（管理员除外）。"
+
+        # 4. 全局公开查询
+        if self.config.get("public_query", True):
+            return True, ""
+
+        return False, "当前仅管理员可查询用户画像。"
+
+    def _llm_tag_cache_ttl(self) -> int:
+        try:
+            raw = self.config.get("llm_tag_cache_ttl")
+            if raw is None:
+                return 86400
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 86400
 
     # ---------------- 被动采集（零 LLM 零网络） ----------------
 
@@ -505,16 +547,27 @@ class UserProfilePlugin(Star):
             return
         qq = match.group(0)
 
-        if not self.config.get("public_query", True):
-            try:
-                if not event.is_admin():
-                    await event.send(
-                        MessageChain(chain=[Plain("当前仅管理员可查询用户画像")])
-                    )
-                    return
-            except Exception:
-                pass  # is_admin 不可用时按公开处理
+        allowed, reason = self._check_query_permission(qq, event)
+        if not allowed:
+            await event.send(MessageChain(chain=[Plain(reason)]))
+            return
 
+        await self._send_profile(qq, event)
+
+    @filter.command("我的画像")
+    async def self_profile_command(self, event: AstrMessageEvent):
+        if not self._enabled():
+            return
+        if not self.config.get("enable_self_command", True):
+            return
+        sender = str(event.get_sender_id() or "").strip()
+        if not re.fullmatch(r"\d{5,12}", sender):
+            await event.send(MessageChain(chain=[Plain("无法获取你的 QQ 号")]))
+            return
+        await self._send_profile(sender, event)
+
+    async def _send_profile(self, qq: str, event: AstrMessageEvent):
+        """查询并发送画像的公共逻辑。"""
         profile = await self._build_profile_text(qq, event)
         chain = await self._render_message_chain(qq, profile)
         try:
@@ -621,7 +674,7 @@ class UserProfilePlugin(Star):
         return [Plain(profile_text)]
 
     def _render_profile_image(self, qq: str, text: str) -> str | None:
-        """把画像文本渲染成图片，返回临时文件路径。"""
+        """把画像文本渲染成图片，返回临时文件路径。优化：按像素宽度折行，支持 CJK，标签自动换行。"""
         if not HAS_PIL:
             return None
         try:
@@ -630,20 +683,6 @@ class UserProfilePlugin(Star):
             line_height = 34
             title_height = 80
             content_width = width - padding * 2
-
-            # 预估算行数（按 50 字符折行）
-            lines = text.splitlines()
-            wrapped = []
-            for line in lines:
-                if len(line) <= 50:
-                    wrapped.append(line)
-                else:
-                    wrapped.extend(textwrap.wrap(line, width=50))
-
-            height = max(500, title_height + len(wrapped) * line_height + padding * 2)
-
-            img = PILImage.new("RGB", (width, height), color=(250, 250, 250))
-            draw = ImageDraw.Draw(img)
 
             # 字体
             font_paths = [
@@ -677,54 +716,127 @@ class UserProfilePlugin(Star):
                     except Exception:
                         return len(s) * 12, 24
 
+            def _is_wide(c: str) -> bool:
+                """粗略判断字符是否占两个英文字符宽度（CJK 等）。"""
+                o = ord(c)
+                # CJK 统一表意符号及其扩展
+                if 0x4E00 <= o <= 0x9FFF:
+                    return True
+                if 0x3400 <= o <= 0x4DBF:
+                    return True
+                if 0x3040 <= o <= 0x309F or 0x30A0 <= o <= 0x30FF or 0xAC00 <= o <= 0xD7AF:
+                    return True
+                if 0xFF01 <= o <= 0xFF60:
+                    return True
+                return False
+
+            def _display_width(s: str) -> int:
+                return sum(2 if _is_wide(c) else 1 for c in s)
+
+            def _wrap_by_width(s: str, max_dw: int) -> list[str]:
+                """按显示宽度折行，优先在标点/空格处断开。"""
+                if not s:
+                    return []
+                lines_out = []
+                cur = ""
+                cur_dw = 0
+                for c in s:
+                    cw = 2 if _is_wide(c) else 1
+                    if cur_dw + cw > max_dw and cur:
+                        # 尝试回退到最近的断点
+                        cut = -1
+                        for idx in range(len(cur) - 1, max(0, len(cur) - 12), -1):
+                            if cur[idx] in " ，,.。！？、；：" " \\t":
+                                cut = idx + 1
+                                break
+                        if cut > 0:
+                            lines_out.append(cur[:cut])
+                            cur = cur[cut:]
+                            cur_dw = _display_width(cur)
+                        else:
+                            lines_out.append(cur)
+                            cur = ""
+                            cur_dw = 0
+                    cur += c
+                    cur_dw += cw
+                if cur:
+                    lines_out.append(cur)
+                return lines_out
+
+            # 估算 24px 字体下单个窄字符宽度（msyh 约 12px），从而得到目标显示宽度
+            sample_w, _ = _text_size("a", font)
+            if sample_w <= 0:
+                sample_w = 12
+            max_dw = max(20, int(content_width / sample_w))
+
+            # 预排版：把所有行转成渲染单元，并计算总高度
+            render_items = []
+            for raw_line in text.splitlines():
+                if raw_line.startswith("综合风险分："):
+                    render_items.append(("score", raw_line))
+                elif raw_line.startswith("基础标签：") or raw_line.startswith("LLM 标签："):
+                    render_items.append(("tags", raw_line))
+                else:
+                    sub_lines = _wrap_by_width(raw_line, max_dw)
+                    for sub in sub_lines:
+                        render_items.append(("plain", sub))
+
+            height = max(500, title_height + len(render_items) * line_height + padding * 2)
+
+            img = PILImage.new("RGB", (width, height), color=(250, 250, 250))
+            draw = ImageDraw.Draw(img)
+
             # 标题背景
             draw.rectangle([(0, 0), (width, title_height)], fill=(33, 150, 243))
             draw.text((padding, 20), f"用户画像  QQ {qq}", fill=(255, 255, 255), font=title_font)
 
             y = title_height + padding
-            for raw_line in lines:
-                color = (33, 33, 33)
+            for kind, content in render_items:
+                if y + line_height > height - padding:
+                    # 内容超长时追加提示并停止
+                    draw.text((padding, y), "... 内容过多，已截断 ...", fill=(150, 150, 150), font=font)
+                    break
 
-                # 风险分高亮
-                if raw_line.startswith("综合风险分："):
-                    score_match = re.search(r"(\d+)\s*/\s*100", raw_line)
+                if kind == "score":
+                    color = (33, 33, 33)
+                    score_match = re.search(r"(\d+)\s*/\s*100", content)
                     if score_match:
                         color = _risk_color(int(score_match.group(1)))
-                    draw.text((padding, y), raw_line, fill=color, font=font)
+                    draw.text((padding, y), content, fill=color, font=font)
                     y += line_height
                     continue
 
-                # 标签行按不同颜色块渲染，超宽自动换行
-                if raw_line.startswith("基础标签：") or raw_line.startswith("LLM 标签："):
-                    prefix = raw_line.split("：")[0] + "："
+                if kind == "tags":
+                    prefix = content.split("：")[0] + "："
                     draw.text((padding, y), prefix, fill=(66, 66, 66), font=font)
                     pw, _ = _text_size(prefix, font)
                     x = padding + pw + 8
-                    rest = raw_line[len(prefix):]
-                    for part in rest.split(" | "):
+                    rest = content[len(prefix):]
+                    tag_parts = rest.split(" | ") if rest else []
+                    row_y = y
+                    for part in tag_parts:
                         tag_name = part.split("(")[0]
                         tw, th = _text_size(tag_name, font)
-                        # 超宽换行
+                        # 标签本身超长时按显示宽度截断
+                        if tw > content_width - padding:
+                            sub_tags = _wrap_by_width(tag_name, max_dw)
+                            tag_name = sub_tags[0] + "…" if sub_tags else "…"
+                            tw, th = _text_size(tag_name, font)
                         if x + tw + 16 > width - padding:
                             x = padding
-                            y += line_height + 6
+                            row_y += line_height + 6
                         try:
-                            draw.rounded_rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], radius=6, fill=(225, 245, 254))
+                            draw.rounded_rectangle([(x - 4, row_y - 2), (x + tw + 8, row_y + th + 6)], radius=6, fill=(225, 245, 254))
                         except Exception:
-                            draw.rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], fill=(225, 245, 254))
-                        draw.text((x, y), tag_name, fill=(2, 119, 189), font=font)
+                            draw.rectangle([(x - 4, row_y - 2), (x + tw + 8, row_y + th + 6)], fill=(225, 245, 254))
+                        draw.text((x, row_y), tag_name, fill=(2, 119, 189), font=font)
                         x += tw + 24
-                    y += line_height
+                    y = row_y + line_height
                     continue
 
-                # 普通文本自动换行
-                if len(raw_line) > 50:
-                    for sub in textwrap.wrap(raw_line, width=50):
-                        draw.text((padding, y), sub, fill=color, font=font)
-                        y += line_height
-                else:
-                    draw.text((padding, y), raw_line, fill=color, font=font)
-                    y += line_height
+                # 普通文本
+                draw.text((padding, y), content, fill=(33, 33, 33), font=font)
+                y += line_height
 
             tmp_dir = os.path.join(os.path.dirname(__file__), "tmp")
             os.makedirs(tmp_dir, exist_ok=True)
@@ -855,10 +967,21 @@ class UserProfilePlugin(Star):
             tags_cache = {}
         cached = tags_cache.get(qq)
 
+        ttl = self._llm_tag_cache_ttl()
+
         def _cached_tags() -> list:
-            if isinstance(cached, dict) and cached.get("count") == total:
-                return list(cached.get("tags") or [])
-            return []
+            if not isinstance(cached, dict):
+                return []
+            if cached.get("count") != total:
+                return []
+            if ttl == 0:
+                # 0 表示关闭缓存，每次重新生成
+                return []
+            if ttl > 0:
+                cached_time = int(cached.get("time") or 0)
+                if cached_time and int(time.time()) - cached_time > ttl:
+                    return []
+            return list(cached.get("tags") or [])
 
         cached_tags = _cached_tags()
         if cached_tags:

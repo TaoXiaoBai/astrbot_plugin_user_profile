@@ -29,6 +29,36 @@
       }
     }
   },
+  "permissions": {
+    "description": "查询权限",
+    "type": "object",
+    "items": {
+      "self_query_only": {
+        "description": "仅允许查自己",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后非管理员只能用 /画像 查自己的 QQ，管理员和指定公开群除外"
+      },
+      "group_public_query_groups": {
+        "description": "全员可查的群",
+        "type": "string",
+        "default": "",
+        "hint": "逗号分隔群号；在这些群里所有成员都能查任意 QQ 画像，不受“仅查自己”限制"
+      },
+      "enable_self_command": {
+        "description": "启用 /我的画像",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后可用 /我的画像 快速查询自己的画像"
+      },
+      "llm_tag_cache_ttl": {
+        "description": "LLM 标签缓存时间",
+        "type": "int",
+        "default": 86400,
+        "hint": "LLM 标签缓存多少秒后刷新；0 表示每次查询都重新生成"
+      }
+    }
+  },
   "collect": {
     "description": "数据采集",
     "type": "object",
