@@ -541,6 +541,7 @@ class UserProfilePlugin(Star):
         if not self._enabled():
             return
         text = (event.get_message_str() or "").strip()
+        logger.debug(f"user_profile: profile_command triggered, text={text!r}")
         match = re.search(r"\d{5,12}", text)
         if not match:
             await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号>")]))
@@ -554,13 +555,17 @@ class UserProfilePlugin(Star):
 
         await self._send_profile(qq, event)
 
-    @filter.command("我的画像")
+    @filter.command("我的画像", alias=["查自己"])
     async def self_profile_command(self, event: AstrMessageEvent):
+        logger.debug("user_profile: self_profile_command triggered")
         if not self._enabled():
+            logger.debug("user_profile: self_profile_command skipped, plugin disabled")
             return
         if not self.config.get("enable_self_command", True):
+            logger.debug("user_profile: self_profile_command skipped, enable_self_command=false")
             return
         sender = str(event.get_sender_id() or "").strip()
+        logger.debug(f"user_profile: self_profile_command sender={sender!r}")
         if not re.fullmatch(r"\d{5,12}", sender):
             await event.send(MessageChain(chain=[Plain("无法获取你的 QQ 号")]))
             return
@@ -568,10 +573,22 @@ class UserProfilePlugin(Star):
 
     async def _send_profile(self, qq: str, event: AstrMessageEvent):
         """查询并发送画像的公共逻辑。"""
-        profile = await self._build_profile_text(qq, event)
+        logger.debug(f"user_profile: _send_profile qq={qq!r}")
+        try:
+            profile = await self._build_profile_text(qq, event)
+        except Exception as exc:
+            logger.error(f"user_profile: _build_profile_text failed: {exc}")
+            await event.send(MessageChain(chain=[Plain(f"生成画像失败：{exc}")]))
+            return
         chain = await self._render_message_chain(qq, profile)
         try:
             await event.send(MessageChain(chain=chain))
+        except Exception as exc:
+            logger.error(f"user_profile: send profile failed: {exc}")
+            try:
+                await event.send(MessageChain(chain=[Plain(profile)]))
+            except Exception as exc2:
+                logger.error(f"user_profile: fallback send failed: {exc2}")
         except Exception as exc:
             logger.error(f"user_profile: send profile failed: {exc}")
             try:
