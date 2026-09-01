@@ -1,7 +1,5 @@
 import asyncio
-import base64
 import inspect
-import io
 import json
 import os
 import re
@@ -518,7 +516,7 @@ class UserProfilePlugin(Star):
                 pass  # is_admin 不可用时按公开处理
 
         profile = await self._build_profile_text(qq, event)
-        chain = await self._render_message_chain(qq, profile, event)
+        chain = await self._render_message_chain(qq, profile)
         try:
             await event.send(MessageChain(chain=chain))
         except Exception as exc:
@@ -610,7 +608,7 @@ class UserProfilePlugin(Star):
 
         return "\n\n".join(lines)
 
-    async def _render_message_chain(self, qq: str, profile_text: str, event) -> list:
+    async def _render_message_chain(self, qq: str, profile_text: str) -> list:
         """根据配置返回文本或图片消息链。"""
         if not self.config.get("image_output", False):
             return [Plain(profile_text)]
@@ -618,7 +616,8 @@ class UserProfilePlugin(Star):
             return [Plain(profile_text + "\n\n[图片输出未启用：缺少 Pillow 依赖]")]
         path = self._render_profile_image(qq, profile_text)
         if path:
-            return [Image.fromFileSystem(path)]
+            # 与邀请守卫保持一致：直接传本地路径给 Image(file=...)
+            return [Image(file=path)]
         return [Plain(profile_text)]
 
     def _render_profile_image(self, qq: str, text: str) -> str | None:
@@ -630,8 +629,9 @@ class UserProfilePlugin(Star):
             padding = 40
             line_height = 34
             title_height = 80
+            content_width = width - padding * 2
 
-            # 预估算行数
+            # 预估算行数（按 50 字符折行）
             lines = text.splitlines()
             wrapped = []
             for line in lines:
@@ -650,6 +650,7 @@ class UserProfilePlugin(Star):
                 "C:/Windows/Fonts/msyh.ttc",
                 "C:/Windows/Fonts/simhei.ttf",
                 "C:/Windows/Fonts/simsun.ttc",
+                "C:/Windows/Fonts/msyhbd.ttc",
             ]
             font = None
             for fp in font_paths:
@@ -665,47 +666,64 @@ class UserProfilePlugin(Star):
             except Exception:
                 title_font = font
 
+            def _text_size(s: str, f) -> tuple:
+                """兼容新旧 Pillow 的文本尺寸计算。"""
+                try:
+                    bbox = draw.textbbox((0, 0), s, font=f)
+                    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+                except Exception:
+                    try:
+                        return draw.textsize(s, font=f)
+                    except Exception:
+                        return len(s) * 12, 24
+
             # 标题背景
             draw.rectangle([(0, 0), (width, title_height)], fill=(33, 150, 243))
             draw.text((padding, 20), f"用户画像  QQ {qq}", fill=(255, 255, 255), font=title_font)
 
             y = title_height + padding
             for raw_line in lines:
-                line = raw_line
                 color = (33, 33, 33)
+
                 # 风险分高亮
-                if line.startswith("综合风险分："):
-                    score_match = re.search(r"(\d+)\s*/\s*100", line)
+                if raw_line.startswith("综合风险分："):
+                    score_match = re.search(r"(\d+)\s*/\s*100", raw_line)
                     if score_match:
                         color = _risk_color(int(score_match.group(1)))
-                    draw.text((padding, y), line, fill=color, font=font)
+                    draw.text((padding, y), raw_line, fill=color, font=font)
                     y += line_height
                     continue
 
-                # 标签行按不同颜色块渲染
-                if line.startswith("基础标签：") or line.startswith("LLM 标签："):
-                    prefix = line.split("：")[0] + "："
+                # 标签行按不同颜色块渲染，超宽自动换行
+                if raw_line.startswith("基础标签：") or raw_line.startswith("LLM 标签："):
+                    prefix = raw_line.split("：")[0] + "："
                     draw.text((padding, y), prefix, fill=(66, 66, 66), font=font)
-                    x = padding + draw.textlength(prefix, font=font) + 8
-                    rest = line[len(prefix):]
+                    pw, _ = _text_size(prefix, font)
+                    x = padding + pw + 8
+                    rest = raw_line[len(prefix):]
                     for part in rest.split(" | "):
                         tag_name = part.split("(")[0]
-                        # 简单背景块
-                        bbox = draw.textbbox((0, 0), tag_name, font=font)
-                        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                        draw.rounded_rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], radius=6, fill=(225, 245, 254))
+                        tw, th = _text_size(tag_name, font)
+                        # 超宽换行
+                        if x + tw + 16 > width - padding:
+                            x = padding
+                            y += line_height + 6
+                        try:
+                            draw.rounded_rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], radius=6, fill=(225, 245, 254))
+                        except Exception:
+                            draw.rectangle([(x - 4, y - 2), (x + tw + 8, y + th + 6)], fill=(225, 245, 254))
                         draw.text((x, y), tag_name, fill=(2, 119, 189), font=font)
                         x += tw + 24
                     y += line_height
                     continue
 
                 # 普通文本自动换行
-                if len(line) > 50:
-                    for sub in textwrap.wrap(line, width=50):
+                if len(raw_line) > 50:
+                    for sub in textwrap.wrap(raw_line, width=50):
                         draw.text((padding, y), sub, fill=color, font=font)
                         y += line_height
                 else:
-                    draw.text((padding, y), line, fill=color, font=font)
+                    draw.text((padding, y), raw_line, fill=color, font=font)
                     y += line_height
 
             tmp_dir = os.path.join(os.path.dirname(__file__), "tmp")
