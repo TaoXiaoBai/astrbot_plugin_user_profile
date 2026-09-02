@@ -392,16 +392,29 @@ def _new_stat() -> dict:
     }
 
 
+def _flatten_plugin_config(config: dict | None) -> dict:
+    """兼容 AstrBot 分组 schema 和旧版扁平配置。"""
+    source = config or {}
+    flattened = dict(source)
+    for section in ("basic", "permissions", "collect", "tags", "risk", "link"):
+        values = source.get(section)
+        if isinstance(values, dict):
+            for key, value in values.items():
+                # 顶层值优先，避免破坏旧版/测试中的显式扁平配置。
+                flattened.setdefault(key, value)
+    return flattened
+
+
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.3.0",
+    "1.3.2",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.config = config or {}
+        self.config = _flatten_plugin_config(config)
         self._stats: dict | None = None  # qq -> 统计（懒加载，定期落盘）
         self._quotes: dict | None = None  # qq -> 最近原话列表
         self._dirty = False
