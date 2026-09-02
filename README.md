@@ -1,202 +1,199 @@
 # 用户画像（astrbot_plugin_user_profile）
 
-一个**独立可用**的 AstrBot 用户画像 / 自动标签引擎：自己监听消息、自己积累数据、自己生成标签和风险分，不依赖任何其它插件也能完整使用。
+一个独立可用的 AstrBot 用户画像与自动标签引擎。插件被动统计群聊/私聊发言，生成结构化标签和 0-100 综合风险分，可供聊天查询，也可由加群邀请守卫等可信插件只读调用。
 
-它的核心产出是**结构化标签 + 综合风险分**：从群聊/私聊发言中自动统计活跃度、风险、社交、内容等特征，再由 LLM 从原话里打语义标签（广告嫌疑、抬杠、正常等）。标签和风险分可直接被「加群邀请守卫」等插件读取，用于辅助判断"这人能不能进群"。
-
-纯只读：本插件不做任何拉黑、踢人、退群等敏感操作。
+本插件不会主动拉黑、踢人、退群或修改其它插件数据。
 
 ## 功能
 
-**被动采集（零 LLM 零网络，不占聊天性能）**
-- 静默监听群聊/私聊消息，按 QQ 统计：发言总数、活跃群数、首次/最近发言时间
-- 额外行为信号：图片/链接/二维码/@次数/消息长度/夜间活跃
-- 每个 QQ 保留最近 N 条发言原话（默认 10 条，可配）
-- 内存累积、每分钟批量落盘（kv 存储），不打断任何事件、不影响正常聊天
+- 被动统计发言数、活跃群、首次/最近发言时间，以及图片、链接、二维码、@、消息长度和夜间活跃等信号。
+- 每个 QQ 保存最近 N 条原话，内存累积并定期写入 AstrBot KV。
+- 规则标签覆盖活跃度、社交、内容和前科；可选 LLM 语义标签覆盖广告、刷屏、诈骗、挑衅、友好等倾向。
+- 根据标签权重计算综合风险分和低/中/高/极高风险等级。
+- 支持文字或图片画像、QQ 头像、指定公开查询群、聊天命令与 LLM 工具。
+- 可只读联动 `astrbot_plugin_group_invite_guard` 和 `astrbot_plugin_qq_tools`。
 
-**自动标签（为决策服务）**
-- 基础标签（规则生成，零成本）：
-  - 活跃度：`高活跃` / `较活跃` / `低活跃` / `新人` / `长期沉寂`
-  - 社交：`多群出现` / `私聊活跃`
-  - 风险：`黑名单记录` / `拉群前科` / `禁言前科` / `频繁邀请` / `邀请被拒`
-  - 内容：`图片刷屏` / `链接刷屏` / `二维码刷屏` / `频繁@人` / `话痨` / `夜间活跃`
-- LLM 语义标签（默认开启）：`广告嫌疑` / `刷屏嫌疑` / `抬杠/钓鱼` / `诈骗嫌疑` / `表现正常` 等
-- 每个标签带 `confidence`（置信度）、`source`（来源）、`evidence`（证据摘要）
+## 安装与命令
 
-**综合风险分**
-- 根据标签权重自动计算 0-100 风险分
-- 风险等级：`低` / `中` / `高` / `极高`
-- 权重可配置，正负权重均可（如 `normal` 为负向，降低风险分）
+1. 将目录放入 AstrBot 的 `data/plugins/`，或从插件市场安装。
+2. 重启 AstrBot，在 WebUI 的插件配置中按需调整。
 
-**画像查询**
-- 命令：`/画像 <QQ号>`（群聊私聊均可，默认公开，可改仅管理员）
-- 查自己：(`/画像 自己` 或 `/画像 我`)、`/我的画像`、`/查自己`、快捷命令 `/我`
-- 无论 AstrBot 的 `wake_prefix` 是不是 `/`，直接以 `/` 开头的命令都会响应
-- 可选图片形式输出（`image_output`），避免刷屏
-- LLM 工具：`user_profile_query(qq)`，bot 聊天时可自主调用查询
-- 细粒度权限：可指定某些群全员可查，也可开启“仅允许查自己”
+聊天命令：
 
-## 安装
+- `/画像 <QQ号>`：查询指定 QQ。
+- `/画像 自己`、`/画像 我`：通过标准画像命令查询自己。
+- `/我`、`/我的画像`、`/查自己`：自查询快捷命令，可由 `enable_self_shortcuts` 单独关闭。
 
-1. 把本目录放进 AstrBot 的 `data/plugins/`（或在插件市场搜索安装）
-2. 重启 AstrBot
-3. WebUI → 插件 →「用户画像」里按需改配置（默认配置即可直接用）
+正则兜底只匹配完整命令边界，`/我是...`、`/画像测试...` 等文本不会误触发。无论 AstrBot 的 `wake_prefix` 是否为 `/`，合法的完整斜杠命令都可响应。
+
+## 查询权限
+
+默认采用隐私优先配置：普通用户可查询自己，但不能查询他人；AstrBot 管理员始终可查询任意人。
+
+权限判断优先级：
+
+1. 插件关闭：所有聊天入口和 LLM 查询工具拒绝。
+2. AstrBot 管理员：可查询自己或任意他人。
+3. 查询自己：由 `allow_self_query` 决定。
+4. 当前群在 `group_public_query_groups`：可查询任意人。
+5. `allow_other_query=true`：可查询任意人。
+6. 其它情况拒绝，并向用户返回原因、在日志记录入口、发送者、目标、群号和命中规则。
+
+权限矩阵（普通用户）：
+
+| 场景 | 查自己 | 查他人 |
+| --- | --- | --- |
+| 默认配置 | 允许 | 拒绝 |
+| `allow_self_query=false` | 拒绝 | 仍由其它规则决定 |
+| `allow_other_query=true` | 由 `allow_self_query` 决定 | 允许 |
+| 位于指定公开群 | 由 `allow_self_query` 决定 | 允许 |
+| 管理员 | 允许 | 允许 |
+
+注意：指定公开群是“查询他人”的例外，不会绕过 `allow_self_query=false`。`enable_self_shortcuts` 只控制快捷入口，不是自查询权限；关闭后仍可在 `allow_self_query=true` 时使用 `/画像 自己` 或 `/画像 <自己的QQ>`。
+
+典型配置：
+
+```json
+// 仅管理员
+{"allow_self_query": false, "allow_other_query": false, "group_public_query_groups": ""}
+```
+
+```json
+// 管理员 + 本人（默认）
+{"allow_self_query": true, "allow_other_query": false, "group_public_query_groups": ""}
+```
+
+```json
+// 全员可查询自己和他人
+{"allow_self_query": true, "allow_other_query": true}
+```
+
+```json
+// 本人可查自己，仅群 123456 和 789012 可查他人
+{"allow_self_query": true, "allow_other_query": false, "group_public_query_groups": "123456,789012"}
+```
 
 ## 配置
 
-**基础**
+### 基础开关
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `enable` | `true` | 总开关；关闭后停止采集、/画像 与 LLM 工具都不再响应 |
-| `public_query` | `true` | 是否允许非管理员用 /画像 |
-| `show_avatar` | `true` | /画像 文字回复是否附 QQ 头像 |
-| `image_output` | `false` | /画像 以图片形式发送，避免刷屏；需要 Pillow |
+| `enable` | `true` | 插件总开关；关闭后停止采集并拒绝聊天查询和 LLM 工具。 |
 
-**查询权限**
+### 查询权限
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `public_query` | `true` | 是否允许非管理员用 `/画像` 查任意 QQ |
-| `self_query_only` | `false` | 开启后非管理员只能查自己的画像（管理员和指定公开群除外） |
-| `group_public_query_groups` | `""` | 逗号分隔群号；在这些群里所有成员都能查任意 QQ 画像 |
-| `enable_self_command` | `true` | 是否启用 `/我的画像`（含 `/查自己`、`/我`）快捷命令 |
+| `allow_self_query` | `true` | 允许非管理员查询自己的画像。 |
+| `allow_other_query` | `false` | 允许非管理员查询他人的画像。 |
+| `group_public_query_groups` | `""` | 逗号、中文逗号或空白分隔群号；这些群中可查询任意他人。 |
+| `enable_self_shortcuts` | `true` | 启用 `/我`、`/我的画像`、`/查自己`；不影响 `/画像 自己`。 |
+| `enable_llm_tool` | `true` | 启用 `user_profile_query`；工具与命令使用相同用户权限。 |
 
-权限优先级（高→低）：管理员 → 指定公开群 → 仅查自己 → 全局公开 → 拒绝。
-
-典型场景：
-- 全局公开：`public_query=true`（默认）。
-- 仅管理员可查：`public_query=false`。
-- 全员只查自己，但某些群可以任意查：`self_query_only=true`，并把群号填到 `group_public_query_groups`。
-
-**数据采集**
+### 输出与隐私
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `passive_collect` | `true` | 是否被动采集发言统计；关闭后已有数据保留 |
-| `collect_private` | `true` | 是否统计私聊发言；在意隐私可关掉 |
-| `collect_groups` | `""` | 只采集这些群（逗号分隔群号），留空采集全部 |
-| `quote_keep` | `10` | 每人保留的最近原话条数 |
-| `max_tracked_users` | `5000` | 最多跟踪多少个 QQ，超过自动清理最不活跃的 |
-| `flush_interval` | `60` | 采集数据落盘间隔（秒） |
+| `image_output` | `false` | 将画像渲染为图片；需要 Pillow，失败自动回退文字。 |
+| `show_avatar` | `true` | 文字回复尝试附加 QQ 头像。 |
+| `show_quotes` | `true` | 在聊天画像中展示最近发言原话。 |
+| `quote_show` | `5` | 最多展示几条原话摘录。 |
 
-**标签生成**
+### 数据采集
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `llm_tags` | `true` | 是否由 LLM 生成语义标签；关闭后只出基础标签 |
-| `llm_provider_id` | `""` | 标签用模型，留空用 AstrBot 默认模型 |
-| `llm_tag_cache_ttl` | `86400` | LLM 标签缓存多少秒后刷新；0 表示每次都重新生成 |
-| `show_quotes` | `true` | /画像 里是否显示最近发言原话 |
-| `quote_show` | `5` | show_quotes 开启时，展示最近几条原话摘录 |
-| `history_fallback` | `true` | 未采集到此人时用 AstrBot 会话历史补充 |
-| `tag_active_high_threshold` | `100` | 累计发言数达到多少打 `高活跃` |
-| `tag_active_med_threshold` | `20` | 累计发言数达到多少打 `较活跃` |
-| `tag_newcomer_days` | `7` | 首次记录在多少天内打 `新人` |
-| `tag_multi_group_threshold` | `3` | 活跃群数达到多少打 `多群出现` |
-| `tag_image_threshold` | `0.5` | 图片消息占比超过多少打 `图片刷屏` |
-| `tag_link_threshold` | `0.3` | 含链接消息占比超过多少打 `链接刷屏` |
-| `tag_mention_threshold` | `0.3` | 含@消息占比超过多少打 `频繁@人` |
-| `tag_verbose_threshold` | `80` | 平均消息长度超过多少字打 `话痨` |
-| `tag_night_threshold` | `0.3` | 夜间（0-5点）发言占比超过多少打 `夜间活跃` |
+| `passive_collect` | `true` | 被动统计消息；关闭后已有数据保留。 |
+| `collect_private` | `true` | 是否采集私聊。 |
+| `collect_groups` | `""` | 仅采集指定群，留空为全部群；不控制查询权限。 |
+| `quote_keep` | `10` | 每个 QQ 保存的最近原话条数。 |
+| `max_tracked_users` | `5000` | 超限后清理最不活跃用户。 |
+| `flush_interval` | `60` | KV 落盘间隔，单位秒，最小按 10 处理。 |
+| `history_fallback` | `true` | 无采集原话时尝试从 AstrBot 会话历史补充。 |
 
-- `/画像` 的发言摘录由 `show_quotes` 控制，关闭后不会在回复中展示原话（但仍可继续采集，用于 LLM 标签和邀请守卫判断）。
-
-**风险评分**
+### LLM 标签
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `risk_weights` | `""` | JSON 字符串，自定义每个标签的权重，例如 `{"ban_history":40,"normal":-15}` |
-| `risk_level_low` | `30` | 风险分达到多少显示为"中" |
-| `risk_level_high` | `60` | 风险分达到多少显示为"高" |
-| `risk_level_extreme` | `80` | 风险分达到多少显示为"极高" |
+| `llm_tags` | `true` | 根据原话生成语义标签；与 LLM 查询工具开关无关。 |
+| `llm_provider_id` | `""` | 标签模型 provider ID，留空使用 AstrBot 默认模型。 |
+| `llm_tag_cache_ttl` | `86400` | 标签缓存秒数；0 表示每次重新生成。 |
 
-**插件联动**
+### 规则标签阈值
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `link_invite_guard` | `true` | 读取加群邀请守卫的前科记录生成风险标签 |
-| `link_qq_tools_ban` | `true` | 读取 qq_tools 黑名单生成 `黑名单记录` 标签 |
+| `tag_active_high_threshold` | `100` | 高活跃累计发言数。 |
+| `tag_active_med_threshold` | `20` | 中活跃累计发言数。 |
+| `tag_newcomer_days` | `7` | 新人判定天数。 |
+| `tag_multi_group_threshold` | `3` | 多群出现的群数。 |
+| `tag_image_threshold` | `0.5` | 图片消息占比阈值。 |
+| `tag_link_threshold` | `0.3` | 链接消息占比阈值。 |
+| `tag_mention_threshold` | `0.3` | @消息占比阈值。 |
+| `tag_verbose_threshold` | `80` | 平均消息字符数阈值。 |
+| `tag_night_threshold` | `0.3` | 0:00-5:59 夜间消息占比阈值。 |
 
-## 与加群邀请守卫的联动
+### 风险评分
 
-本插件独立可用；如果检测到装了「加群邀请守卫」（`astrbot_plugin_group_invite_guard`），联动自动开启，无需配置：
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `risk_weights` | `""` | 标签权重 JSON，例如 `{"ban_history":40,"normal":-15}`。 |
+| `risk_level_low` | `30` | 低到中风险分界。 |
+| `risk_level_high` | `60` | 中到高风险分界。 |
+| `risk_level_extreme` | `80` | 高到极高风险分界。 |
 
-- 通过 AstrBot 共享偏好存储（`astrbot.core.sp`）只读访问邀请守卫的 `invite_records` / `join_records` / `mute_records`，以及 qq_tools 的 `ban_list`
-- 生成 `频繁邀请`、`邀请被拒`、`拉群前科`、`禁言前科`、`黑名单记录` 等风险标签
-- 邀请守卫没装、读取失败时对应标签自动省略，不影响其它标签
+### 插件联动
 
-### 给邀请守卫的 API
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `link_invite_guard` | `true` | 只读读取邀请守卫记录生成前科标签。 |
+| `link_qq_tools_ban` | `true` | 只读读取 qq_tools 黑名单生成标签。 |
 
-邀请守卫（或其它插件）可以读取标签和风险分，用于进群决策：
+## LLM 工具与可信内部 API
+
+`user_profile_query(qq)` 是面向聊天对话的 LLM 工具：
+
+- `enable_llm_tool=false` 时拒绝调用。
+- 必须能从工具上下文取得真实 `AstrMessageEvent` 和发送者身份；没有真实事件时默认拒绝。
+- 有事件时与标准命令、正则兜底完全使用同一权限规则，不能绕过 `allow_self_query`、`allow_other_query` 或指定群限制。
+
+插件间 Python API 是可信内部只读接口，不是聊天用户入口，因此不受上述聊天权限约束，确保邀请守卫等插件可在后台决策中读取画像：
 
 ```python
 md = self.context.get_registered_star("astrbot_plugin_user_profile")
 instance = getattr(md, "star_cls", None)
 if instance is not None:
-    # 带风险分的完整结果
     result = await instance.get_profile_tags_with_score(inviter_qq, event)
-    # result = {"score": 72, "level": "高", "tags": [...]}
-
-    # 只看风险分
     score = await instance.get_risk_score(inviter_qq, event)
-
-    # 只看标签
     tags = await instance.get_profile_tags(inviter_qq, event)
-    risk_tags = {"ban_history", "kick_history", "mute_history", "invite_rejected", "spam_suspect", "ad_suspect", "scam_suspect", "troll"}
-    if any(t["tag"] in risk_tags for t in tags):
-        # 提高警惕或拒绝
-        pass
+    text = await instance.get_profile_text(inviter_qq, event)
 ```
 
-- `get_profile_tags(qq, event=None) -> list[dict]`：返回标签列表，每个标签含 `tag` / `confidence` / `source` / `evidence`；无数据返回 `[]`
-- `get_profile_tags_with_score(qq, event=None) -> dict`：返回 `{"score", "level", "tags"}`
-- `get_risk_score(qq, event=None) -> int`：返回 0-100 风险分
-- `get_profile_text(qq, event=None) -> str`：保留，返回人类可读画像文本；无数据返回空串
-- 只读、无副作用；`event` 传 None 时自动跳过昵称/头像
+- `get_profile_tags(qq, event=None) -> list[dict]`
+- `get_profile_tags_with_score(qq, event=None) -> {"score", "level", "tags"}`
+- `get_risk_score(qq, event=None) -> int`
+- `get_profile_text(qq, event=None) -> str`
 
-### 标签格式示例
+这些接口只读、无敏感操作；调用方应是受信任插件，不应直接将其包装成无权限校验的聊天接口。
 
-```json
-{
-  "score": 72,
-  "level": "高",
-  "tags": [
-    {"tag": "ban_history", "confidence": 0.95, "source": "ban_list", "evidence": "在 bot 黑名单中（1 条记录）"},
-    {"tag": "ad_suspect", "confidence": 0.82, "source": "llm", "evidence": "多次发送二维码和联系方式"},
-    {"tag": "active_high", "confidence": 0.95, "source": "stats", "evidence": "发言总数 523（群聊 511 / 私聊 12）"}
-  ]
-}
-```
+## 从 1.3.x 升级
 
-## 图片输出
+AstrBot 通常已通过 `_flatten_plugin_config` 展平分组配置；插件仍兼容嵌套分组和旧扁平配置。新键只要存在就优先，旧键仅在对应新键缺失时迁移，不参与后续权限判断：
 
-开启 `image_output` 后，`/画像` 会把结果渲染成一张图片发送：
+- `public_query` → `allow_other_query`。
+- `enable_self_command` → `enable_self_shortcuts`，并在 `allow_self_query` 缺失时作为旧版自查询许可。
+- `self_query_only=true` → `allow_other_query=false`；自查询默认允许，除非旧 `enable_self_command=false` 或新 `allow_self_query=false`。
 
-- 顶部蓝色标题栏，显示 QQ 号
-- 风险分用颜色高亮：绿/黄/橙/红
-- 标签以蓝色圆角块展示，过多时自动换行
-- 按字符显示宽度自动折行，适配中英文混排
+升级后的安全默认值是 `allow_self_query=true`、`allow_other_query=false`、`enable_self_shortcuts=true`、`enable_llm_tool=true`。建议升级后在 WebUI 保存一次新配置，并删除外部手工配置中已废弃的 `public_query`、`self_query_only`、`enable_self_command`。
 
-如果环境没有安装 `Pillow`，会自动回退为文字输出。
+## 隐私与性能
 
-## 性能设计
-
-- **采集路径零 LLM 零网络**：监听只更新内存，每分钟批量落盘一次 kv
-- **LLM 标签按发言数+TTL 缓存**：发言数没变且在缓存有效期内直接用缓存；并发查询有锁防重复调用；LLM 失败降级为空
-- **查询路径全并发**：昵称、前科、黑名单用 `asyncio.gather` 并行拉取，单点失败互不影响
-- **体积有上限**：每人只留最近 N 条原话，跟踪人数超限自动清理最不活跃的
-
-## 隐私说明
-
-- 本插件会记录群员的发言原话（每人最近 N 条），且 `/画像` 默认**任何人都能查任何人**
-- 介意的群可关闭 `public_query`、开启 `self_query_only`、配置 `group_public_query_groups` 限定公开群，或用 `collect_groups` 限定采集范围
-- 画像数据仅存于本 bot 的 AstrBot 数据目录，不上传任何第三方
-
-## 已知局限
-
-- 画像严格按 QQ 号维度，**没有跨账号关联**：同一个人换个 QQ 号就是一份新档案
-- 昵称/头像依赖 OneBot V11（aiocqhttp）；其它平台仅保留发言统计
+- 原话仅保存在本 bot 的 AstrBot 数据目录；启用 LLM 标签时，原话会发送给所选模型提供方处理。
+- `show_quotes=false` 只隐藏聊天输出，不停止原话采集；如需降低隐私风险，可同时关闭 `collect_private`、减小 `quote_keep` 或关闭 `llm_tags`。
+- 采集路径不调用 LLM、不发起网络请求；LLM 标签按发言数和 TTL 缓存，并用锁避免并发重复生成。
+- 昵称和头像依赖 OneBot V11；其它平台仍可使用发言统计、标签和风险分。
+- 画像按 QQ 号维度，不做跨账号关联。
 
 ## License
 

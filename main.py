@@ -393,15 +393,34 @@ def _new_stat() -> dict:
 
 
 def _flatten_plugin_config(config: dict | None) -> dict:
-    """兼容 AstrBot 分组 schema 和旧版扁平配置。"""
+    """兼容 AstrBot 分组 schema 和旧版扁平配置，并迁移旧权限键。"""
     source = config or {}
     flattened = dict(source)
-    for section in ("basic", "permissions", "collect", "tags", "risk", "link"):
-        values = source.get(section)
+    for values in source.values():
         if isinstance(values, dict):
             for key, value in values.items():
-                # 顶层值优先，避免破坏旧版/测试中的显式扁平配置。
+                # AstrBot 通常已展平分组配置；仍兼容测试和旧实例传入的嵌套结构。
                 flattened.setdefault(key, value)
+
+    # 新键始终优先；旧键只在新键不存在时用于一次性语义迁移。
+    legacy_self_only = bool(flattened.get("self_query_only", False))
+    if "allow_self_query" not in flattened:
+        if "enable_self_command" in flattened:
+            flattened["allow_self_query"] = bool(flattened["enable_self_command"])
+        else:
+            flattened["allow_self_query"] = True
+    if "allow_other_query" not in flattened:
+        if legacy_self_only:
+            flattened["allow_other_query"] = False
+        elif "public_query" in flattened:
+            flattened["allow_other_query"] = bool(flattened["public_query"])
+        else:
+            flattened["allow_other_query"] = False
+    if "enable_self_shortcuts" not in flattened:
+        flattened["enable_self_shortcuts"] = bool(
+            flattened.get("enable_self_command", True)
+        )
+    flattened.setdefault("enable_llm_tool", True)
     return flattened
 
 
@@ -409,7 +428,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.3.2",
+    "1.4.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -426,42 +445,62 @@ class UserProfilePlugin(Star):
     def _enabled(self) -> bool:
         return bool(self.config.get("enable", True))
 
-    def _check_query_permission(self, target_qq: str, event: AstrMessageEvent) -> tuple[bool, str]:
-        """统一查询权限判断。返回 (是否允许, 拒绝原因)。管理员始终允许。"""
-        target_qq = str(target_qq or "").strip()
-        sender = str(event.get_sender_id() or "").strip()
-
-        # 1. 管理员放行
+    @staticmethod
+    def _event_identity(event) -> tuple[str, str, bool]:
+        """安全读取聊天事件身份；缺字段时按普通用户处理。"""
+        if event is None:
+            return "", "", False
         try:
-            if event.is_admin():
-                return True, ""
+            sender = str(event.get_sender_id() or "").strip()
         except Exception:
-            pass
+            sender = ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+        except Exception:
+            group_id = ""
+        try:
+            is_admin = bool(event.is_admin())
+        except Exception:
+            is_admin = False
+        return sender, group_id, is_admin
 
-        group_id = str(event.get_group_id() or "").strip()
+    def _check_query_permission(
+        self, target_qq: str, event
+    ) -> tuple[bool, str, str]:
+        """统一聊天查询权限，返回 (允许, 用户消息, 命中规则)。"""
+        target_qq = str(target_qq or "").strip()
+        if not self._enabled():
+            return False, "用户画像插件当前未启用。", "plugin_disabled"
 
-        # 2. 指定公开群全员可查
-        raw_groups = str(self.config.get("group_public_query_groups", "") or "").strip()
+        sender, group_id, is_admin = self._event_identity(event)
+        if is_admin:
+            return True, "", "admin"
+
+        if sender and sender == target_qq:
+            if self.config.get("allow_self_query", True):
+                return True, "", "allow_self_query"
+            return False, "当前不允许普通用户查询自己的画像。", "self_query_disabled"
+
+        raw_groups = str(
+            self.config.get("group_public_query_groups", "") or ""
+        ).strip()
         if raw_groups and group_id:
-            allowed = {g.strip() for g in re.split(r"[,，\s]+", raw_groups) if g.strip()}
-            if group_id in allowed:
-                return True, ""
+            allowed_groups = {
+                group.strip()
+                for group in re.split(r"[,，\s]+", raw_groups)
+                if group.strip()
+            }
+            if group_id in allowed_groups:
+                return True, "", "group_public_query"
 
-        # 3. 自查询快捷命令放行：/我的画像 /查自己 /我 /画像 自己
-        if sender and sender == target_qq and self.config.get("enable_self_command", True):
-            return True, ""
+        if self.config.get("allow_other_query", False):
+            return True, "", "allow_other_query"
 
-        # 4. 仅允许查自己
-        if self.config.get("self_query_only", False):
-            if sender and sender == target_qq:
-                return True, ""
-            return False, "当前仅允许查询自己的画像（管理员除外）。"
-
-        # 5. 全局公开查询
-        if self.config.get("public_query", True):
-            return True, ""
-
-        return False, "当前仅管理员可查询用户画像。"
+        return (
+            False,
+            "当前不允许普通用户查询他人的画像；请查询自己或联系管理员。",
+            "other_query_disabled",
+        )
 
     def _llm_tag_cache_ttl(self) -> int:
         try:
@@ -556,101 +595,104 @@ class UserProfilePlugin(Star):
     @filter.command("画像")
     async def profile_command(self, event: AstrMessageEvent):
         if not self._enabled():
+            await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
             return
         text = (event.get_message_str() or "").strip()
-        logger.info(f"user_profile: /画像 triggered, text={text!r}")
-
-        # 兜底：如果 AstrBot 把 /我的画像 /查自己 路由到 /画像，转去查自己
+        logger.info(f"user_profile: standard command triggered, text={text!r}")
+        rest = re.sub(r"^/?画像(?:\s+|$)", "", text, count=1).strip()
         if text in ("我的画像", "查自己"):
-            logger.info("user_profile: routing self-like command to self profile")
-            await self._send_self_profile(event)
-            return
-
-        match = re.search(r"\d{5,12}", text)
-        if not match:
-            await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号>")]))
-            return
-        qq = match.group(0)
-
-        allowed, reason = self._check_query_permission(qq, event)
-        if not allowed:
-            await event.send(MessageChain(chain=[Plain(reason)]))
-            return
-
-        await self._send_profile(qq, event)
+            await self._dispatch_chat_query(event, "self", "standard_routed_shortcut", True)
+        elif rest.lower() in ("自己", "我", "me"):
+            await self._dispatch_chat_query(event, "self", "standard_command")
+        elif re.fullmatch(r"\d{5,12}", rest):
+            await self._dispatch_chat_query(event, rest, "standard_command")
+        else:
+            await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号|自己>")]))
 
     @filter.command("我")
     async def self_profile_command_short(self, event: AstrMessageEvent):
-        """快捷命令 /我：查自己的画像（最不容易被 AstrBot 命令解析器吞掉）。"""
-        logger.info("user_profile: /我 triggered")
-        await self._send_self_profile(event)
+        """快捷命令 /我：查自己的画像。"""
+        await self._dispatch_chat_query(event, "self", "shortcut_/我", True)
 
     @filter.command("我的画像", alias=["查自己"])
     async def self_profile_command(self, event: AstrMessageEvent):
-        logger.info("user_profile: /我的画像 triggered")
-        await self._send_self_profile(event)
+        await self._dispatch_chat_query(event, "self", "self_shortcut", True)
 
-    @filter.regex(r"^/(?:画像|我的画像|查自己|我)")
+    @filter.regex(
+        r"^(?:/(?:我的画像|查自己|我)|/画像(?:\s+(?:自己|我|me|\d{5,12}))?)\s*$"
+    )
     async def slash_command_fallback(self, event: AstrMessageEvent):
-        """兜底：当 AstrBot 的 wake_prefix 不是 '/' 时，直接以 '/' 开头的命令
-        不会被标准 command filter 捕获。此正则在所有平台统一处理 /画像 /我的画像
-        /查自己 /我，并避开 wake_prefix='/' 时已由 command filter 处理的情况。"""
-        if not self._enabled():
-            return
+        """在 wake_prefix 不是 '/' 时处理完整、边界明确的斜杠命令。"""
         raw = (event.get_message_str() or "").strip()
-        # 如果 AstrBot 已经通过标准 command 唤醒，且剥离 wake_prefix 后不再以
-        # '/' 开头，说明 command handler 会处理，这里不再重复响应。
         if event.is_at_or_wake_command and not raw.startswith("/"):
             return
 
-        logger.info(f"user_profile: slash fallback triggered, raw={raw!r}")
-
-        # /我的画像 /查自己 /我 -> 查自己
-        if raw == "/我的画像" or raw == "/查自己" or raw == "/我":
-            await self._send_self_profile(event)
+        if raw in ("/我的画像", "/查自己", "/我"):
+            await self._dispatch_chat_query(event, "self", "regex_shortcut", True)
             event.stop_event()
             return
 
-        # /画像 ...
-        if raw.startswith("/画像"):
-            rest = raw[len("/画像"):].strip()
-            # /画像 自己 /画像 我 /画像 me /画像 不带参数 -> 查自己
-            if not rest or rest.lower() in ("自己", "我", "me"):
-                await self._send_self_profile(event)
-                event.stop_event()
-                return
-            match = re.search(r"\d{5,12}", rest)
-            if not match:
-                await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号>")]))
-                event.stop_event()
-                return
-            qq = match.group(0)
-            allowed, reason = self._check_query_permission(qq, event)
-            if not allowed:
-                await event.send(MessageChain(chain=[Plain(reason)]))
-                event.stop_event()
-                return
-            await self._send_profile(qq, event)
-            event.stop_event()
+        rest = raw[len("/画像"):].strip()
+        if not rest:
+            await event.send(MessageChain(chain=[Plain("用法：/画像 <QQ号|自己>")]))
+        elif rest.lower() in ("自己", "我", "me"):
+            await self._dispatch_chat_query(event, "self", "regex_fallback")
+        else:
+            await self._dispatch_chat_query(event, rest, "regex_fallback")
+        event.stop_event()
+
+    async def _dispatch_chat_query(
+        self,
+        event: AstrMessageEvent,
+        target: str,
+        entry: str,
+        shortcut: bool = False,
+    ):
+        """所有聊天查询入口共用的目标解析、权限判断、日志和发送逻辑。"""
+        sender, group_id, _ = self._event_identity(event)
+        if not self._enabled():
+            logger.warning(
+                f"user_profile: query denied entry={entry} sender={sender!r} "
+                f"target={target!r} group={group_id!r} rule=plugin_disabled"
+            )
+            await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
             return
+        if shortcut and not self.config.get("enable_self_shortcuts", True):
+            reason = "自查询快捷命令当前未启用；请使用 /画像 自己。"
+            logger.warning(
+                f"user_profile: query denied entry={entry} sender={sender!r} "
+                f"target={sender!r} group={group_id!r} rule=self_shortcuts_disabled"
+            )
+            await event.send(MessageChain(chain=[Plain(reason)]))
+            return
+
+        qq = sender if target == "self" else str(target or "").strip()
+        if not re.fullmatch(r"\d{5,12}", qq):
+            logger.warning(
+                f"user_profile: query denied entry={entry} sender={sender!r} "
+                f"target={qq!r} group={group_id!r} rule=invalid_qq"
+            )
+            await event.send(MessageChain(chain=[Plain("查询失败：请提供 5-12 位纯数字 QQ 号。")]))
+            return
+
+        allowed, reason, rule = self._check_query_permission(qq, event)
+        log = logger.info if allowed else logger.warning
+        log(
+            f"user_profile: query {'allowed' if allowed else 'denied'} "
+            f"entry={entry} sender={sender!r} target={qq!r} "
+            f"group={group_id!r} rule={rule}"
+        )
+        if not allowed:
+            await event.send(MessageChain(chain=[Plain(reason)]))
+            return
+        await self._send_profile(qq, event)
 
     async def _send_self_profile(self, event: AstrMessageEvent):
-        """查询并发送发送者自己的画像。"""
-        if not self._enabled():
-            logger.info("user_profile: self profile skipped, plugin disabled")
-            return
-        if not self.config.get("enable_self_command", True):
-            logger.info("user_profile: self profile skipped, enable_self_command=false")
-            return
-        sender = str(event.get_sender_id() or "").strip()
-        logger.info(f"user_profile: self profile sender={sender!r}")
-        if not re.fullmatch(r"\d{5,12}", sender):
-            await event.send(MessageChain(chain=[Plain("无法获取你的 QQ 号")]))
-            return
-        await self._send_profile(sender, event)
+        """兼容旧调用方；按快捷命令入口查询发送者自己的画像。"""
+        await self._dispatch_chat_query(event, "self", "legacy_self_helper", True)
 
     async def _send_profile(self, qq: str, event: AstrMessageEvent):
-        """查询并发送画像的公共逻辑。"""
+        """已通过聊天权限校验后生成并发送画像。"""
         logger.info(f"user_profile: _send_profile qq={qq!r}")
         try:
             profile = await self._build_profile_text(qq, event)
@@ -670,13 +712,33 @@ class UserProfilePlugin(Star):
 
     @filter.llm_tool(name="user_profile_query")
     async def user_profile_query(self, event, qq: str):
-        """查询指定 QQ 号用户的画像标签与综合风险分：活跃度、风险标签、LLM 语义标签。用于判断该用户是否可信、是否适合进群。需要了解某个 QQ 用户的背景时调用。"""
-        event = _unwrap_event(event)
+        """按触发聊天用户的权限查询指定 QQ 画像；无真实事件时拒绝。"""
         if not self._enabled():
             return "用户画像插件当前未启用。"
+        if not self.config.get("enable_llm_tool", True):
+            return "用户画像 LLM 查询工具当前未启用。"
+
+        event = _unwrap_event(event)
+        sender, group_id, _ = self._event_identity(event)
+        if not sender:
+            logger.warning(
+                "user_profile: LLM query denied sender='' target=%r group='' "
+                "rule=missing_event" % (qq,)
+            )
+            return "查询被拒绝：无法确认触发查询的真实用户身份。"
+
         qq = str(qq or "").strip()
         if not re.fullmatch(r"\d{5,12}", qq):
             return "查询失败：请提供 5-12 位纯数字 QQ 号。"
+        allowed, reason, rule = self._check_query_permission(qq, event)
+        log = logger.info if allowed else logger.warning
+        log(
+            f"user_profile: LLM query {'allowed' if allowed else 'denied'} "
+            f"sender={sender!r} target={qq!r} group={group_id!r} rule={rule}"
+        )
+        if not allowed:
+            return f"查询被拒绝：{reason}"
+
         result = await self.get_profile_tags_with_score(qq, event)
         tags = result.get("tags") or []
         if not tags:
@@ -685,8 +747,11 @@ class UserProfilePlugin(Star):
             f"QQ {qq} 的综合风险分：{result['score']}（{result['level']}）",
             "标签：",
         ]
-        for t in tags:
-            lines.append(f"- {_tag_display(t['tag'])}（置信度 {t['confidence']}，来源 {t['source']}）{t.get('evidence', '')}")
+        for tag in tags:
+            lines.append(
+                f"- {_tag_display(tag['tag'])}（置信度 {tag['confidence']}，来源 {tag['source']}）"
+                f"{tag.get('evidence', '')}"
+            )
         return "\n".join(lines)
 
     # ---------------- 画像组装 ----------------
@@ -938,10 +1003,10 @@ class UserProfilePlugin(Star):
             logger.warning(f"user_profile: render image failed: {exc}")
             return None
 
-    # ---------------- 对外 API（供加群邀请守卫等插件读取标签） ----------------
+    # ---------------- 可信插件间 API（只读，不套聊天用户权限） ----------------
 
     async def get_profile_tags_with_score(self, qq: str, event=None) -> dict:
-        """返回标签列表 + 综合风险分 + 风险等级。"""
+        """可信插件内部只读 API：返回标签、风险分和等级，不校验聊天权限。"""
         tags = await self.get_profile_tags(qq, event)
         score = self._calc_risk_score(tags)
         return {"score": score, "level": _risk_level(score, self.config), "tags": tags}
@@ -959,6 +1024,7 @@ class UserProfilePlugin(Star):
                 result = await instance.get_profile_tags_with_score(inviter_qq, event)
 
         event 可传 None：缺少 OneBot 上下文时自动跳过昵称/头像。
+        此接口只供可信插件内部调用，不受聊天查询权限开关影响，也不应直接暴露给用户。
         未采集到该用户任何数据时返回 []（方便调用方直接判空）。
         """
         if not self._enabled():

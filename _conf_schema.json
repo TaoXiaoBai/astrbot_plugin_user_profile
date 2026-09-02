@@ -1,31 +1,13 @@
 {
   "basic": {
-    "description": "基础",
+    "description": "基础开关",
     "type": "object",
     "items": {
       "enable": {
         "description": "启用插件",
         "type": "bool",
         "default": true,
-        "hint": "总开关；关闭后停止采集、/画像 与 LLM 工具都不再响应"
-      },
-      "public_query": {
-        "description": "公开查询",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后任何人都能用 /画像 查别人；关闭则仅管理员可用"
-      },
-      "show_avatar": {
-        "description": "回复带头像",
-        "type": "bool",
-        "default": true,
-        "hint": "/画像 回复里附上对方 QQ 头像（仅文字模式生效）"
-      },
-      "image_output": {
-        "description": "图片形式输出",
-        "type": "bool",
-        "default": false,
-        "hint": "/画像 以图片形式发送，避免刷屏；需要环境安装 Pillow"
+        "hint": "插件总开关。关闭后停止数据采集，并明确拒绝标准命令、斜杠正则兜底、自查询快捷命令和 LLM 查询工具；已有画像数据保留。"
       }
     }
   },
@@ -33,29 +15,65 @@
     "description": "查询权限",
     "type": "object",
     "items": {
-      "self_query_only": {
-        "description": "仅允许查自己",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后非管理员只能用 /画像 查自己的 QQ，管理员和指定公开群除外"
-      },
-      "group_public_query_groups": {
-        "description": "全员可查的群",
-        "type": "string",
-        "default": "",
-        "hint": "逗号分隔群号；在这些群里所有成员都能查任意 QQ 画像，不受“仅查自己”限制"
-      },
-      "enable_self_command": {
-        "description": "启用 /我的画像",
+      "allow_self_query": {
+        "description": "允许查询自己",
         "type": "bool",
         "default": true,
-        "hint": "开启后可用 /我的画像 快速查询自己的画像"
+        "hint": "允许非管理员查询自己的画像。关闭后普通用户使用 /画像 自己、/画像 <自己的QQ> 或自查询快捷命令都会被拒绝；AstrBot 管理员始终允许。"
       },
-      "llm_tag_cache_ttl": {
-        "description": "LLM 标签缓存时间",
+      "allow_other_query": {
+        "description": "允许查询他人",
+        "type": "bool",
+        "default": false,
+        "hint": "允许非管理员在群聊或私聊查询其他 QQ。默认关闭以保护隐私；管理员和 group_public_query_groups 中的群不受此限制。"
+      },
+      "group_public_query_groups": {
+        "description": "指定公开查询群",
+        "type": "string",
+        "default": "",
+        "hint": "逗号、中文逗号或空白分隔群号，例如 123456,789012。成员仅在这些群的聊天事件中可查询任意人；私聊和未列出的群仍按 allow_other_query 判断。留空表示无群例外。"
+      },
+      "enable_self_shortcuts": {
+        "description": "启用自查询快捷命令",
+        "type": "bool",
+        "default": true,
+        "hint": "控制 /我、/我的画像、/查自己 是否可用。关闭只禁用这些快捷入口，并返回明确提示；/画像 自己和 /画像 <自己的QQ> 仍由 allow_self_query 决定。"
+      },
+      "enable_llm_tool": {
+        "description": "启用 LLM 查询工具",
+        "type": "bool",
+        "default": true,
+        "hint": "允许对话 LLM 调用 user_profile_query。工具使用触发对话用户的同一套权限；无法取得真实聊天事件或身份时默认拒绝。此开关不影响可信插件间 Python API。"
+      }
+    }
+  },
+  "output": {
+    "description": "输出与隐私",
+    "type": "object",
+    "items": {
+      "image_output": {
+        "description": "图片形式输出",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后将画像渲染为图片以减少长文本刷屏，需要 Pillow；渲染失败会自动回退文字。图片模式不单独附加头像。"
+      },
+      "show_avatar": {
+        "description": "文字回复带头像",
+        "type": "bool",
+        "default": true,
+        "hint": "文字模式下尝试附加目标 QQ 头像，仅 OneBot V11 可用；关闭可减少外部头像请求，图片输出模式不使用此项。"
+      },
+      "show_quotes": {
+        "description": "展示发言摘录",
+        "type": "bool",
+        "default": true,
+        "hint": "控制聊天画像中是否展示最近发言原话。关闭仅隐藏输出，采集和 LLM 标签仍可能使用原话；涉及隐私时建议同时审查 quote_keep 和 collect_private。"
+      },
+      "quote_show": {
+        "description": "摘录展示条数",
         "type": "int",
-        "default": 86400,
-        "hint": "LLM 标签缓存多少秒后刷新；0 表示每次查询都重新生成"
+        "default": 5,
+        "hint": "show_quotes 开启时最多展示的最近原话条数，单位为条；小于 1 的值按 1 处理，不能超过实际保存数量。"
       }
     }
   },
@@ -67,128 +85,83 @@
         "description": "被动采集发言",
         "type": "bool",
         "default": true,
-        "hint": "静默统计每个 QQ 的发言数与原话；关闭后不再采集，已有数据保留"
+        "hint": "静默统计消息数量、群分布和行为信号，并按 quote_keep 保存最近原话。关闭后停止新增采集，已有数据不会删除。"
       },
       "collect_private": {
         "description": "采集私聊",
         "type": "bool",
         "default": true,
-        "hint": "是否统计私聊发言；在意隐私可关掉，只留群聊"
+        "hint": "是否统计私聊消息并保存其原话。关闭后只采集群消息；如对私聊隐私敏感，建议关闭。"
       },
       "collect_groups": {
-        "description": "采集群列表",
+        "description": "采集群范围",
         "type": "string",
         "default": "",
-        "hint": "只采集这些群，逗号分隔群号；留空采集全部群"
+        "hint": "仅采集列出的群，支持逗号、中文逗号或空白分隔，例如 123456 789012；留空采集全部群。此项不控制查询权限。"
       },
       "quote_keep": {
-        "description": "原话保留条数",
+        "description": "原话保存条数",
         "type": "int",
         "default": 10,
-        "hint": "每个 QQ 保留最近多少条发言原话"
+        "hint": "每个 QQ 保留的最近发言原话数量，单位为条；最小按 1 处理。数值越大，画像与 LLM 标签材料越多，同时占用更多存储并提高隐私风险。"
       },
       "max_tracked_users": {
         "description": "最多跟踪人数",
         "type": "int",
         "default": 5000,
-        "hint": "超过后自动清掉最不活跃的用户，防数据无限涨"
+        "hint": "内存中最多保留的用户数；最小按 100 处理。超限时按最近活跃时间清理最不活跃用户及其原话，防止数据无限增长。"
       },
       "flush_interval": {
-        "description": "落盘间隔（秒）",
+        "description": "落盘间隔",
         "type": "int",
         "default": 60,
-        "hint": "采集数据先攒在内存，每隔这么久批量写入一次磁盘"
-      }
-    }
-  },
-  "tags": {
-    "description": "标签生成",
-    "type": "object",
-    "items": {
-      "llm_tags": {
-        "description": "LLM 语义标签",
-        "type": "bool",
-        "default": true,
-        "hint": "由 LLM 根据最近原话自动打 spam_suspect / ad_suspect / troll 等语义标签；发言数没变就用缓存"
-      },
-      "llm_provider_id": {
-        "description": "标签用模型",
-        "type": "string",
-        "default": "",
-        "hint": "生成 LLM 标签用的模型，留空用 AstrBot 默认模型"
-      },
-      "show_quotes": {
-        "description": "展示发言摘录",
-        "type": "bool",
-        "default": true,
-        "hint": "/画像 里是否显示最近发言原话；关闭后只出标签、风险分和活跃度"
-      },
-      "quote_show": {
-        "description": "原话展示条数",
-        "type": "int",
-        "default": 5,
-        "hint": "show_quotes 开启时，/画像 里展示最近几条发言摘录"
+        "hint": "内存统计批量写入 AstrBot KV 的间隔，单位为秒；最小按 10 秒处理。较短更抗意外退出，但会增加磁盘写入。"
       },
       "history_fallback": {
         "description": "会话历史补充",
         "type": "bool",
         "default": true,
-        "hint": "自己没采集到此人时，改用 AstrBot 会话历史搜 TA 的发言原话"
-      },
-      "tag_active_high_threshold": {
-        "description": "高活跃阈值",
-        "type": "int",
-        "default": 100,
-        "hint": "累计发言数达到多少打 active_high 标签"
-      },
-      "tag_active_med_threshold": {
-        "description": "中活跃阈值",
-        "type": "int",
-        "default": 20,
-        "hint": "累计发言数达到多少打 active_medium 标签"
-      },
-      "tag_newcomer_days": {
-        "description": "新人判定天数",
-        "type": "int",
-        "default": 7,
-        "hint": "首次记录在多少天内打 newcomer 标签"
-      },
-      "tag_multi_group_threshold": {
-        "description": "多群判定阈值",
-        "type": "int",
-        "default": 3,
-        "hint": "活跃群数达到多少打 multi_group 标签"
-      },
-      "tag_image_threshold": {
-        "description": "图片刷屏阈值",
-        "type": "float",
-        "default": 0.5,
-        "hint": "图片消息占比超过多少打 image_spammer 标签"
-      },
-      "tag_link_threshold": {
-        "description": "链接刷屏阈值",
-        "type": "float",
-        "default": 0.3,
-        "hint": "含链接消息占比超过多少打 link_spammer 标签"
-      },
-      "tag_mention_threshold": {
-        "description": "频繁@阈值",
-        "type": "float",
-        "default": 0.3,
-        "hint": "含@消息占比超过多少打 mention_heavy 标签"
-      },
-      "tag_verbose_threshold": {
-        "description": "话痨阈值",
-        "type": "int",
-        "default": 80,
-        "hint": "平均消息长度超过多少字打 verbose 标签"
-      },
-      "tag_night_threshold": {
-        "description": "夜间活跃阈值",
-        "type": "float",
-        "default": 0.3,
-        "hint": "夜间（0-5点）发言占比超过多少打 night_active 标签"
+        "hint": "未采集到目标原话时，尝试从 AstrBot 会话历史中只读搜索该 QQ 的发言。关闭可避免读取历史会话，但可能减少标签材料。"
       }
+    }
+  },
+  "llm_tags_group": {
+    "description": "LLM 标签",
+    "type": "object",
+    "items": {
+      "llm_tags": {
+        "description": "启用语义标签",
+        "type": "bool",
+        "default": true,
+        "hint": "根据已保存原话生成广告、刷屏、诈骗、友好等语义标签。关闭后只生成规则标签和风险分，不影响 user_profile_query 工具是否注册可用。"
+      },
+      "llm_provider_id": {
+        "description": "标签模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于生成语义标签的 AstrBot provider ID；留空使用全局默认模型。填写不存在或不可用的 ID 时自动降级为无 LLM 标签。"
+      },
+      "llm_tag_cache_ttl": {
+        "description": "标签缓存时间",
+        "type": "int",
+        "default": 86400,
+        "hint": "LLM 标签缓存有效期，单位为秒。默认 86400（24 小时）；0 表示每次查询都重新生成。发言数量变化也会使缓存失效。"
+      }
+    }
+  },
+  "tag_thresholds": {
+    "description": "规则标签阈值",
+    "type": "object",
+    "items": {
+      "tag_active_high_threshold": {"description": "高活跃阈值", "type": "int", "default": 100, "hint": "累计群聊与私聊发言数达到此值时标记 active_high，单位为条；应高于中活跃阈值。"},
+      "tag_active_med_threshold": {"description": "中活跃阈值", "type": "int", "default": 20, "hint": "累计发言数达到此值且未达到高活跃阈值时标记 active_medium，单位为条。"},
+      "tag_newcomer_days": {"description": "新人判定天数", "type": "int", "default": 7, "hint": "首次记录距今不超过此天数时标记 newcomer，单位为天；建议使用非负整数。"},
+      "tag_multi_group_threshold": {"description": "多群判定阈值", "type": "int", "default": 3, "hint": "出现过的不同群数量达到此值时标记 multi_group，单位为群数。"},
+      "tag_image_threshold": {"description": "图片消息占比", "type": "float", "default": 0.5, "hint": "图片或空文本富媒体消息占总消息比例达到此值时标记 image_spammer；范围建议 0-1，例如 0.5 表示 50%。"},
+      "tag_link_threshold": {"description": "链接消息占比", "type": "float", "default": 0.3, "hint": "含链接次数占总消息比例达到此值时标记 link_spammer；范围建议 0-1，例如 0.3 表示 30%。"},
+      "tag_mention_threshold": {"description": "@消息占比", "type": "float", "default": 0.3, "hint": "检测到 @ 的次数占总消息比例达到此值时标记 mention_heavy；范围建议 0-1。"},
+      "tag_verbose_threshold": {"description": "平均消息长度", "type": "int", "default": 80, "hint": "平均每条消息字符数达到此值时标记 verbose，单位为字符。"},
+      "tag_night_threshold": {"description": "夜间发言占比", "type": "float", "default": 0.3, "hint": "本机时间 0:00-5:59 的消息占比达到此值时标记 night_active；范围建议 0-1。"}
     }
   },
   "risk": {
@@ -196,29 +169,14 @@
     "type": "object",
     "items": {
       "risk_weights": {
-        "description": "风险权重",
+        "description": "标签风险权重",
         "type": "string",
         "default": "",
-        "hint": "JSON 对象，自定义每个标签对风险分的影响，例如 {\"ban_history\":40,\"normal\":-15}；留空用默认权重"
+        "hint": "JSON 对象字符串，例如 {\"ban_history\":40,\"normal\":-15}。正数提高、负数降低以 50 为基准的风险分；留空或 JSON 无效时使用内置权重。"
       },
-      "risk_level_low": {
-        "description": "低→中风险分界线",
-        "type": "int",
-        "default": 30,
-        "hint": "风险分达到多少显示为 \"中\" "
-      },
-      "risk_level_high": {
-        "description": "中→高风险分界线",
-        "type": "int",
-        "default": 60,
-        "hint": "风险分达到多少显示为 \"高\" "
-      },
-      "risk_level_extreme": {
-        "description": "高→极高风险分界线",
-        "type": "int",
-        "default": 80,
-        "hint": "风险分达到多少显示为 \"极高\" "
-      }
+      "risk_level_low": {"description": "低到中分界", "type": "int", "default": 30, "hint": "风险分达到此值显示为“中”，范围建议 0-100，并应低于高风险分界。"},
+      "risk_level_high": {"description": "中到高分界", "type": "int", "default": 60, "hint": "风险分达到此值显示为“高”，范围建议 0-100，并应位于低与极高分界之间。"},
+      "risk_level_extreme": {"description": "高到极高分界", "type": "int", "default": 80, "hint": "风险分达到此值显示为“极高”，范围建议 0-100，并应高于高风险分界。"}
     }
   },
   "link": {
@@ -229,13 +187,13 @@
         "description": "联动邀请守卫",
         "type": "bool",
         "default": true,
-        "hint": "读取加群邀请守卫的前科记录生成 ban_history / frequent_inviter 等标签；没装该插件自动跳过"
+        "hint": "只读获取加群邀请守卫的邀请、入群和禁言记录以生成前科标签；插件未安装或读取失败时自动跳过。可信内部 API 不受聊天查询权限限制。"
       },
       "link_qq_tools_ban": {
-        "description": "联动黑名单",
+        "description": "联动 QQ 黑名单",
         "type": "bool",
         "default": true,
-        "hint": "读取 qq_tools 黑名单生成 ban_history 标签；没装自动跳过"
+        "hint": "只读获取 astrbot_plugin_qq_tools 的 ban_list 以生成 ban_history；插件未安装或读取失败时自动跳过，不执行拉黑或其他写操作。"
       }
     }
   }
