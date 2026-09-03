@@ -443,7 +443,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.5.1",
+    "1.5.2",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -688,40 +688,71 @@ class UserProfilePlugin(Star):
         )
 
         await self._ensure_loaded()
-        targets: list[str] = []
+        all_targets: list[str] = []
+        single_mode = False
         if not rest or rest in ("全部", "所有"):
-            targets = list(self._stats.keys())
+            all_targets = list(self._stats.keys())
         elif rest == "本群":
             if not group_id:
                 await event.send(MessageChain(chain=[Plain("当前无群上下文，无法按本群扫描。")]))
                 return
-            targets = [
+            all_targets = [
                 qq
                 for qq, st in self._stats.items()
                 if group_id in (st.get("groups") or {})
             ]
         elif re.fullmatch(r"\d{5,12}", rest):
-            targets = [rest]
+            all_targets = [rest]
+            single_mode = True
         else:
             await event.send(MessageChain(chain=[Plain("用法：/画像扫描 <QQ号|本群|全部>")]))
             return
 
-        if not targets:
+        if not all_targets:
             await event.send(MessageChain(chain=[Plain("没有可扫描对象：请先让插件采集到发言，或提供具体 QQ 号。")]))
             return
 
         limit = self._history_scan_batch_limit()
-        total_n = len(targets)
-        truncated = total_n > limit
-        if truncated:
-            targets = targets[:limit]
+
+        if single_mode:
+            qq = all_targets[0]
+            if (self._stats.get(qq) or {}).get("history_complete"):
+                await event.send(MessageChain(chain=[Plain(f"QQ {qq} 已完成历史扫描，无需重复扫描。")]))
+                return
+            targets = [qq]
+            pending_total = 1
+            remaining = 0
+        else:
+            # 只扫尚未完成的，避免每次都截断在同一批前 N 人而漏掉其余人
+            pending = [
+                qq
+                for qq in all_targets
+                if not (self._stats.get(qq) or {}).get("history_complete")
+            ]
+            pending_total = len(pending)
+            remaining = max(0, pending_total - limit)
+            targets = pending[:limit]
+
+        if not targets:
+            await event.send(MessageChain(chain=[Plain("没有待扫描对象：所有人均已完成历史扫描。")]))
+            return
 
         logger.info(
-            f"user_profile: history scan start total={total_n} limit={limit} truncated={truncated}"
+            f"user_profile: history scan start pending_total={pending_total} "
+            f"limit={limit} targets={len(targets)} remaining={remaining}"
         )
-        await event.send(MessageChain(chain=[Plain(
-            f"开始历史扫描：共 {total_n} 人，本次最多处理 {limit} 人…"
-        )]))
+        if single_mode:
+            await event.send(MessageChain(chain=[Plain(
+                f"开始历史扫描：QQ {targets[0]} …"
+            )]))
+        elif remaining:
+            await event.send(MessageChain(chain=[Plain(
+                f"开始历史扫描：待扫 {pending_total} 人，本次处理 {len(targets)} 人；剩余 {remaining} 人可再次执行 /画像扫描 全部 继续…"
+            )]))
+        else:
+            await event.send(MessageChain(chain=[Plain(
+                f"开始历史扫描：待扫 {pending_total} 人，本次处理 {len(targets)} 人…"
+            )]))
 
         done = 0
         backfilled = 0
@@ -743,10 +774,10 @@ class UserProfilePlugin(Star):
         except Exception as exc:
             logger.warning(f"user_profile: manual scan flush failed: {exc}")
 
-        suffix = "（已达单次上限）" if truncated else ""
+        suffix = f"；剩余 {remaining} 人待下次扫描" if remaining else ""
         logger.info(
-            f"user_profile: history scan done total={total_n} done={done} "
-            f"backfilled={backfilled} failed={failed}"
+            f"user_profile: history scan done targets={len(targets)} done={done} "
+            f"backfilled={backfilled} failed={failed} remaining={remaining}"
         )
         await event.send(MessageChain(chain=[Plain(
             f"历史扫描完成：处理 {done} 人，回填历史时间 {backfilled} 人，失败 {failed} 人{suffix}。"
