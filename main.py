@@ -443,7 +443,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.5.0",
+    "1.5.1",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -635,12 +635,18 @@ class UserProfilePlugin(Star):
         await self._dispatch_chat_query(event, "self", "self_shortcut", True)
 
     @filter.regex(
-        r"^(?:/(?:我的画像|查自己|我)|/画像(?:\s+(?:自己|我|me|\d{5,12}))?)\s*$"
+        r"^(?:/(?:我的画像|查自己|我|画像扫描(?:\s+(?:全部|所有|本群|\d{5,12}))?)|/画像(?:\s+(?:自己|我|me|\d{5,12}))?)\s*$"
     )
     async def slash_command_fallback(self, event: AstrMessageEvent):
         """在 wake_prefix 不是 '/' 时处理完整、边界明确的斜杠命令。"""
         raw = (event.get_message_str() or "").strip()
         if event.is_at_or_wake_command and not raw.startswith("/"):
+            return
+
+        # 历史扫描走同一正则兜底，避免依赖 wake_prefix
+        if raw.startswith("/画像扫描"):
+            await self.history_scan_command(event)
+            event.stop_event()
             return
 
         if raw in ("/我的画像", "/查自己", "/我"):
@@ -663,8 +669,11 @@ class UserProfilePlugin(Star):
         if not self._enabled():
             await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
             return
-        _, group_id, is_admin = self._event_identity(event)
+        sender, group_id, is_admin = self._event_identity(event)
         if not is_admin:
+            logger.warning(
+                f"user_profile: history scan denied sender={sender!r} group={group_id!r} rule=not_admin"
+            )
             await event.send(MessageChain(chain=[Plain("历史扫描仅限管理员使用。")]))
             return
         if not self.config.get("history_scan_enabled", True):
@@ -673,6 +682,10 @@ class UserProfilePlugin(Star):
 
         text = (event.get_message_str() or "").strip()
         rest = re.sub(r"^/?画像扫描(?:\s+|$)", "", text, count=1).strip()
+        logger.info(
+            f"user_profile: history scan command triggered sender={sender!r} "
+            f"group={group_id!r} rest={rest!r}"
+        )
 
         await self._ensure_loaded()
         targets: list[str] = []
@@ -703,6 +716,9 @@ class UserProfilePlugin(Star):
         if truncated:
             targets = targets[:limit]
 
+        logger.info(
+            f"user_profile: history scan start total={total_n} limit={limit} truncated={truncated}"
+        )
         await event.send(MessageChain(chain=[Plain(
             f"开始历史扫描：共 {total_n} 人，本次最多处理 {limit} 人…"
         )]))
@@ -728,6 +744,10 @@ class UserProfilePlugin(Star):
             logger.warning(f"user_profile: manual scan flush failed: {exc}")
 
         suffix = "（已达单次上限）" if truncated else ""
+        logger.info(
+            f"user_profile: history scan done total={total_n} done={done} "
+            f"backfilled={backfilled} failed={failed}"
+        )
         await event.send(MessageChain(chain=[Plain(
             f"历史扫描完成：处理 {done} 人，回填历史时间 {backfilled} 人，失败 {failed} 人{suffix}。"
         )]))
