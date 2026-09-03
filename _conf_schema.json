@@ -61,7 +61,7 @@
         "description": "文字回复带头像",
         "type": "bool",
         "default": true,
-        "hint": "文字模式下尝试附加目标 QQ 头像，仅 OneBot V11 可用；关闭可减少外部头像请求，图片输出模式不使用此项。"
+        "hint": "文字模式下附加目标 QQ 头像（仅 OneBot V11 可用）。当前版本暂未实现头像附加，此配置项保留但暂不生效；图片输出模式不使用此项。"
       },
       "show_quotes": {
         "description": "展示发言摘录",

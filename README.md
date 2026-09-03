@@ -98,7 +98,7 @@
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `image_output` | `false` | 将画像渲染为图片；需要 Pillow，失败自动回退文字。 |
-| `show_avatar` | `true` | 文字回复尝试附加 QQ 头像。 |
+| `show_avatar` | `true` | 文字回复附加 QQ 头像；当前版本暂未实现头像附加，此配置项保留但暂不生效。 |
 | `show_quotes` | `true` | 在聊天画像中展示最近发言原话。 |
 | `quote_show` | `5` | 最多展示几条原话摘录。 |
 
