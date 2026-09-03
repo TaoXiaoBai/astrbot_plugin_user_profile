@@ -125,6 +125,42 @@
       }
     }
   },
+  "history_scan": {
+    "description": "历史扫描",
+    "type": "object",
+    "items": {
+      "history_scan_enabled": {
+        "description": "启用历史扫描",
+        "type": "bool",
+        "default": true,
+        "hint": "按需只读扫描 AstrBot 已保存的会话历史，回填首次/最近出现时间与原话，避免插件刚安装时把群聊老人误标为新人。关闭后历史状态未知，不再打新人标签。"
+      },
+      "history_scan_pages": {
+        "description": "扫描页数",
+        "type": "int",
+        "default": 3,
+        "hint": "每次扫描最多翻几页会话历史，页数越大覆盖越全但越慢；最小按 1 处理。单个 QQ 匹配的会话数通常很少，一般无需调大。"
+      },
+      "history_scan_page_size": {
+        "description": "每页会话数",
+        "type": "int",
+        "default": 10,
+        "hint": "每次扫描每页返回的会话数，最小按 1 处理。与扫描页数相乘即单次最多读取的会话数。"
+      },
+      "history_scan_cooldown": {
+        "description": "扫描冷却时间",
+        "type": "int",
+        "default": 3600,
+        "hint": "同一 QQ 两次自动扫描之间的最小间隔，单位为秒；0 表示不冷却。避免每次查询反复扫库拖慢决策；管理员手动 /画像扫描 会绕过冷却。"
+      },
+      "history_scan_batch_limit": {
+        "description": "批量扫描上限",
+        "type": "int",
+        "default": 200,
+        "hint": "管理员 /画像扫描 全部/本群 时单次最多处理的人数，最小按 1 处理，防止一次性扫库过久。"
+      }
+    }
+  },
   "llm_tags_group": {
     "description": "LLM 标签",
     "type": "object",

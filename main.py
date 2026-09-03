@@ -143,10 +143,18 @@ class TagEngine:
         total = g_count + p_count
         groups = st.get("groups") or {}
         group_count = len(groups)
-        g_first = int(st.get("g_first") or 0)
-        p_first = int(st.get("p_first") or 0)
-        first_seen = min([x for x in (g_first, p_first) if x]) or 0
-        last_seen = max([x for x in (st.get("g_last") or 0, st.get("p_last") or 0) if x]) or 0
+        first_values = [
+            int(x)
+            for x in (st.get("g_first"), st.get("p_first"), st.get("history_first"))
+            if x
+        ]
+        last_values = [
+            int(x)
+            for x in (st.get("g_last"), st.get("p_last"), st.get("history_last"))
+            if x
+        ]
+        first_seen = min(first_values) if first_values else 0
+        last_seen = max(last_values) if last_values else 0
 
         # 活跃度标签
         high = int(self.config.get("tag_active_high_threshold", 100) or 100)
@@ -158,9 +166,10 @@ class TagEngine:
         elif total > 0:
             tags.append(self._tag("active_low", 0.8, "stats", f"发言总数仅 {total}"))
 
-        # 新人标签
+        # 新人标签：仅在完成历史扫描后、且首次出现时间足够近时打标，
+        # 避免插件刚安装时把历史久远的群聊老人误标为新人。
         newcomer_days = int(self.config.get("tag_newcomer_days", 7) or 7)
-        if first_seen and (now - first_seen) <= newcomer_days * 86400:
+        if first_seen and (now - first_seen) <= newcomer_days * 86400 and st.get("history_complete"):
             tags.append(self._tag("newcomer", 0.85, "stats", f"首次记录于 {_fmt_time(first_seen)}"))
 
         # 多群出现
@@ -389,6 +398,12 @@ def _new_stat() -> dict:
         "mentions": 0,
         "total_chars": 0,
         "night_count": 0,
+        # 历史扫描回填：最早/最近出现时间、扫描完成标志、最近扫描时间、历史原话
+        "history_first": 0,
+        "history_last": 0,
+        "history_complete": False,
+        "history_scanned_at": 0,
+        "history_quotes": [],
     }
 
 
@@ -428,7 +443,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.4.0",
+    "1.5.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -440,6 +455,7 @@ class UserProfilePlugin(Star):
         self._flush_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
         self._tag_lock = asyncio.Lock()  # 防止并发查询重复调 LLM
+        self._scan_lock = asyncio.Lock()  # 防止并发历史扫描重复查询
         self._tag_engine = TagEngine(self.config)
 
     def _enabled(self) -> bool:
@@ -641,6 +657,81 @@ class UserProfilePlugin(Star):
             await self._dispatch_chat_query(event, rest, "regex_fallback")
         event.stop_event()
 
+    @filter.command("画像扫描")
+    async def history_scan_command(self, event: AstrMessageEvent):
+        """管理员手动扫描历史：/画像扫描 <QQ号|本群|全部>，用于批量预热历史状态。"""
+        if not self._enabled():
+            await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
+            return
+        _, group_id, is_admin = self._event_identity(event)
+        if not is_admin:
+            await event.send(MessageChain(chain=[Plain("历史扫描仅限管理员使用。")]))
+            return
+        if not self.config.get("history_scan_enabled", True):
+            await event.send(MessageChain(chain=[Plain("历史扫描功能当前未启用。")]))
+            return
+
+        text = (event.get_message_str() or "").strip()
+        rest = re.sub(r"^/?画像扫描(?:\s+|$)", "", text, count=1).strip()
+
+        await self._ensure_loaded()
+        targets: list[str] = []
+        if not rest or rest in ("全部", "所有"):
+            targets = list(self._stats.keys())
+        elif rest == "本群":
+            if not group_id:
+                await event.send(MessageChain(chain=[Plain("当前无群上下文，无法按本群扫描。")]))
+                return
+            targets = [
+                qq
+                for qq, st in self._stats.items()
+                if group_id in (st.get("groups") or {})
+            ]
+        elif re.fullmatch(r"\d{5,12}", rest):
+            targets = [rest]
+        else:
+            await event.send(MessageChain(chain=[Plain("用法：/画像扫描 <QQ号|本群|全部>")]))
+            return
+
+        if not targets:
+            await event.send(MessageChain(chain=[Plain("没有可扫描对象：请先让插件采集到发言，或提供具体 QQ 号。")]))
+            return
+
+        limit = self._history_scan_batch_limit()
+        total_n = len(targets)
+        truncated = total_n > limit
+        if truncated:
+            targets = targets[:limit]
+
+        await event.send(MessageChain(chain=[Plain(
+            f"开始历史扫描：共 {total_n} 人，本次最多处理 {limit} 人…"
+        )]))
+
+        done = 0
+        backfilled = 0
+        failed = 0
+        for qq in targets:
+            try:
+                before = dict(self._stats.get(qq) or {})
+                await self._ensure_history_scanned(qq, force=True)
+                after = self._stats.get(qq) or {}
+                if int(after.get("history_first") or 0) and not int(before.get("history_first") or 0):
+                    backfilled += 1
+                done += 1
+            except Exception as exc:
+                logger.warning(f"user_profile: manual scan '{qq}' failed: {exc}")
+                failed += 1
+
+        try:
+            await self._flush()
+        except Exception as exc:
+            logger.warning(f"user_profile: manual scan flush failed: {exc}")
+
+        suffix = "（已达单次上限）" if truncated else ""
+        await event.send(MessageChain(chain=[Plain(
+            f"历史扫描完成：处理 {done} 人，回填历史时间 {backfilled} 人，失败 {failed} 人{suffix}。"
+        )]))
+
     async def _dispatch_chat_query(
         self,
         event: AstrMessageEvent,
@@ -803,7 +894,9 @@ class UserProfilePlugin(Star):
         if self.config.get("show_quotes", True):
             quotes = list(self._quotes.get(qq) or [])
             if not quotes:
-                history_lines = await self._search_history_quotes(qq)
+                history_lines = list(stats.get("history_quotes") or [])
+                if not history_lines and not self.config.get("history_scan_enabled", True):
+                    history_lines = await self._search_history_quotes(qq)
                 if history_lines:
                     lines.append("历史会话中的发言（来自 AstrBot 会话记录补充）：\n" + "\n".join(history_lines))
             else:
@@ -1034,13 +1127,17 @@ class UserProfilePlugin(Star):
             return []
 
         await self._ensure_loaded()
+        # 按需回填历史时间/原话（受开关、冷却与 history_complete 控制）
+        await self._ensure_history_scanned(qq)
         st = self._stats.get(qq) or {}
         quotes = list(self._quotes.get(qq) or [])
 
-        # 自己没采集到时，用 AstrBot 会话历史补充原话
-        history_lines = []
+        # 自己没采集到时，用历史扫描回填的原话补充标签材料
         if not quotes and self.config.get("history_fallback", True):
-            history_lines = await self._search_history_quotes(qq)
+            history_lines = list(st.get("history_quotes") or [])
+            if not history_lines and not self.config.get("history_scan_enabled", True):
+                # 未启用历史扫描时退化为按需补一次原话（仅本次查询，不落盘）
+                history_lines = await self._search_history_quotes(qq)
             quotes = [{"t": 0, "src": "历史会话", "text": line} for line in history_lines]
 
         total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
@@ -1172,10 +1269,19 @@ class UserProfilePlugin(Star):
         lines = ["活跃度：", f"- 发言总数：{g + p}（群聊 {g} / 私聊 {p}）"]
         if groups:
             lines.append(f"- 活跃群数：{len(groups)}")
-        last = max(int(st.get("g_last") or 0), int(st.get("p_last") or 0))
+        last_values = [
+            int(x)
+            for x in (st.get("g_last"), st.get("p_last"), st.get("history_last"))
+            if x
+        ]
+        last = max(last_values) if last_values else 0
         if last:
             lines.append(f"- 最近发言：{_fmt_time(last)}")
-        firsts = [x for x in (st.get("g_first"), st.get("p_first")) if x]
+        firsts = [
+            int(x)
+            for x in (st.get("g_first"), st.get("p_first"), st.get("history_first"))
+            if x
+        ]
         if firsts:
             lines.append(f"- 首次记录：{_fmt_time(min(firsts))}")
         total = g + p
@@ -1277,54 +1383,150 @@ class UserProfilePlugin(Star):
             lines.append(f"在 bot 黑名单中（{_fmt_time(item.get('ban_time'))}，原因：{reason}）")
         return lines
 
-    # ---------------- 会话历史补充 ----------------
+    # ---------------- 会话历史扫描与回填 ----------------
 
-    async def _search_history_quotes(self, qq: str) -> list:
-        """从 AstrBot 会话历史里抓该 QQ 的发言原话（自己未采集到时的补充来源）。"""
+    async def _scan_history(self, qq: str) -> dict:
+        """只读扫描 AstrBot 会话历史，返回 {first, last, complete, quotes}。
+
+        first/last 取自会话的 created_at/updated_at（AstrBot 会话无消息级时间戳时
+        作为保守边界）；quotes 为清洗后的该 QQ 发言原话（去重，上限 _HISTORY_QUOTE_KEEP）。
+        扫描失败降级返回空结果，绝不抛出异常。
+        """
+        empty = {"first": 0, "last": 0, "complete": False, "quotes": []}
         cm = getattr(self.context, "conversation_manager", None)
         if cm is None:
-            return []
-        try:
-            conversations, _ = await cm.get_filtered_conversations(
-                page=1, page_size=10, search_query=qq, include_history=True
-            )
-        except Exception as exc:
-            logger.warning(f"user_profile: history search '{qq}' failed: {exc}")
-            return []
-
+            return empty
+        pages = self._history_scan_pages()
+        page_size = self._history_scan_page_size()
         pattern = re.compile(r"ID:\s*" + re.escape(qq))
-        quotes = []
-        for conv in conversations or []:
-            history = getattr(conv, "history", None)
-            if not history:
-                continue
+        quotes: list[str] = []
+        first_ts = 0
+        last_ts = 0
+        complete = False
+        got = 0
+        total = 0
+        for page in range(1, pages + 1):
             try:
-                items = json.loads(history)
-            except Exception:
-                continue
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("role") or "").strip().lower() != "user":
-                    continue
-                text = self._content_to_text(item.get("content"))
-                for raw_line in text.splitlines():
-                    if not pattern.search(raw_line):
-                        continue
-                    line = re.sub(r"^\s*\[[^\]]*\]\s*", "", raw_line)
-                    line = re.sub(r"^\s*\S+\s*\(ID:[^)]*\)\s*[:：]\s*", "", line)
-                    line = re.sub(r"^\s*\[At:[^\]]*\]\s*", "", line).strip()
-                    if len(line) < 2:
-                        continue
-                    if len(line) > _QUOTE_MAX_LEN:
-                        line = line[:_QUOTE_MAX_LEN] + "…"
-                    if line not in quotes:
-                        quotes.append(line)
-            if len(quotes) >= _HISTORY_QUOTE_KEEP:
+                conversations, total = await cm.get_filtered_conversations(
+                    page=page, page_size=page_size, search_query=qq, include_history=True
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"user_profile: history scan '{qq}' page {page} failed: {exc}"
+                )
                 break
-        return quotes[:_HISTORY_QUOTE_KEEP]
+            convs = conversations or []
+            got += len(convs)
+            for conv in convs:
+                c_first = int(getattr(conv, "created_at", 0) or 0)
+                c_last = int(getattr(conv, "updated_at", 0) or 0)
+                if c_first and (not first_ts or c_first < first_ts):
+                    first_ts = c_first
+                if c_last and c_last > last_ts:
+                    last_ts = c_last
+                history = getattr(conv, "history", None)
+                if not history:
+                    continue
+                try:
+                    items = json.loads(history)
+                except Exception:
+                    continue
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("role") or "").strip().lower() != "user":
+                        continue
+                    text = self._content_to_text(item.get("content"))
+                    for raw_line in text.splitlines():
+                        if not pattern.search(raw_line):
+                            continue
+                        line = re.sub(r"^\s*\[[^\]]*\]\s*", "", raw_line)
+                        line = re.sub(r"^\s*\S+\s*\(ID:[^)]*\)\s*[:：]\s*", "", line)
+                        line = re.sub(r"^\s*\[At:[^\]]*\]\s*", "", line).strip()
+                        if len(line) < 2:
+                            continue
+                        if len(line) > _QUOTE_MAX_LEN:
+                            line = line[:_QUOTE_MAX_LEN] + "…"
+                        if line not in quotes:
+                            quotes.append(line)
+            # 无更多匹配，或已取满，即视为本次扫描完成
+            if not convs or (total and got >= total):
+                complete = True
+                break
+        else:
+            complete = total > 0 and got >= total
+        return {
+            "first": first_ts,
+            "last": last_ts,
+            "complete": complete,
+            "quotes": quotes[:_HISTORY_QUOTE_KEEP],
+        }
+
+    async def _search_history_quotes(self, qq: str) -> list:
+        """兼容旧调用：只返回历史原话列表。"""
+        return (await self._scan_history(qq)).get("quotes") or []
+
+    async def _ensure_history_scanned(self, qq: str, force: bool = False) -> bool:
+        """按需扫描该 QQ 的历史并回填时间/原话；返回是否实际执行了扫描。
+
+        受 history_scan_enabled、冷却时间和 history_complete 控制；force=True 时
+        绕过冷却（供管理员手动扫描使用），但已完成扫描的对象不重复扫。
+        历史状态未知时不打新人标签。扫描只读 AstrBot 已保存的会话历史，
+        不会读取 OneBot 服务器上 AstrBot 从未记录的历史。
+        """
+        if not self.config.get("history_scan_enabled", True):
+            return False
+        await self._ensure_loaded()
+        now = int(time.time())
+        cooldown = self._history_scan_cooldown()
+
+        st = self._stats.get(qq) or {}
+        if st.get("history_complete"):
+            return False
+        scanned_at = int(st.get("history_scanned_at") or 0)
+        if not force and scanned_at and (now - scanned_at) < cooldown:
+            return False
+
+        async with self._scan_lock:
+            st = self._stats.get(qq) or {}
+            if st.get("history_complete"):
+                return False
+            scanned_at = int(st.get("history_scanned_at") or 0)
+            if not force and scanned_at and (now - scanned_at) < cooldown:
+                return False
+            try:
+                scanned = await self._scan_history(qq)
+            except Exception as exc:
+                logger.warning(f"user_profile: history scan '{qq}' failed: {exc}")
+                scanned = {"first": 0, "last": 0, "complete": False, "quotes": []}
+
+            async with self._store_lock:
+                st = self._stats.setdefault(qq, _new_stat())
+                hf = int(scanned.get("first") or 0)
+                hl = int(scanned.get("last") or 0)
+                if hf:
+                    cur = int(st.get("history_first") or 0)
+                    if not cur or hf < cur:
+                        st["history_first"] = hf
+                if hl:
+                    cur = int(st.get("history_last") or 0)
+                    if hl > cur:
+                        st["history_last"] = hl
+                if scanned.get("complete"):
+                    st["history_complete"] = True
+                # 历史原话去重合并，只保留最近 _HISTORY_QUOTE_KEEP 条
+                if scanned.get("quotes"):
+                    merged = list(st.get("history_quotes") or [])
+                    for line in scanned["quotes"]:
+                        if line not in merged:
+                            merged.append(line)
+                    st["history_quotes"] = merged[-_HISTORY_QUOTE_KEEP:]
+                st["history_scanned_at"] = int(time.time())
+                self._dirty = True
+        self._ensure_flush_task()
+        return True
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -1422,6 +1624,30 @@ class UserProfilePlugin(Star):
             return max(10, int(self.config.get("flush_interval", 60) or 60))
         except (TypeError, ValueError):
             return 60
+
+    def _history_scan_pages(self) -> int:
+        try:
+            return max(1, int(self.config.get("history_scan_pages", 3) or 3))
+        except (TypeError, ValueError):
+            return 3
+
+    def _history_scan_page_size(self) -> int:
+        try:
+            return max(1, int(self.config.get("history_scan_page_size", 10) or 10))
+        except (TypeError, ValueError):
+            return 10
+
+    def _history_scan_cooldown(self) -> int:
+        try:
+            return max(0, int(self.config.get("history_scan_cooldown", 3600) or 3600))
+        except (TypeError, ValueError):
+            return 3600
+
+    def _history_scan_batch_limit(self) -> int:
+        try:
+            return max(1, int(self.config.get("history_scan_batch_limit", 200) or 200))
+        except (TypeError, ValueError):
+            return 200
 
     def _group_allowed(self, group_id: str) -> bool:
         """配置了采集群列表时，只采集列表内的群；留空采集全部。"""
