@@ -7,6 +7,7 @@
 ## 功能
 
 - 被动统计发言数、活跃群、首次/最近发言时间，以及图片、链接、二维码、@、消息长度和夜间活跃等信号。
+- 记录好友添加时间、加好友验证语和进群来源（谁、何时、被谁邀请/同意、哪个群），并可选推测来源群（仅 OneBot V11）。
 - 每个 QQ 保存最近 N 条原话，内存累积并定期写入 AstrBot KV。
 - 规则标签覆盖活跃度、社交、内容和前科；可选 LLM 语义标签覆盖广告、刷屏、诈骗、挑衅、友好等倾向。
 - 根据标签权重计算综合风险分和低/中/高/极高风险等级。
@@ -164,6 +165,16 @@
 | `link_invite_guard` | `true` | 只读读取邀请守卫记录生成前科标签。 |
 | `link_qq_tools_ban` | `true` | 只读读取 qq_tools 黑名单生成标签。 |
 
+### 社交来源
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `collect_social_events` | `true` | 静默记录好友添加、好友申请验证语和进群来源，零 LLM 零网络，独立于 `passive_collect`。 |
+| `show_social_origin` | `true` | 在画像中展示添加好友时间、验证语、进群来源和推测来源群。 |
+| `guess_source_group` | `true` | 加了好友但无明确进群来源时，用群聊发言最多的群作“推测来源群”，明确标注仅推测。 |
+
+> 社交来源事件（`friend_add` / `friend` / `group_increase`）来自 OneBot V11 的 notice/request 事件。SnowLuma、NapCat 等实现的 `friend_add` 只带 `user_id`，**不含“从哪里加的好友”这个来源字段**，因此只能记录“何时加好友”；`friend_request` 可记录验证语；`group_increase` 可记录进群来源（群号、`invite`/`approve`、操作者 QQ、时间）。推测来源群仅为参考，不代表真实来源。
+
 ## LLM 工具与可信内部 API
 
 `user_profile_query(qq)` 是面向聊天对话的 LLM 工具：
@@ -182,12 +193,14 @@ if instance is not None:
     score = await instance.get_risk_score(inviter_qq, event)
     tags = await instance.get_profile_tags(inviter_qq, event)
     text = await instance.get_profile_text(inviter_qq, event)
+    social = await instance.get_social_origin(inviter_qq)
 ```
 
 - `get_profile_tags(qq, event=None) -> list[dict]`
 - `get_profile_tags_with_score(qq, event=None) -> {"score", "level", "tags"}`
 - `get_risk_score(qq, event=None) -> int`
 - `get_profile_text(qq, event=None) -> str`
+- `get_social_origin(qq) -> dict`：返回 `{"friend_add_time", "friend_request_comment", "friend_request_time", "join_sources"}` 结构化社交来源，供邀请守卫判断“这人从哪来”。
 
 这些接口只读、无敏感操作；调用方应是受信任插件，不应直接将其包装成无权限校验的聊天接口。
 
@@ -207,7 +220,7 @@ AstrBot 通常已通过 `_flatten_plugin_config` 展平分组配置；插件仍�
 - `show_quotes=false` 只隐藏聊天输出，不停止原话采集；如需降低隐私风险，可同时关闭 `collect_private`、减小 `quote_keep` 或关闭 `llm_tags`。
 - 采集路径不调用 LLM、不发起网络请求；LLM 标签按发言数和 TTL 缓存，并用锁避免并发重复生成。
 - 历史扫描只读 AstrBot 已保存的会话历史，受页数、冷却和批量上限约束，扫描失败自动降级；仅在查询或管理员手动预热时触发，采集路径零额外开销。
-- 昵称和头像依赖 OneBot V11；其它平台仍可使用发言统计、标签和风险分。
+- 昵称、头像和社交来源（好友/进群事件）依赖 OneBot V11；其它平台仍可使用发言统计、标签和风险分。SnowLuma、NapCat 等实现的 `friend_add` 事件不含“加好友来源”字段，只能记录“何时加好友”；推测来源群仅为参考，不代表真实来源。
 - 画像按 QQ 号维度，不做跨账号关联。
 
 ## License

@@ -232,5 +232,29 @@
         "hint": "只读获取 astrbot_plugin_qq_tools 的 ban_list 以生成 ban_history；插件未安装或读取失败时自动跳过，不执行拉黑或其他写操作。"
       }
     }
+  },
+  "social": {
+    "description": "社交来源",
+    "type": "object",
+    "items": {
+      "collect_social_events": {
+        "description": "采集好友/进群事件",
+        "type": "bool",
+        "default": true,
+        "hint": "静默记录好友添加、好友申请验证语和进群来源（谁、何时、被谁邀请/同意、哪个群），零 LLM 零网络。仅 OneBot V11 可获得；关闭后不再新增，已有记录保留。独立于被动发言采集开关。"
+      },
+      "show_social_origin": {
+        "description": "展示社交来源",
+        "type": "bool",
+        "default": true,
+        "hint": "在画像中展示添加好友时间、加好友验证语、进群来源和推测来源群。关闭仅隐藏展示，采集仍受 collect_social_events 控制。"
+      },
+      "guess_source_group": {
+        "description": "推测来源群",
+        "type": "bool",
+        "default": true,
+        "hint": "某用户添加 bot 为好友、但无明确进群来源时，用其在群聊中发言最多的群作为推测来源群，明确标注“仅推测”。无好友事件时不推测。"
+      }
+    }
   }
 }

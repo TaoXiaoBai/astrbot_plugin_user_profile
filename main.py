@@ -404,6 +404,11 @@ def _new_stat() -> dict:
         "history_complete": False,
         "history_scanned_at": 0,
         "history_quotes": [],
+        # 社交来源：好友添加、好友申请验证语、进群来源
+        "friend_add_time": 0,
+        "friend_request_comment": "",
+        "friend_request_time": 0,
+        "join_sources": [],  # [{gid, sub_type, operator, time}]
     }
 
 
@@ -442,8 +447,8 @@ def _flatten_plugin_config(config: dict | None) -> dict:
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.5.2",
+    "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，记录好友添加与进群来源，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
+    "1.6.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -533,8 +538,14 @@ class UserProfilePlugin(Star):
         filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE
     )
     async def on_message(self, event: AstrMessageEvent):
-        """静默统计每个 QQ 的发言；不打断事件，不影响正常回复流程。"""
+        """静默统计每个 QQ 的发言；notice/request 事件单独记录社交来源，不打断事件。"""
         if not self._enabled():
+            return
+        # 先分流非消息事件（notice/request），避免被误当作空文本发言统计
+        raw = self._raw_event(event)
+        post_type = self._post_type(raw)
+        if post_type in ("notice", "request"):
+            await self._record_social_event(event, raw, post_type)
             return
         if not self.config.get("passive_collect", True):
             return
@@ -605,6 +616,171 @@ class UserProfilePlugin(Star):
             self._dirty = True
 
         self._ensure_flush_task()
+
+    # ---------------- 社交来源（好友 / 进群事件） ----------------
+
+    @staticmethod
+    def _raw_event(event):
+        """读取适配器塞进 message_obj.raw_message 的原始事件；缺失时返回 None。"""
+        mo = getattr(event, "message_obj", None)
+        return getattr(mo, "raw_message", None)
+
+    @staticmethod
+    def _post_type(raw) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, dict):
+            return str(raw.get("post_type") or "")
+        try:
+            return str(getattr(raw, "post_type", "") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _field(raw, key):
+        if isinstance(raw, dict):
+            return raw.get(key)
+        return getattr(raw, key, None)
+
+    def _event_time(self, raw) -> int:
+        t = self._field(raw, "time")
+        try:
+            t = int(t)
+            return t if t > 0 else int(time.time())
+        except (TypeError, ValueError):
+            return int(time.time())
+
+    async def _record_social_event(self, event, raw, post_type: str):
+        """记录好友添加、好友申请和进群来源；零 LLM 零网络，独立于 passive_collect。"""
+        if not self.config.get("collect_social_events", True):
+            return
+        qq = str(event.get_sender_id() or "").strip()
+        if not qq:
+            return
+        self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+        if self_id and self_id == qq:
+            return
+
+        changed = False
+        if post_type == "notice":
+            notice_type = str(self._field(raw, "notice_type") or "")
+            if notice_type == "friend_add":
+                await self._ensure_loaded()
+                async with self._store_lock:
+                    st = self._stats.setdefault(qq, _new_stat())
+                    ts = self._event_time(raw)
+                    if not st.get("friend_add_time") or ts < int(st.get("friend_add_time") or 0):
+                        st["friend_add_time"] = ts
+                        changed = True
+            elif notice_type == "group_increase":
+                gid = str(self._field(raw, "group_id") or "").strip()
+                operator = str(self._field(raw, "operator_id") or "").strip()
+                sub_type = str(self._field(raw, "sub_type") or "").strip()
+                await self._ensure_loaded()
+                async with self._store_lock:
+                    st = self._stats.setdefault(qq, _new_stat())
+                    joins = st.setdefault("join_sources", [])
+                    if not isinstance(joins, list):
+                        joins = []
+                        st["join_sources"] = joins
+                    ts = self._event_time(raw)
+                    dup = any(
+                        int(j.get("time") or 0) == ts
+                        and str(j.get("gid") or "") == gid
+                        and str(j.get("operator") or "") == operator
+                        for j in joins
+                    )
+                    if not dup:
+                        joins.append(
+                            {
+                                "gid": gid,
+                                "sub_type": sub_type,
+                                "operator": operator,
+                                "time": ts,
+                            }
+                        )
+                        del joins[:-20]
+                        changed = True
+        elif post_type == "request":
+            request_type = str(self._field(raw, "request_type") or "")
+            if request_type == "friend":
+                comment = str(self._field(raw, "comment") or "").strip()
+                await self._ensure_loaded()
+                async with self._store_lock:
+                    st = self._stats.setdefault(qq, _new_stat())
+                    st["friend_request_comment"] = comment[:200]
+                    st["friend_request_time"] = self._event_time(raw)
+                    changed = True
+
+        if changed:
+            self._dirty = True
+            self._ensure_flush_task()
+
+    def _guess_source_group(self, st: dict) -> dict | None:
+        """推测好友来源群：取该用户在群聊中发言数最多的群，仅作参考。"""
+        groups = st.get("groups") or {}
+        if not groups:
+            return None
+        best = None
+        best_count = -1
+        for gid, count in groups.items():
+            c = int(count or 0)
+            if c > best_count:
+                best = gid
+                best_count = c
+        return {"gid": str(best), "count": best_count} if best is not None else None
+
+    def _format_social_origin(self, st: dict) -> str:
+        """把好友/进群来源格式化为人类可读文本；无数据返回空字符串。"""
+        if not st:
+            return ""
+        parts = []
+        add_time = int(st.get("friend_add_time") or 0)
+        if add_time:
+            parts.append(f"- 添加好友：{_fmt_time(add_time)}")
+        comment = str(st.get("friend_request_comment") or "").strip()
+        if comment:
+            parts.append(f"- 加好友验证语：{comment}")
+        joins = list(st.get("join_sources") or [])
+        if joins:
+            join_lines = []
+            for j in joins[-5:]:
+                sub = str(j.get("sub_type") or "").strip()
+                if sub == "invite":
+                    action = "被邀请"
+                elif sub == "approve":
+                    action = "经同意"
+                else:
+                    action = "进入"
+                gid = str(j.get("gid") or "").strip()
+                operator = str(j.get("operator") or "").strip()
+                line = f"{action}进群 {gid}（{_fmt_time(j.get('time'))}"
+                if operator:
+                    line += f"，操作者 {operator}"
+                line += ")"
+                join_lines.append(line)
+            parts.append("- 进群来源：\n" + "\n".join(join_lines))
+        if add_time and not joins and self.config.get("guess_source_group", True):
+            guess = self._guess_source_group(st)
+            if guess:
+                parts.append(f"- 推测来源群：{guess['gid']}（加好友前群聊发言最多，仅推测）")
+        if not parts:
+            return ""
+        return "社交来源：\n" + "\n".join(parts)
+
+    async def get_social_origin(self, qq: str) -> dict:
+        """可信内部只读 API：返回好友/进群来源结构，供邀请守卫等插件决策调用。"""
+        qq = str(qq or "").strip()
+        if not re.fullmatch(r"\d{5,12}", qq):
+            return {}
+        await self._ensure_loaded()
+        st = self._stats.get(qq) or {}
+        return {
+            "friend_add_time": int(st.get("friend_add_time") or 0),
+            "friend_request_comment": str(st.get("friend_request_comment") or ""),
+            "friend_request_time": int(st.get("friend_request_time") or 0),
+            "join_sources": list(st.get("join_sources") or []),
+        }
 
     # ---------------- 查询入口 ----------------
 
@@ -902,10 +1078,16 @@ class UserProfilePlugin(Star):
         """给 /画像 命令用：返回人类可读文本。"""
         result = await self.get_profile_tags_with_score(qq, event)
         tags = result.get("tags") or []
-        if not tags:
-            return f"【用户画像】QQ {qq}\n暂无记录：未采集到该用户的发言，也没有前科数据。"
 
         await self._ensure_loaded()
+        stats = self._stats.get(qq) or {}
+        has_social = bool(
+            int(stats.get("friend_add_time") or 0)
+            or str(stats.get("friend_request_comment") or "").strip()
+            or (stats.get("join_sources") or [])
+        )
+        if not tags and not has_social:
+            return f"【用户画像】QQ {qq}\n暂无记录：未采集到该用户的发言，也没有前科或好友/进群记录。"
 
         base = [t for t in tags if t["source"] != "llm"]
         llm = [t for t in tags if t["source"] == "llm"]
@@ -918,8 +1100,9 @@ class UserProfilePlugin(Star):
         if nickname:
             lines[0] += f"（{nickname}）"
 
-        # 风险分
-        lines.append(f"综合风险分：{result['score']} / 100（{result['level']}）")
+        # 风险分（仅在存在标签时展示，避免对纯社交来源用户给出误导性的中性分）
+        if tags:
+            lines.append(f"综合风险分：{result['score']} / 100（{result['level']}）")
 
         # 基础标签
         if base:
@@ -940,6 +1123,12 @@ class UserProfilePlugin(Star):
         activity = self._format_activity(stats)
         if activity:
             lines.append(activity)
+
+        # 社交来源（好友 / 进群）
+        if self.config.get("show_social_origin", True):
+            social = self._format_social_origin(stats)
+            if social:
+                lines.append(social)
 
         # 最近原话（可开关）
         if self.config.get("show_quotes", True):
