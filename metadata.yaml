@@ -1,7 +1,7 @@
 name: astrbot_plugin_user_profile
 desc: QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，记录好友添加与进群来源，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，可选图片输出，支持细粒度查询权限控制与历史扫描回填；供加群邀请守卫等插件在决策时调用
 author: Kimi
-version: 1.6.0
+version: 1.7.0
 display_name: 用户画像
 short_desc: 发言统计 + 自动标签 + 风险分 + 图片输出 + 查询权限控制 + 历史扫描 + 社交来源 + 邀请守卫联动
 support_platforms:

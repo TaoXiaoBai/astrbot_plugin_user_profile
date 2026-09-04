@@ -189,6 +189,10 @@
 md = self.context.get_registered_star("astrbot_plugin_user_profile")
 instance = getattr(md, "star_cls", None)
 if instance is not None:
+    # 邀请守卫等决策插件优先使用：无原话、结构稳定，并可排除当前审核记录
+    decision_profile = await instance.get_decision_profile(
+        inviter_qq, event, exclude_request_key=current_request_key
+    )
     result = await instance.get_profile_tags_with_score(inviter_qq, event)
     score = await instance.get_risk_score(inviter_qq, event)
     tags = await instance.get_profile_tags(inviter_qq, event)
@@ -196,11 +200,14 @@ if instance is not None:
     social = await instance.get_social_origin(inviter_qq)
 ```
 
+- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：推荐给邀请守卫等可信决策插件使用，返回风险分、结构化标签、精简活跃度和社交来源，不包含发言原话；`exclude_request_key` 可排除当前审核中的邀请，避免把本次事件算成历史前科。
 - `get_profile_tags(qq, event=None) -> list[dict]`
 - `get_profile_tags_with_score(qq, event=None) -> {"score", "level", "tags"}`
 - `get_risk_score(qq, event=None) -> int`
 - `get_profile_text(qq, event=None) -> str`
 - `get_social_origin(qq) -> dict`：返回 `{"friend_add_time", "friend_request_comment", "friend_request_time", "join_sources"}` 结构化社交来源，供邀请守卫判断“这人从哪来”。
+
+画像插件兼容邀请守卫的旧字符串、旧单条 dict 和当前按群多条 `list[dict]` 三种记录格式；纯邀请前科、纯黑名单或纯社交来源用户也能返回画像。拒绝记录优先按稳定的 `decision` / `execution_state` 判断，再兼容旧 `action` 文案。
 
 这些接口只读、无敏感操作；调用方应是受信任插件，不应直接将其包装成无权限校验的聊天接口。
 

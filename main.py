@@ -43,6 +43,27 @@ _STATS_KEY = "up_stats"
 _QUOTES_KEY = "up_quotes"
 _TAGS_KEY = "up_tags"
 
+
+def _normalize_guard_invite_records(records: Any) -> dict[str, list[dict]]:
+    """兼容邀请守卫的旧字符串、旧单记录和当前按群多记录格式。"""
+    if not isinstance(records, dict):
+        return {}
+    normalized: dict[str, list[dict]] = {}
+    for gid, value in records.items():
+        key = str(gid)
+        if isinstance(value, list):
+            normalized[key] = [item for item in value if isinstance(item, dict)]
+        elif isinstance(value, dict):
+            normalized[key] = [value]
+        elif isinstance(value, str):
+            normalized[key] = [
+                {"inviter": value, "time": 0, "action": "", "comment": ""}
+            ]
+        else:
+            normalized[key] = []
+    return normalized
+
+
 # 标签人类可读名（对 LLM 和人类都友好）
 _TAG_DISPLAY_NAMES = {
     "active_high": "高活跃",
@@ -226,14 +247,21 @@ class TagEngine:
 
         invite_times = 0
         invite_rejected = 0
-        for gid, rec in invite_records.items():
-            inviter = (rec.get("inviter") or "") if isinstance(rec, dict) else str(rec)
-            if str(inviter).strip() != qq:
-                continue
-            invite_times += 1
-            action = str(rec.get("action") or "").strip() if isinstance(rec, dict) else ""
-            if action in ("reject", "拒绝", "blacklist", "拉黑"):
-                invite_rejected += 1
+        for recs in _normalize_guard_invite_records(invite_records).values():
+            for rec in recs:
+                if str(rec.get("inviter") or "").strip() != qq:
+                    continue
+                invite_times += 1
+                decision = str(rec.get("decision") or "").strip().lower()
+                execution_state = str(rec.get("execution_state") or "").strip().upper()
+                action = str(rec.get("action") or "").strip().lower()
+                if (
+                    decision == "reject"
+                    or execution_state in ("REJECTED", "UNEXPECTED_JOIN_LEFT")
+                    or "拒绝" in action
+                    or action in ("reject", "blacklist", "拉黑")
+                ):
+                    invite_rejected += 1
 
         kick_times = 0
         for gid, rec in join_records.items():
@@ -244,11 +272,22 @@ class TagEngine:
 
         mute_times = 0
         if isinstance(mute_records, dict):
-            for k, v in mute_records.items():
-                if str(k) == qq:
-                    mute_times += 1
-                elif isinstance(v, dict) and str(v.get("operator") or "").strip() == qq:
-                    mute_times += 1
+            # 邀请守卫按群保存累计禁言数；只关联此 QQ 邀请过的唯一群。
+            for gid in _normalize_guard_invite_records(invite_records):
+                try:
+                    mute_times += max(0, int(mute_records.get(gid, 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+            # 兼容未来或旧版按 QQ / operator 保存的结构。
+            if not mute_times:
+                for key, value in mute_records.items():
+                    if str(key) == qq:
+                        try:
+                            mute_times += max(1, int(value or 1))
+                        except (TypeError, ValueError):
+                            mute_times += 1
+                    elif isinstance(value, dict) and str(value.get("operator") or "").strip() == qq:
+                        mute_times += 1
 
         if invite_times >= 2:
             tags.append(self._tag("frequent_inviter", 0.85, "guard", f"累计邀请 bot 进群 {invite_times} 次"))
@@ -448,7 +487,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，记录好友添加与进群来源，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.6.0",
+    "1.7.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1338,13 +1377,17 @@ class UserProfilePlugin(Star):
 
     # ---------------- 可信插件间 API（只读，不套聊天用户权限） ----------------
 
-    async def get_profile_tags_with_score(self, qq: str, event=None) -> dict:
+    async def get_profile_tags_with_score(
+        self, qq: str, event=None, exclude_request_key: str = ""
+    ) -> dict:
         """可信插件内部只读 API：返回标签、风险分和等级，不校验聊天权限。"""
-        tags = await self.get_profile_tags(qq, event)
+        tags = await self.get_profile_tags(qq, event, exclude_request_key)
         score = self._calc_risk_score(tags)
         return {"score": score, "level": _risk_level(score, self.config), "tags": tags}
 
-    async def get_profile_tags(self, qq: str, event=None) -> list[dict]:
+    async def get_profile_tags(
+        self, qq: str, event=None, exclude_request_key: str = ""
+    ) -> list[dict]:
         """返回指定 QQ 的结构化标签列表，供加群邀请守卫等插件在决策时调用。
 
         调用方式（以加群邀请守卫为例）::
@@ -1381,12 +1424,10 @@ class UserProfilePlugin(Star):
             quotes = [{"t": 0, "src": "历史会话", "text": line} for line in history_lines]
 
         total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
-        if not total and not quotes:
-            return []
 
-        # 前科与黑名单并发拉取
+        # 前科与黑名单必须在空画像判断前读取，纯前科用户也应生成画像。
         fetched = await asyncio.gather(
-            self._load_guard_records_raw(qq),
+            self._load_guard_records_raw(qq, exclude_request_key),
             self._load_ban_entry(qq),
             return_exceptions=True,
         )
@@ -1395,14 +1436,76 @@ class UserProfilePlugin(Star):
 
         # 基础标签
         base_tags = self._tag_engine.generate_base_tags(qq, st, quotes, guard_records, ban_lines)
+        has_social = bool(
+            int(st.get("friend_add_time") or 0)
+            or str(st.get("friend_request_comment") or "").strip()
+            or (st.get("join_sources") or [])
+        )
+        if not total and not quotes and not base_tags and not has_social:
+            return []
 
-        # LLM 标签（默认开启，带缓存）
-        llm_tags = await self._get_or_make_llm_tags(qq, st, quotes, base_tags)
+        # 无原话时不调用语义标签 LLM，前科/规则标签仍正常返回。
+        llm_tags = (
+            await self._get_or_make_llm_tags(qq, st, quotes, base_tags)
+            if quotes
+            else []
+        )
 
         # 合并：基础标签在前，LLM 标签在后，按置信度降序
         all_tags = base_tags + llm_tags
         all_tags.sort(key=lambda x: x["confidence"], reverse=True)
         return all_tags
+
+    async def get_decision_profile(
+        self, qq: str, event=None, exclude_request_key: str = ""
+    ) -> dict:
+        """可信插件决策 API：返回无原话的结构化画像快照。"""
+        qq = str(qq or "").strip()
+        if not self._enabled() or not re.fullmatch(r"\d{5,12}", qq):
+            return {}
+        result = await self.get_profile_tags_with_score(
+            qq, event, exclude_request_key=exclude_request_key
+        )
+        await self._ensure_loaded()
+        st = self._stats.get(qq) or {}
+        tags = list(result.get("tags") or [])
+        social = await self.get_social_origin(qq)
+        has_social = bool(
+            social.get("friend_add_time")
+            or social.get("friend_request_comment")
+            or social.get("join_sources")
+        )
+        if not tags and not has_social:
+            return {}
+
+        first_values = [
+            int(value)
+            for value in (st.get("g_first"), st.get("p_first"), st.get("history_first"))
+            if value
+        ]
+        last_values = [
+            int(value)
+            for value in (st.get("g_last"), st.get("p_last"), st.get("history_last"))
+            if value
+        ]
+        activity = {
+            "group_messages": int(st.get("g_count") or 0),
+            "private_messages": int(st.get("p_count") or 0),
+            "active_groups": len(st.get("groups") or {}),
+            "first_seen": min(first_values) if first_values else 0,
+            "last_seen": max(last_values) if last_values else 0,
+        }
+        return {
+            "schema_version": 1,
+            "provider": "astrbot_plugin_user_profile",
+            "captured_at": int(time.time()),
+            "qq": qq,
+            "score": int(result.get("score") or 0),
+            "level": str(result.get("level") or ""),
+            "tags": tags,
+            "activity": activity,
+            "social_origin": social,
+        }
 
     async def get_profile_text(self, qq: str, event=None) -> str:
         """返回指定 QQ 的画像文本；未采集到数据时返回空字符串，兼容旧版调用。"""
@@ -1532,8 +1635,10 @@ class UserProfilePlugin(Star):
 
     # ---------------- 前科联动（均优雅降级） ----------------
 
-    async def _load_guard_records_raw(self, qq: str) -> dict:
-        """读取加群邀请守卫的原始记录，返回 {"invite": {}, "join": {}, "mute": {}}；未装守卫或失败返回空结构。"""
+    async def _load_guard_records_raw(
+        self, qq: str, exclude_request_key: str = ""
+    ) -> dict:
+        """读取并过滤邀请守卫记录；兼容按群单条和多条邀请格式。"""
         empty = {"invite": {}, "join": {}, "mute": {}}
         if sp is None or not self.config.get("link_invite_guard", True):
             return empty
@@ -1554,17 +1659,20 @@ class UserProfilePlugin(Star):
             _get("invite_records"), _get("join_records"), _get("mute_records")
         )
 
-        # 过滤出与此 QQ 相关的记录
+        # 过滤出与此 QQ 相关的记录；保留每群多条历史。
         out = {"invite": {}, "join": {}, "mute": {}}
-        if isinstance(invite, dict):
-            for gid, rec in invite.items():
-                inviter = (
-                    str(rec.get("inviter") or "").strip()
-                    if isinstance(rec, dict)
-                    else str(rec or "").strip()
+        for gid, recs in _normalize_guard_invite_records(invite).items():
+            matched = [
+                rec
+                for rec in recs
+                if str(rec.get("inviter") or "").strip() == qq
+                and (
+                    not exclude_request_key
+                    or str(rec.get("request_key") or "") != exclude_request_key
                 )
-                if inviter == qq:
-                    out["invite"][gid] = rec if isinstance(rec, dict) else {"inviter": qq}
+            ]
+            if matched:
+                out["invite"][gid] = matched
         if isinstance(join, dict):
             for gid, rec in join.items():
                 if isinstance(rec, dict) and str(rec.get("operator") or "").strip() == qq:
@@ -1581,13 +1689,14 @@ class UserProfilePlugin(Star):
         mute = records.get("mute") or {}
 
         lines = []
-        for gid, rec in invite.items():
-            ts = _fmt_time(rec.get("time")) if isinstance(rec, dict) else "-"
-            action = str(rec.get("action") or "").strip() or "-" if isinstance(rec, dict) else "-"
-            extra = ""
-            if isinstance(mute, dict) and gid in mute:
-                extra = f"；该群累计禁言 bot {mute[gid]} 次"
-            lines.append(f"曾邀请 bot 进群 {gid}（{ts}，{action}{extra}）")
+        for gid, recs in _normalize_guard_invite_records(invite).items():
+            for rec in recs:
+                ts = _fmt_time(rec.get("time"))
+                action = str(rec.get("action") or "").strip() or "-"
+                extra = ""
+                if isinstance(mute, dict) and gid in mute:
+                    extra = f"；该群累计禁言 bot {mute[gid]} 次"
+                lines.append(f"曾邀请 bot 进群 {gid}（{ts}，{action}{extra}）")
         for gid, rec in join.items():
             if isinstance(rec, dict):
                 lines.append(f"曾操作拉 bot 进群 {gid}（{_fmt_time(rec.get('time'))}）")
