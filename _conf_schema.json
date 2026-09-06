@@ -162,26 +162,26 @@
     }
   },
   "llm_tags_group": {
-    "description": "LLM 标签",
+    "description": "LLM 画像分析（核心）",
     "type": "object",
     "items": {
       "llm_tags": {
-        "description": "启用语义标签",
+        "description": "启用 LLM 画像分析",
         "type": "bool",
         "default": true,
-        "hint": "根据已保存原话生成广告、刷屏、诈骗、友好等语义标签。关闭后只生成规则标签和风险分，不影响 user_profile_query 工具是否注册可用。"
+        "hint": "画像分析的核心开关，默认开启。LLM 会结合近期真实发言、基础统计标签和图片/链接/@/夜间发言等行为比例，识别广告、诈骗、刷屏、挑衅、友好等语义倾向，并返回带置信度和判断理由的结构化标签。关闭后只保留规则标签与风险分，不影响 user_profile_query 工具是否可用。"
       },
       "llm_provider_id": {
-        "description": "标签模型",
+        "description": "画像分析模型",
         "type": "string",
         "default": "",
-        "hint": "用于生成语义标签的 AstrBot provider ID；留空使用全局默认模型。填写不存在或不可用的 ID 时自动降级为无 LLM 标签。"
+        "hint": "执行用户画像语义分析的 AstrBot provider ID；留空使用全局默认模型。填写不存在或不可用的 ID 时自动降级为仅规则画像。"
       },
       "llm_tag_cache_ttl": {
-        "description": "标签缓存时间",
+        "description": "LLM 分析缓存时间",
         "type": "int",
         "default": 86400,
-        "hint": "LLM 标签缓存有效期，单位为秒。默认 86400（24 小时）；0 表示每次查询都重新生成。发言数量变化也会使缓存失效。"
+        "hint": "LLM 画像分析结果的缓存有效期，单位为秒。默认 86400（24 小时）；0 表示每次查询都重新分析。用户发言数量变化也会使缓存失效。"
       }
     }
   },

@@ -1,9 +1,9 @@
 name: astrbot_plugin_user_profile
 display_name: 用户画像
-short_desc: 独立采集聊天行为，由规则与 LLM 生成可读标签和风险画像
-desc: 独立的 QQ 用户画像与自动标签插件。被动统计群聊和私聊行为，按需扫描 AstrBot 会话历史，通过规则与 LLM 生成可读标签和风险分；支持图片输出、细粒度查询权限、社交来源记录，并可与加群邀请守卫深度联动。
+short_desc: LLM 阅读历史发言，生成带依据的用户标签与风险画像
+desc: LLM 驱动的独立 QQ 用户画像插件。持续积累群聊、私聊、社交来源和管理前科，由 LLM 结合近期原话与行为统计识别广告、诈骗、刷屏、挑衅、友好等倾向，输出带置信度和理由的结构化标签，再融合规则标签计算风险分；支持图片输出、历史扫描、细粒度查询权限，并可为加群邀请守卫提供长期画像依据。
 author: Kimi
-version: 1.7.1
+version: 1.7.2
 repo: https://github.com/TaoXiaoBai/astrbot_plugin_user_profile
 social_link: https://github.com/TaoXiaoBai
 tags:

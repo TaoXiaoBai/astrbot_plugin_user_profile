@@ -487,7 +487,7 @@ def _flatten_plugin_config(config: dict | None) -> dict:
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：被动采集群聊与私聊发言，记录好友添加与进群来源，自动打上活跃度、风险、社交、内容等结构化标签，输出综合风险分，支持细粒度查询权限，供加群邀请守卫等插件决策调用",
-    "1.7.1",
+    "1.7.2",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
