@@ -57,12 +57,6 @@
         "default": false,
         "hint": "开启后将画像渲染为图片以减少长文本刷屏，需要 Pillow；渲染失败会自动回退文字。图片模式不单独附加头像。"
       },
-      "show_avatar": {
-        "description": "文字回复带头像",
-        "type": "bool",
-        "default": true,
-        "hint": "文字模式下附加目标 QQ 头像（仅 OneBot V11 可用）。当前版本暂未实现头像附加，此配置项保留但暂不生效；图片输出模式不使用此项。"
-      },
       "show_quotes": {
         "description": "展示发言摘录",
         "type": "bool",
@@ -88,10 +82,22 @@
         "hint": "静默统计消息数量、群分布和行为信号，并按 quote_keep 保存最近原话。关闭后停止新增采集，已有数据不会删除。"
       },
       "collect_private": {
-        "description": "采集私聊",
+        "description": "采集私聊统计",
         "type": "bool",
         "default": true,
-        "hint": "是否统计私聊消息并保存其原话。关闭后只采集群消息；如对私聊隐私敏感，建议关闭。"
+        "hint": "是否统计私聊消息。原话是否保存由 store_private_quotes 单独控制。"
+      },
+      "store_quotes": {
+        "description": "保存发言摘录",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后仍统计数量和行为信号，但不再保存新的群聊或私聊原话。为兼容旧实例默认开启。"
+      },
+      "store_private_quotes": {
+        "description": "保存私聊摘录",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后仍可统计私聊，但不保存新的私聊原话。为避免升级时静默改变既有行为，默认开启。"
       },
       "collect_groups": {
         "description": "采集群范围",
@@ -103,7 +109,13 @@
         "description": "原话保存条数",
         "type": "int",
         "default": 10,
-        "hint": "每个 QQ 保留的最近发言原话数量，单位为条；最小按 1 处理。数值越大，画像与 LLM 标签材料越多，同时占用更多存储并提高隐私风险。"
+        "hint": "每个 QQ 保留的最近发言原话数量，运行时限制为 1-100。"
+      },
+      "quote_retention_days": {
+        "description": "摘录保留天数",
+        "type": "int",
+        "default": 0,
+        "hint": "超过天数的实时摘录会在采集、加载或 /画像清理 时删除；0 表示不按时间过期。"
       },
       "max_tracked_users": {
         "description": "最多跟踪人数",
@@ -148,10 +160,22 @@
         "hint": "每次扫描每页返回的会话数，最小按 1 处理。与扫描页数相乘即单次最多读取的会话数。"
       },
       "history_scan_cooldown": {
-        "description": "扫描冷却时间",
+        "description": "未完成扫描冷却时间",
         "type": "int",
         "default": 3600,
-        "hint": "同一 QQ 两次自动扫描之间的最小间隔，单位为秒；0 表示不冷却。避免每次查询反复扫库拖慢决策；管理员手动 /画像扫描 会绕过冷却。"
+        "hint": "未扫完时两次自动续扫的最小间隔秒数；0 表示不冷却。管理员命令绕过。"
+      },
+      "history_rescan_interval": {
+        "description": "完成后增量复查间隔",
+        "type": "int",
+        "default": 86400,
+        "hint": "完成扫描后再次从第一页检查新会话的间隔秒数；0 表示每次查询都检查。"
+      },
+      "history_scan_concurrency": {
+        "description": "历史扫描并发数",
+        "type": "int",
+        "default": 4,
+        "hint": "批量扫描同时处理的用户数，运行时限制为 1-20。"
       },
       "history_scan_batch_limit": {
         "description": "批量扫描上限",
@@ -181,7 +205,37 @@
         "description": "LLM 分析缓存时间",
         "type": "int",
         "default": 86400,
-        "hint": "LLM 画像分析结果的缓存有效期，单位为秒。默认 86400（24 小时）；0 表示每次查询都重新分析。用户发言数量变化也会使缓存失效。"
+        "hint": "成功和空结果的缓存秒数；0 表示关闭缓存。材料、provider 或 schema 变化会立即失效。"
+      },
+      "llm_failure_cache_ttl": {
+        "description": "LLM 失败短缓存",
+        "type": "int",
+        "default": 300,
+        "hint": "模型超时或失败后短期缓存秒数，避免故障期间反复请求；0 表示不缓存失败。"
+      },
+      "llm_timeout_seconds": {
+        "description": "LLM 超时秒数",
+        "type": "int",
+        "default": 45,
+        "hint": "单次画像分析最长等待时间，运行时限制为 1-300 秒。"
+      },
+      "llm_max_concurrency": {
+        "description": "LLM 最大并发",
+        "type": "int",
+        "default": 3,
+        "hint": "不同 QQ 同时分析的最大数量；同一 QQ 和同一材料会自动合并为一个请求。"
+      },
+      "llm_material_max_chars": {
+        "description": "LLM 材料字符上限",
+        "type": "int",
+        "default": 6000,
+        "hint": "发送给模型的摘录总字符上限，运行时限制为 500-20000。"
+      },
+      "llm_include_private_quotes": {
+        "description": "LLM 可使用私聊摘录",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后语义分析只使用已保存的群聊摘录，不使用私聊或来源不明的历史摘录。"
       }
     }
   },
@@ -193,7 +247,7 @@
       "tag_active_med_threshold": {"description": "中活跃阈值", "type": "int", "default": 20, "hint": "累计发言数达到此值且未达到高活跃阈值时标记 active_medium，单位为条。"},
       "tag_newcomer_days": {"description": "新人判定天数", "type": "int", "default": 7, "hint": "首次记录距今不超过此天数时标记 newcomer，单位为天；建议使用非负整数。"},
       "tag_multi_group_threshold": {"description": "多群判定阈值", "type": "int", "default": 3, "hint": "出现过的不同群数量达到此值时标记 multi_group，单位为群数。"},
-      "tag_image_threshold": {"description": "图片消息占比", "type": "float", "default": 0.5, "hint": "图片或空文本富媒体消息占总消息比例达到此值时标记 image_spammer；范围建议 0-1，例如 0.5 表示 50%。"},
+      "tag_image_threshold": {"description": "图片消息占比", "type": "float", "default": 0.5, "hint": "消息组件中实际图片/视频数量占总消息数的比例达到此值时标记 image_spammer；空文本本身不会计为图片。范围 0-1，例如 0.5 表示 50%。"},
       "tag_link_threshold": {"description": "链接消息占比", "type": "float", "default": 0.3, "hint": "含链接次数占总消息比例达到此值时标记 link_spammer；范围建议 0-1，例如 0.3 表示 30%。"},
       "tag_mention_threshold": {"description": "@消息占比", "type": "float", "default": 0.3, "hint": "检测到 @ 的次数占总消息比例达到此值时标记 mention_heavy；范围建议 0-1。"},
       "tag_verbose_threshold": {"description": "平均消息长度", "type": "int", "default": 80, "hint": "平均每条消息字符数达到此值时标记 verbose，单位为字符。"},
@@ -208,7 +262,7 @@
         "description": "标签风险权重",
         "type": "string",
         "default": "",
-        "hint": "JSON 对象字符串，例如 {\"ban_history\":40,\"normal\":-15}。正数提高、负数降低以 50 为基准的风险分；留空或 JSON 无效时使用内置权重。"
+        "hint": "JSON 对象字符串，例如 {\"ban_history\":40,\"normal\":-15}。仅接受内置标签的有限数值；未知标签、非数值、NaN 和 Infinity 会忽略并回退对应内置权重。"
       },
       "risk_level_low": {"description": "低到中分界", "type": "int", "default": 30, "hint": "风险分达到此值显示为“中”，范围建议 0-100，并应低于高风险分界。"},
       "risk_level_high": {"description": "中到高分界", "type": "int", "default": 60, "hint": "风险分达到此值显示为“高”，范围建议 0-100，并应位于低与极高分界之间。"},
@@ -247,7 +301,7 @@
         "description": "展示社交来源",
         "type": "bool",
         "default": true,
-        "hint": "在画像中展示添加好友时间、加好友验证语、进群来源和推测来源群。关闭仅隐藏展示，采集仍受 collect_social_events 控制。"
+        "hint": "在画像中展示添加好友时间、进群来源和推测来源群；好友申请验证语仅在私聊画像中显示，群聊查询始终隐藏。关闭仅隐藏展示，采集仍受 collect_social_events 控制。"
       },
       "guess_source_group": {
         "description": "推测来源群",
