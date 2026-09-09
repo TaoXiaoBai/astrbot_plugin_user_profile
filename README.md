@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.8.0-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.9.0-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -23,9 +23,9 @@ LLM 是画像的**语义分析核心**，规则统计是它的**证据底座和�
 1. **持续积累证据**：插件静默收集近期发言原话、群聊/私聊活跃度、图片、链接、二维码、@、夜间发言、社交来源及管理前科。
 2. **规则预处理**：先把客观数据转换为高活跃、多群出现、链接偏多、邀请被拒等基础标签和行为比例。
 3. **LLM 阅读与理解**：查询画像时，LLM 同时阅读近期原话、基础标签和行为比例，不只按关键词匹配，而是结合上下文识别广告引流、诈骗索要信息、刷屏、重复内容、挑衅、友好、乐于助人、正常交流等倾向。
-4. **输出结构化判断**：LLM 返回最多 5 个语义标签；每个标签都包含 `tag`、`confidence` 和 `reason`，便于人类阅读，也方便邀请守卫等插件稳定调用。
-5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，再按可配置权重计算 0–100 风险分和风险等级。
-6. **缓存与复用**：摘录、行为统计、基础标签、provider 和 schema 共同构成指纹；任一实际 prompt 输入变化都会失效。成功、空结果和短期失败均缓存，同一材料并发请求自动合并。
+4. **输出结构化判断**：LLM 返回 JSON 对象，包含最多 5 个带 `tag`、`confidence`、`reason` 的语义标签、一段 `impression` 人物印象和最多 5 项 `traits` 人格/行为特征。
+5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，再按可配置权重计算 0–100 风险分和风险等级；文字与图片入口共享同一个展示模型。
+6. **缓存与复用**：摘录、行为统计、基础标签、provider 和 schema 共同构成指纹；任一实际 prompt 输入变化都会失效。1.9.0 会在首次查询时刷新旧 tags-only 缓存，成功、空结果和短期失败均缓存，同一材料并发请求自动合并。
 
 LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。如果模型不可用、没有可分析原话或主动关闭 `llm_tags`，插件会保留统计、规则标签、前科和风险计算能力，但画像的语义理解会明显减弱。
 
@@ -42,7 +42,7 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 - **历史扫描回填**：按需扫描 AstrBot 已保存的会话历史，补充 LLM 分析材料，并减少将老群友误判为新人的情况。
 - **社交来源记录**：记录好友添加时间、好友验证语及进群方式、群号、操作者和时间；协议未提供真实来源时明确标注为“推测来源群”。
 - **灵活查询权限**：支持仅管理员、允许查自己、全员查他人、指定群公开查询等组合。
-- **文字或图片输出**：长画像可渲染成图片，避免刷屏；发言原话可以单独隐藏。
+- **统一文字或图片输出**：所有 `/我`、`/画像` 入口共用展示模型；新版动态高度卡片包含圆形头像或可靠占位头像、昵称/QQ/风险、按“风险 / 正向 / 行为”区分的柔和色椭圆药丸标签、人物印象、人格/行为分析、横向关键统计、社交来源/前科及可选摘录。长内容自动换行，图片成功时不再双发文字。
 - **邀请守卫深度联动**：画像插件吸收邀请守卫前科，邀请守卫读取画像标签和风险分，形成双向只读的信息闭环。
 - **低开销采集**：消息监听路径零 LLM、零网络，内存聚合后定期写入 AstrBot KV；模型只在需要画像时调用。
 
@@ -101,10 +101,10 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 
 有数据的项目才会显示；全部为空时返回“暂无记录”。
 
-- QQ 号和可获取时的昵称；
+- QQ 号、可获取时的昵称，以及仅在查询阶段短时获取的 QQ 头像；头像失败时使用占位图，不持久保存；
 - 群聊/私聊发言数、活跃群数、首次与最近发言时间；
-- 行为统计和最近发言摘录；
-- 人类和其它插件都容易读取的中文语义标签；
+- 人物印象、人格/行为分析、行为统计和可选的最近发言摘录；
+- 带“风险 / 正向 / 行为”文字分类的中文椭圆药丸标签，风险用柔和暖色、正向用绿色、行为用蓝紫色，颜色只作辅助；
 - LLM 对各项语义判断给出的置信度；
 - 供 LLM 工具和可信插件读取的标签依据 `evidence`；
 - 0–100 综合风险分及低、中、高、极高等级；
@@ -221,21 +221,20 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 这组配置决定画像的语义分析能力。开启后，模型收到的是“近期真实发言 + 规则标签 + 行为比例”，返回机器可读的结构化判断，例如：
 
 ```json
-[
-  {
-    "tag": "ad_suspect",
-    "confidence": 0.82,
-    "reason": "多次发送二维码、联系方式和引流文案"
-  },
-  {
-    "tag": "repetitive",
-    "confidence": 0.74,
-    "reason": "近期反复发送高度相似的内容"
-  }
-]
+{
+  "tags": [
+    {
+      "tag": "ad_suspect",
+      "confidence": 0.82,
+      "reason": "多次发送二维码、联系方式和引流文案"
+    }
+  ],
+  "impression": "表达直接，近期内容有较明显的推广导向。",
+  "traits": ["高频推广", "重复表达"]
+}
 ```
 
-模型只能返回固定白名单标签；`reason` 会清除控制字符并截断到 160 字。发言摘录被包在明确的“不可信证据”边界内，不能作为提示词指令。普通 `/画像` 页面以紧凑方式显示标签和置信度。
+模型只能返回固定白名单标签；`reason` 会清除控制字符并截断到 160 字，`impression` 截断到 240 字，`traits` 最多 5 项且每项截断到 48 字，重复项会去除。发言摘录继续放在明确的 `<untrusted_evidence>` 不可信证据边界内，不能作为提示词指令。旧 tags-only 缓存因 schema 版本变化会在首次查询时自动刷新。
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -326,8 +325,8 @@ if instance is not None:
 
 接口说明：
 
-- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：推荐的 schema v2 决策接口；在旧字段基础上加入 `captured_at`、`data_freshness`、`llm_status`、`partial_errors`、`evidence_untrusted`，不包含发言原话，并可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
-- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级和标签。
+- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：兼容既有 schema v2 决策接口；保留 `tags` 等旧字段并附加 `impression`、`traits`，不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
+- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits`；旧调用方可继续只读取原字段。
 - `get_profile_tags(qq, event=None) -> list[dict]`：返回结构化标签。
 - `get_risk_score(qq, event=None) -> int`：返回风险分。
 - `get_profile_text(qq, event=None) -> str`：返回可读文字画像。
@@ -341,7 +340,7 @@ if instance is not None:
 - `collect_private` 控制统计，`store_private_quotes` 控制落盘，`llm_include_private_quotes` 控制发送给模型，三者相互独立。
 - 群聊查询永不展示私聊摘录或好友申请验证语；私聊查询可以显示，可信内部 API 可读取验证语供受限审核使用。
 - 启用 LLM 标签后，允许的近期摘录会发送给所选模型提供方；请按隐私政策配置。
-- 采集路径零 LLM、零网络；统计内存聚合后按 `flush_interval` 写入 KV。
+- 采集路径零 LLM、零网络；统计内存聚合后按 `flush_interval` 写入 KV。图片查询阶段会在线程中以 2.5 秒超时读取受限 QQ 官方域名头像，最多 2 MiB，不落盘；失败直接使用占位头像。
 - 每个 QQ 只保留最近 `quote_keep` 条，并可按 `quote_retention_days` 清理；消息热路径只检查当前 QQ，启动和管理员 `/画像清理` 才全量检查。
 - LLM 成功、空结果和短期失败都会缓存；同 QQ 同材料合并调用，不同 QQ 受有限 semaphore 控制，不同材料乱序完成时只有最新请求可更新缓存。
 - `/画像删除` 通过每 QQ 世代号使删除前已经在途的消息、历史扫描和 LLM 分析失去写回资格，不持锁等待；删除后的新消息仍可重新建立画像。

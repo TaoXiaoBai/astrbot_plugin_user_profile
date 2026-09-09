@@ -2,9 +2,11 @@ import math
 import unittest
 
 from profile_core import (
+    LLM_SCHEMA_VERSION,
     LLM_TAGS,
     build_material_fingerprint,
     normalize_config,
+    sanitize_llm_analysis,
     sanitize_llm_tags,
     speaker_lines,
 )
@@ -45,6 +47,25 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result[0]["confidence"], 1.0)
         self.assertNotIn("\x00", result[0]["evidence"])
         self.assertLessEqual(len(result[0]["evidence"]), 160)
+
+    def test_structured_llm_analysis_is_strictly_cleaned(self):
+        raw = {
+            "tags": [
+                {"tag": "friendly", "confidence": 0.9, "reason": "可信"},
+                {"tag": "friendly", "confidence": 0.5, "reason": "重复"},
+            ],
+            "summary": "印象\x00 " + "长" * 300,
+            "traits": [
+                {"name": "友善"}, "友善", "x" * 80, "稳定", "耐心", "活跃", "多余",
+            ],
+        }
+        result = sanitize_llm_analysis(raw)
+        self.assertEqual(LLM_SCHEMA_VERSION, 3)
+        self.assertEqual([tag["tag"] for tag in result["tags"]], ["friendly"])
+        self.assertNotIn("\x00", result["impression"])
+        self.assertLessEqual(len(result["impression"]), 240)
+        self.assertEqual(len(result["traits"]), 5)
+        self.assertTrue(all(len(value) <= 48 for value in result["traits"]))
 
     def test_fingerprint_changes_with_all_prompt_inputs(self):
         quotes = [{"text": "a"}]

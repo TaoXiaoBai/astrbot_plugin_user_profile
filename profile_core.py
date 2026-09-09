@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 
-LLM_SCHEMA_VERSION = 2
+LLM_SCHEMA_VERSION = 3
 LLM_TAGS = frozenset({
     "spam_suspect", "ad_suspect", "troll", "friendly", "helpful",
     "nsfw_tendency", "political_sensitive", "scam_suspect", "repetitive",
@@ -150,15 +150,17 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
     if not isinstance(raw, list):
         return []
     result = []
+    seen = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
         tag = clean_text(item.get("tag"), 64).lower()
-        if tag not in LLM_TAGS:
+        if tag not in LLM_TAGS or tag in seen:
             continue
         confidence = _finite_number(item.get("confidence"), -1)
         if confidence < 0:
             continue
+        seen.add(tag)
         result.append({
             "tag": tag,
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
@@ -168,6 +170,32 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
         if len(result) >= 5:
             break
     return result
+
+
+def sanitize_llm_analysis(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        return {"tags": sanitize_llm_tags(raw), "impression": "", "traits": []}
+    impression = clean_text(raw.get("impression", raw.get("summary")), 240)
+    traits_raw = raw.get("traits")
+    traits = []
+    seen = set()
+    if isinstance(traits_raw, list):
+        for value in traits_raw:
+            if isinstance(value, dict):
+                value = value.get("trait", value.get("name", ""))
+            trait = clean_text(value, 48)
+            key = trait.casefold()
+            if not trait or key in seen:
+                continue
+            seen.add(key)
+            traits.append(trait)
+            if len(traits) >= 5:
+                break
+    return {
+        "tags": sanitize_llm_tags(raw.get("tags")),
+        "impression": impression,
+        "traits": traits,
+    }
 
 
 def build_material_fingerprint(

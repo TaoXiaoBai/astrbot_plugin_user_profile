@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import io
 import os
 import sys
 import tempfile
@@ -69,8 +70,11 @@ from main import (
     SocialEventFilter,
     TagEngine,
     UserProfilePlugin,
+    _layout_pills,
     _new_stat,
     _risk_level,
+    _tag_visual_category,
+    _wrap_text,
 )
 
 
@@ -97,6 +101,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         plugin.get_kv_data = get
         plugin.put_kv_data = put
         return plugin
+
+    @staticmethod
+    def make_model(**overrides):
+        model = {
+            "qq": "11111", "nickname": "测试用户", "avatar_bytes": None,
+            "has_record": True, "score": 25, "level": "低",
+            "tags": [{"text": "行为 · 高活跃 95%", "category": "行为"}],
+            "impression": "表达友好，互动稳定。", "traits": ["友善", "乐于助人"],
+            "stats": [("消息总数", "10"), ("群聊 / 私聊", "8 / 2"),
+                      ("活跃群", "2"), ("图片 / 链接 / @", "1 / 0 / 1")],
+            "activity": "活跃度", "social": ["好友添加：未知"],
+            "criminal": ["未发现关联记录"], "quotes": [],
+        }
+        model.update(overrides)
+        return model
 
     def test_handlers_strictly_split_message_and_social_events(self):
         msg = Event({"post_type": "message", "message_type": "group"})
@@ -413,15 +432,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(call.kwargs["force"])
             self.assertFalse(call.kwargs["restart"])
 
-    def test_real_image_render_initializes_draw_and_uses_exact_height(self):
+    def test_real_image_render_uses_dynamic_height_and_uuid_path(self):
         from PIL import Image as PILImage
         plugin = self.make_plugin({"image_output": True})
-        path = plugin._render_profile_image("11111", "标题\n" + "很长的内容" * 200)
+        model = self.make_model(
+            impression="很长的内容" * 200,
+            quotes=["更长的摘录" * 120],
+            tags=[{"text": f"行为 · 标签{i} 90%", "category": "行为"} for i in range(12)],
+        )
+        path = plugin._render_profile_image(model)
         self.assertIsNotNone(path)
         try:
             with PILImage.open(path) as image:
-                self.assertEqual(image.width, 900)
-                self.assertGreater(image.height, 500)
+                self.assertEqual(image.width, 960)
+                self.assertGreater(image.height, 800)
             self.assertRegex(os.path.basename(path), r"^profile_11111_[0-9a-f]{32}\.png$")
         finally:
             if path and os.path.exists(path):
@@ -433,10 +457,113 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         os.close(fd)
         event = Event({"post_type": "message"})
         event.send = AsyncMock(side_effect=[RuntimeError("send failed"), None])
-        plugin._build_profile_text = AsyncMock(return_value="profile")
+        plugin._build_profile_model = AsyncMock(return_value=self.make_model())
         with patch.object(plugin, "_render_profile_image", return_value=path):
             await plugin._send_profile("11111", event)
         self.assertFalse(os.path.exists(path))
+        self.assertEqual(event.send.await_count, 2)
+        self.assertEqual(event.send.await_args_list[-1].args[0][0][0], "plain")
+
+    def test_pill_layout_and_text_wrap_respect_width(self):
+        from PIL import Image as PILImage, ImageDraw, ImageFont
+        draw = ImageDraw.Draw(PILImage.new("RGB", (300, 100), "white"))
+        font = ImageFont.load_default()
+        pills = _layout_pills(draw, ["行为 · 高活跃 95%"] * 8, font, 180)
+        self.assertTrue(pills)
+        self.assertGreater(max(item[1] for item in pills), 0)
+        self.assertTrue(all(item[0] + item[2] <= 180 for item in pills))
+        rows = _wrap_text(draw, "长内容" * 100, font, 120)
+        self.assertGreater(len(rows), 1)
+        self.assertTrue(all(draw.textbbox((0, 0), row, font=font)[2] <= 120 for row in rows))
+        balanced = _wrap_text(
+            draw, "交流表达自然，活跃度较高，愿意参与讨论；目前未见明显恶意引流，但仍建议结合长期记录判断。", font, 180
+        )
+        self.assertGreater(len(balanced), 1)
+        last_width = draw.textbbox((0, 0), balanced[-1], font=font)[2]
+        self.assertGreaterEqual(last_width, 180 * 0.3)
+        self.assertEqual(_tag_visual_category("scam_suspect"), "风险")
+        self.assertEqual(_tag_visual_category("friendly"), "正向")
+        self.assertEqual(_tag_visual_category("active_high"), "行为")
+
+    async def test_avatar_success_and_failure_are_graceful(self):
+        plugin = self.make_plugin()
+        with patch.object(plugin, "_download_avatar", return_value=b"image") as download:
+            data = await plugin._prepare_avatar_bytes(
+                "11111", {"avatar_url": "https://q1.qlogo.cn/avatar.png"}
+            )
+        self.assertEqual(data, b"image")
+        download.assert_called_once()
+        with patch.object(plugin, "_download_avatar", side_effect=RuntimeError("offline")) as failed:
+            self.assertIsNone(await plugin._prepare_avatar_bytes(
+                "11111", {"avatar_url": "https://q1.qlogo.cn/avatar.png"}
+            ))
+        self.assertEqual(failed.call_count, 2)
+        with patch.object(plugin, "_download_avatar", return_value=b"fallback") as fallback:
+            self.assertEqual(
+                await plugin._prepare_avatar_bytes("11111", {}), b"fallback"
+            )
+        fallback.assert_called_once_with(
+            "https://q1.qlogo.cn/g?b=qq&nk=11111&s=160"
+        )
+
+    def test_renderer_supports_placeholder_without_tags_or_nickname(self):
+        plugin = self.make_plugin({"image_output": True})
+        path = plugin._render_profile_image(self.make_model(
+            nickname="", tags=[], avatar_bytes=b"not-an-image",
+            score=None, level="暂无", impression="", traits=[],
+        ))
+        self.assertIsNotNone(path)
+        if path:
+            os.remove(path)
+
+    async def test_successful_image_send_does_not_also_send_text_and_cleans_file(self):
+        plugin = self.make_plugin({"image_output": True})
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        event = Event({"post_type": "message"})
+        plugin._build_profile_model = AsyncMock(return_value=self.make_model())
+        with patch.object(plugin, "_render_profile_image", return_value=path):
+            await plugin._send_profile("11111", event)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(len(event.sent), 1)
+        self.assertEqual(event.sent[0][0][0], "image")
+
+    async def test_all_query_entries_share_send_profile_flow(self):
+        plugin = self.make_plugin()
+        plugin._send_profile = AsyncMock()
+        await plugin.profile_command(Event({}, text="画像 自己", sender="11111"))
+        await plugin.self_profile_command_short(Event({}, text="我", sender="11111"))
+        await plugin.self_profile_command(Event({}, text="我的画像", sender="11111"))
+        self.assertEqual(plugin._send_profile.await_count, 3)
+        self.assertTrue(all(call.args[0] == "11111" for call in plugin._send_profile.await_args_list))
+
+    async def test_legacy_tags_cache_refreshes_to_structured_analysis(self):
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        plugin._kv["up_tags"] = {"11111": [{"tag": "friendly", "confidence": 1}]}
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [{"tag": "friendly", "confidence": 0.8, "reason": "ok"}],
+            "impression": "友好", "traits": ["稳定"],
+        })
+        await plugin._get_or_make_llm_tags(
+            "11111", _new_stat(), [{"src": "群 1", "text": "hello"}], []
+        )
+        cached = plugin._tags_cache["11111"]
+        self.assertEqual(cached["schema_version"], 3)
+        self.assertEqual(cached["impression"], "友好")
+        self.assertEqual(cached["traits"], ["稳定"])
+
+    async def test_disabled_quotes_and_legacy_container_types_do_not_break_model(self):
+        plugin = self.make_plugin({
+            "show_quotes": False, "history_scan_enabled": False, "llm_tags": False,
+        })
+        plugin._kv.update({
+            "up_stats": {"11111": "bad"},
+            "up_quotes": {"11111": {"text": "secret"}},
+            "up_tags": {"11111": "bad"},
+        })
+        model = await plugin._build_profile_model("11111", Event({}, group="22222"))
+        self.assertEqual(model["quotes"], [])
+        self.assertEqual(model["nickname"], "")
 
     async def test_profile_prefers_versioned_invite_guard_api(self):
         guard = types.SimpleNamespace(get_inviter_evidence=AsyncMock(return_value={
@@ -581,10 +708,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         })
         plugin._llm_status["11111"] = "cached_error"
         plugin.get_profile_tags_with_score = AsyncMock(return_value={
-            "score": 50, "level": "中",
+            "score": 50, "level": "中", "impression": "谨慎友好", "traits": ["稳定"],
             "tags": [{"tag": "active_low", "confidence": 0.8, "source": "stats"}],
         })
         profile = await plugin.get_decision_profile("11111")
+        self.assertEqual(profile["impression"], "谨慎友好")
+        self.assertEqual(profile["traits"], ["稳定"])
         self.assertEqual(profile["llm_status"], "cached_error")
         self.assertEqual(
             profile["partial_errors"],
