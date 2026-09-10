@@ -578,7 +578,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         records = await plugin._load_guard_records_raw("11111", "current")
         self.assertIn("30000", records["invite"])
-        self.assertEqual(records["mute"], {})
+        self.assertEqual(records["mute"], {"30000": 3})
         guard.get_inviter_evidence.assert_awaited_once_with(
             "11111", exclude_request_key="current"
         )

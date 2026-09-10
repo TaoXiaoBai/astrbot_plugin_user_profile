@@ -546,7 +546,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为与摘录，输出结构化风险画像，并供邀请守卫只读调用",
-    "1.9.0",
+    "1.9.1",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1876,10 +1876,11 @@ class UserProfilePlugin(Star):
                 evidence = getter(qq, exclude_request_key=exclude_request_key)
                 evidence = await evidence if inspect.isawaitable(evidence) else evidence
                 if isinstance(evidence, dict):
+                    mute_ctx = evidence.get("group_mute_context")
                     return {
                         "invite": evidence.get("invite") or {},
                         "join": evidence.get("join") or {},
-                        "mute": {},
+                        "mute": mute_ctx if isinstance(mute_ctx, dict) else {},
                     }
             except Exception as exc:
                 logger.warning(f"user_profile: invite-guard evidence API failed: {exc}")
