@@ -516,6 +516,24 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         if path:
             os.remove(path)
 
+    def test_card_module_toggles_collapse_to_header_and_footer(self):
+        from PIL import Image as PILImage
+        plugin = self.make_plugin({
+            "image_output": True,
+            "card_show_tags": False, "card_show_stats": False,
+            "card_show_impression": False, "card_show_traits": False,
+            "card_show_social": False, "card_show_criminal": False,
+        })
+        path = plugin._render_profile_image(self.make_model(quotes=[]))
+        self.assertIsNotNone(path)
+        try:
+            with PILImage.open(path) as image:
+                self.assertEqual(image.width, 960)
+                self.assertLess(image.height, 400)
+        finally:
+            if path and os.path.exists(path):
+                os.remove(path)
+
     async def test_successful_image_send_does_not_also_send_text_and_cleans_file(self):
         plugin = self.make_plugin({"image_output": True})
         fd, path = tempfile.mkstemp(suffix=".png")

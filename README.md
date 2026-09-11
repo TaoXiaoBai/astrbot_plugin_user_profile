@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.9.1-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.9.2-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -42,7 +42,7 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 - **历史扫描回填**：按需扫描 AstrBot 已保存的会话历史，补充 LLM 分析材料，并减少将老群友误判为新人的情况。
 - **社交来源记录**：记录好友添加时间、好友验证语及进群方式、群号、操作者和时间；协议未提供真实来源时明确标注为“推测来源群”。
 - **灵活查询权限**：支持仅管理员、允许查自己、全员查他人、指定群公开查询等组合。
-- **统一文字或图片输出**：所有 `/我`、`/画像` 入口共用展示模型；新版动态高度卡片包含圆形头像或可靠占位头像、昵称/QQ/风险、按“风险 / 正向 / 行为”区分的柔和色椭圆药丸标签、人物印象、人格/行为分析、横向关键统计、社交来源/前科及可选摘录。长内容自动换行，图片成功时不再双发文字。
+- **统一文字或图片输出**：所有 `/我`、`/画像` 入口共用展示模型；动态高度卡片包含白环圆形头像或可靠占位头像、昵称/QQ、按风险分着色的头部描边条与右侧风险徽章、按“风险 / 正向 / 行为”区分的柔和色椭圆药丸标签、人物印象、人格/行为分析、横向关键统计、社交来源/前科及可选摘录，页脚标注生成时间。长内容自动换行，图片成功时不再双发文字；每个展示模块都有独立开关（`card_show_*`），可裁剪成极简卡片。
 - **邀请守卫深度联动**：画像插件吸收邀请守卫前科，邀请守卫读取画像标签和风险分，形成双向只读的信息闭环。
 - **低开销采集**：消息监听路径零 LLM、零网络，内存聚合后定期写入 AstrBot KV；模型只在需要画像时调用。
 
@@ -186,6 +186,21 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `quote_show` | `5` | 最多展示的原话条数 |
 
 `show_quotes=false` 只隐藏输出。是否保存、是否允许 LLM 使用私聊摘录分别由下方隐私开关控制。
+
+### 图片卡片模块
+
+以下开关只影响图片卡片的展示模块，不影响文字画像、标签生成和 LLM 分析：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `card_show_tags` | `true` | 卡片展示“画像标签”药丸区 |
+| `card_show_stats` | `true` | 卡片展示“关键统计”四个统计格 |
+| `card_show_impression` | `true` | 卡片展示 LLM“人物印象”区 |
+| `card_show_traits` | `true` | 卡片展示“人格 / 行为分析”列表 |
+| `card_show_social` | `true` | 卡片展示“社交来源”区 |
+| `card_show_criminal` | `true` | 卡片展示“前科记录”区 |
+
+全部关闭时卡片只保留头部（头像、昵称、QQ、风险徽章）和页脚；摘录区仍由 `show_quotes` 控制。
 
 ### 数据采集
 

@@ -71,6 +71,48 @@
       }
     }
   },
+  "card": {
+    "description": "图片卡片模块",
+    "type": "object",
+    "items": {
+      "card_show_tags": {
+        "description": "卡片展示画像标签",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的“画像标签”药丸区。仅影响图片输出，不影响文字画像和标签生成。"
+      },
+      "card_show_stats": {
+        "description": "卡片展示关键统计",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的消息总数、群聊/私聊、活跃群、图片/链接/@ 四个统计格。仅影响图片输出。"
+      },
+      "card_show_impression": {
+        "description": "卡片展示人物印象",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的 LLM 人物印象区。仅影响图片输出，不影响 LLM 分析本身。"
+      },
+      "card_show_traits": {
+        "description": "卡片展示人格/行为分析",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的人格/行为特征列表。仅影响图片输出，不影响 LLM 分析本身。"
+      },
+      "card_show_social": {
+        "description": "卡片展示社交来源",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的社交来源区；需 show_social_origin 开启且采集到记录才有内容。仅影响图片输出。"
+      },
+      "card_show_criminal": {
+        "description": "卡片展示前科记录",
+        "type": "bool",
+        "default": true,
+        "hint": "控制图片卡片中的邀请守卫/黑名单前科区。仅影响图片输出，不影响联动读取和前科标签。"
+      }
+    }
+  },
   "collect": {
     "description": "数据采集",
     "type": "object",

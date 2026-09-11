@@ -200,6 +200,23 @@ def _risk_color(score: int) -> str:
     return "#388e3c"
 
 
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    text = str(value or "").lstrip("#")
+    if len(text) != 6:
+        return (111, 139, 174)
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (111, 139, 174)
+
+
+def _ink_on(color: tuple[int, int, int]) -> tuple[int, int, int]:
+    """按底色亮度选择可读的前景色。"""
+    r, g, b = color
+    luminance = r * 0.299 + g * 0.587 + b * 0.114
+    return (31, 45, 61) if luminance > 160 else (255, 255, 255)
+
+
 def _wrap_text(draw, text: str, font, max_width: int) -> list[str]:
     def width(value: str) -> int:
         box = draw.textbbox((0, 0), value or " ", font=font)
@@ -546,7 +563,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为与摘录，输出结构化风险画像，并供邀请守卫只读调用",
-    "1.9.1",
+    "1.9.2",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1403,7 +1420,16 @@ class UserProfilePlugin(Star):
         if not HAS_PIL or not isinstance(model, dict):
             return None
         try:
-            width, padding, content_width = 960, 52, 856
+            cfg = self.config if isinstance(self.config, dict) else {}
+            show_tags = bool(cfg.get("card_show_tags", True))
+            show_stats = bool(cfg.get("card_show_stats", True))
+            show_impression = bool(cfg.get("card_show_impression", True))
+            show_traits = bool(cfg.get("card_show_traits", True))
+            show_social = bool(cfg.get("card_show_social", True))
+            show_criminal = bool(cfg.get("card_show_criminal", True))
+
+            width, padding = 960, 48
+            content_width = width - padding * 2
             font_paths = [
                 "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
                 "/System/Library/Fonts/PingFang.ttc",
@@ -1413,44 +1439,87 @@ class UserProfilePlugin(Star):
             font_path = next((path for path in font_paths if os.path.isfile(path)), "")
             def font(size):
                 return ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
-            title_font, meta_font = font(34), font(21)
+            title_font, meta_font = font(34), font(20)
             heading_font, body_font, small_font = font(24), font(21), font(18)
+            value_font = font(26)
             scratch = PILImage.new("RGB", (width, 200), "white")
             measure = ImageDraw.Draw(scratch)
 
-            tags = model.get("tags") if isinstance(model.get("tags"), list) else []
-            pill_labels = [str(item.get("text") or "") for item in tags if isinstance(item, dict)]
-            pills = _layout_pills(measure, pill_labels, small_font, content_width)
-            pill_height = (max((y + h for _, y, _, h, _ in pills), default=0) + 8)
+            score = model.get("score")
+            accent = _hex_rgb(_risk_color(score)) if isinstance(score, int) and not isinstance(score, bool) else (111, 139, 174)
+            text_width = content_width - 56
 
-            sections = []
-            section_text_width = content_width - 48
-            def add_section(title, values):
-                values = [str(value) for value in values if str(value).strip()]
-                if not values:
-                    return
+            # 第一遍：按开关预算每个模块的内容高度，模块为 (类型, 标题, 数据, 内容高度)。
+            blocks = []
+
+            def wrap_lines(values):
                 rows = []
                 for value in values:
-                    rows.extend(_wrap_text(measure, value, body_font, section_text_width))
-                sections.append((title, rows))
+                    rows.extend(_wrap_text(measure, str(value), body_font, text_width))
+                return rows
 
-            add_section("人物印象", [model.get("impression") or "暂无足够语义材料"])
-            add_section("人格 / 行为分析", [" · ".join(model.get("traits") or []) or "暂无结构化分析"])
-            add_section("社交来源", model.get("social") or ["暂无明确社交来源记录"])
-            add_section("前科记录", model.get("criminal") or ["未发现关联前科记录"])
-            if model.get("quotes"):
-                add_section("发言摘录", model["quotes"])
+            def add_text_block(kind, title, values, fallback=""):
+                values = [str(value) for value in values if str(value).strip()]
+                if not values and fallback:
+                    values = [fallback]
+                if not values:
+                    return
+                rows = wrap_lines(values)
+                blocks.append((kind, title, rows, len(rows) * 30 + 28))
 
-            header_height = 184
-            stats_height = 116
-            tags_height = 52 + pill_height if pills else 82
-            section_height = sum(52 + len(rows) * 31 + 20 for _, rows in sections)
-            height = header_height + padding + tags_height + stats_height + section_height + padding
-            image = PILImage.new("RGB", (width, height), (247, 249, 252))
+            if not model.get("has_record"):
+                add_text_block("plain", "暂无记录", ["未采集到该用户的发言，也没有前科或好友/进群记录。"])
+            else:
+                if show_tags:
+                    tags = model.get("tags") if isinstance(model.get("tags"), list) else []
+                    labels = [str(item.get("text") or "") for item in tags if isinstance(item, dict)]
+                    pills = _layout_pills(measure, labels, small_font, content_width)
+                    if pills:
+                        blocks.append(("tags", "画像标签", pills, max(y + h for _, y, _, h, _ in pills) + 4))
+                    else:
+                        add_text_block("plain", "画像标签", [], "暂无可用标签")
+                if show_stats:
+                    stats = [
+                        item for item in (model.get("stats") or [])
+                        if isinstance(item, (list, tuple)) and len(item) >= 2
+                    ]
+                    if stats:
+                        blocks.append(("stats", "关键统计", stats[:4], 76))
+                if show_impression:
+                    add_text_block("impression", "人物印象", [model.get("impression") or ""], "暂无足够语义材料")
+                if show_traits:
+                    traits = [str(value) for value in (model.get("traits") or []) if str(value).strip()]
+                    if traits:
+                        rows = []
+                        for trait in traits:
+                            wrapped = _wrap_text(measure, trait, body_font, text_width - 26)
+                            rows.append(f"• {wrapped[0]}")
+                            rows.extend(f"  {row}" for row in wrapped[1:])
+                        blocks.append(("traits", "人格 / 行为分析", rows, len(rows) * 30 + 28))
+                    else:
+                        add_text_block("traits", "人格 / 行为分析", [], "暂无结构化分析")
+                if show_social:
+                    add_text_block("social", "社交来源", model.get("social") or [], "暂无明确社交来源记录")
+                if show_criminal:
+                    add_text_block("criminal", "前科记录", model.get("criminal") or [], "未发现关联前科记录")
+                if model.get("quotes"):
+                    add_text_block("quotes", "发言摘录", model["quotes"])
+
+            header_h, heading_h, block_gap = 172, 44, 26
+            body_h = sum(heading_h + block_h + block_gap for _, _, _, block_h in blocks)
+            if blocks:
+                body_h -= block_gap
+            divider_y = header_h + 30 + body_h + 14
+            height = divider_y + 1 + 16 + 26 + 24
+
+            image = PILImage.new("RGB", (width, height), (244, 246, 250))
             draw = ImageDraw.Draw(image)
-            draw.rectangle((0, 0, width, header_height), fill=(39, 57, 82))
 
-            avatar_size, avatar_x, avatar_y = 112, padding, 36
+            # 头部：深蓝底 + 风险色描边条 + 圆头像 + 右侧风险徽章。
+            draw.rectangle((0, 0, width, header_h), fill=(32, 44, 61))
+            draw.rectangle((0, header_h - 6, width, header_h), fill=accent)
+            avatar_size = 104
+            avatar_x, avatar_y = padding, (header_h - 6 - avatar_size) // 2
             avatar = None
             raw_avatar = model.get("avatar_bytes")
             if isinstance(raw_avatar, (bytes, bytearray)):
@@ -1470,61 +1539,98 @@ class UserProfilePlugin(Star):
                 avatar_draw = ImageDraw.Draw(avatar)
                 initial = (model.get("nickname") or model.get("qq") or "?")[:1]
                 box = avatar_draw.textbbox((0, 0), initial, font=title_font)
-                avatar_draw.text(((avatar_size - (box[2] - box[0])) / 2, 32), initial, fill="white", font=title_font)
+                avatar_draw.text(
+                    ((avatar_size - (box[2] - box[0])) / 2 - box[0],
+                     (avatar_size - (box[3] - box[1])) / 2 - box[1]),
+                    initial, fill="white", font=title_font,
+                )
+            draw.ellipse(
+                (avatar_x - 4, avatar_y - 4, avatar_x + avatar_size + 4, avatar_y + avatar_size + 4),
+                fill=(255, 255, 255),
+            )
             image.paste(avatar, (avatar_x, avatar_y), mask)
 
-            text_x = avatar_x + avatar_size + 30
+            text_x = avatar_x + avatar_size + 28
             nickname = model.get("nickname") or "未获取昵称"
-            draw.text((text_x, 42), nickname, fill="white", font=title_font)
-            draw.text((text_x, 91), f"QQ {model.get('qq', '')}", fill=(207, 218, 232), font=meta_font)
-            risk = "风险：暂无" if model.get("score") is None else f"风险：{model['level']} · {model['score']} / 100"
-            draw.text((text_x, 125), risk, fill=(255, 226, 154), font=meta_font)
+            draw.text((text_x, 44), nickname, fill="white", font=title_font)
+            draw.text((text_x, 98), f"QQ {model.get('qq', '')}", fill=(196, 208, 222), font=meta_font)
 
-            y = header_height + 34
-            draw.text((padding, y), "画像标签", fill=(31, 45, 61), font=heading_font)
-            y += 42
-            if pills:
-                palette = {
-                    "风险": ((255, 235, 229), (166, 72, 54)),
-                    "正向": ((228, 246, 236), (42, 112, 76)),
-                    "行为": ((235, 232, 252), (82, 70, 154)),
-                }
-                for x, py, w, h, label in pills:
-                    category = label.split(" · ", 1)[0]
-                    fill, ink = palette.get(category, ((238, 240, 244), (62, 70, 80)))
-                    draw.rounded_rectangle((padding + x, y + py, padding + x + w, y + py + h), radius=h // 2, fill=fill)
-                    draw.text((padding + x + 14, y + py + 8), label, fill=ink, font=small_font)
-                y += pill_height
+            if score is None or isinstance(score, bool):
+                badge_text, badge_fill = "风险 暂无", (90, 104, 120)
             else:
-                draw.text((padding, y), "暂无可用标签", fill=(102, 112, 124), font=body_font)
-                y += 40
+                badge_text = f"风险 {model.get('level', '')} · {score}/100"
+                badge_fill = accent
+            badge_font = meta_font
+            bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
+            badge_w, badge_h = bbox[2] - bbox[0] + 40, 46
+            badge_x = width - padding - badge_w
+            badge_y = (header_h - 6 - badge_h) // 2
+            draw.rounded_rectangle(
+                (badge_x, badge_y, badge_x + badge_w, badge_y + badge_h),
+                radius=badge_h // 2, fill=badge_fill,
+            )
+            draw.text(
+                (badge_x + 20, badge_y + (badge_h - (bbox[3] - bbox[1])) // 2 - bbox[1]),
+                badge_text, fill=_ink_on(badge_fill), font=badge_font,
+            )
 
-            y += 20
-            draw.text((padding, y), "关键统计", fill=(31, 45, 61), font=heading_font)
-            y += 42
-            stats = model.get("stats") if isinstance(model.get("stats"), list) else []
-            card_gap = 12
-            card_width = (content_width - card_gap * 3) // 4
-            for index, item in enumerate(stats[:4]):
-                label, value = item
-                x = padding + index * (card_width + card_gap)
-                draw.rounded_rectangle((x, y, x + card_width, y + 68), radius=14, fill=(255, 255, 255), outline=(224, 229, 236))
-                draw.text((x + 14, y + 10), str(label), fill=(108, 118, 130), font=small_font)
-                draw.text((x + 14, y + 36), str(value), fill=(31, 45, 61), font=small_font)
-            y += 96
+            # 第二遍：按预算逐模块绘制。
+            y = header_h + 30
+            for kind, title, payload, block_h in blocks:
+                draw.rectangle((padding, y + 4, padding + 5, y + 28), fill=accent)
+                draw.text((padding + 16, y), title, fill=(31, 45, 61), font=heading_font)
+                y += heading_h
+                if kind == "tags":
+                    palette = {
+                        "风险": ((255, 235, 229), (166, 72, 54)),
+                        "正向": ((228, 246, 236), (42, 112, 76)),
+                        "行为": ((235, 232, 252), (82, 70, 154)),
+                    }
+                    for x, py, w, h, label in payload:
+                        category = label.split(" · ", 1)[0]
+                        fill, ink = palette.get(category, ((238, 240, 244), (62, 70, 80)))
+                        draw.rounded_rectangle(
+                            (padding + x, y + py, padding + x + w, y + py + h),
+                            radius=h // 2, fill=fill,
+                        )
+                        draw.text((padding + x + 14, y + py + 8), label, fill=ink, font=small_font)
+                elif kind == "stats":
+                    card_gap = 12
+                    card_width = (content_width - card_gap * 3) // 4
+                    for index, (label, value) in enumerate(payload):
+                        x = padding + index * (card_width + card_gap)
+                        draw.rounded_rectangle(
+                            (x, y, x + card_width, y + block_h),
+                            radius=12, fill=(255, 255, 255), outline=(226, 231, 238),
+                        )
+                        draw.text((x + 16, y + 14), str(label), fill=(108, 118, 130), font=small_font)
+                        draw.text((x + 16, y + 42), str(value), fill=(31, 45, 61), font=value_font)
+                else:
+                    fill = (255, 255, 255)
+                    if kind == "impression":
+                        fill = (240, 245, 252)
+                    elif kind == "quotes":
+                        fill = (250, 251, 253)
+                    draw.rounded_rectangle(
+                        (padding, y, width - padding, y + block_h),
+                        radius=12, fill=fill, outline=(226, 231, 238),
+                    )
+                    if kind == "impression":
+                        draw.rectangle((padding + 1, y + 12, padding + 5, y + block_h - 12), fill=accent)
+                    text_y = y + 14
+                    for row in payload:
+                        draw.text((padding + 26, text_y), row, fill=(54, 63, 73), font=body_font)
+                        text_y += 30
+                y += block_h + block_gap
 
-            for title, rows in sections:
-                draw.text((padding, y), title, fill=(31, 45, 61), font=heading_font)
-                y += 40
-                draw.rounded_rectangle(
-                    (padding, y, width - padding, y + len(rows) * 31 + 14),
-                    radius=14, fill=(255, 255, 255), outline=(228, 232, 238),
-                )
-                text_y = y + 8
-                for row in rows:
-                    draw.text((padding + 24, text_y), row, fill=(54, 63, 73), font=body_font)
-                    text_y += 31
-                y += len(rows) * 31 + 34
+            # 页脚：分隔线 + 居中生成信息。
+            draw.line((padding, divider_y, width - padding, divider_y), fill=(222, 228, 236), width=1)
+            footer_text = f"AstrBot 用户画像 · 生成于 {time.strftime('%Y-%m-%d %H:%M')}"
+            fb = draw.textbbox((0, 0), footer_text, font=small_font)
+            draw.text(
+                ((width - (fb[2] - fb[0])) / 2, divider_y + 16),
+                footer_text, fill=(140, 150, 162), font=small_font,
+            )
 
             tmp_dir = os.path.join(os.path.dirname(__file__), "tmp")
             os.makedirs(tmp_dir, exist_ok=True)

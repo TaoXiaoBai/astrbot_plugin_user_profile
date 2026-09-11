@@ -2,6 +2,14 @@
 
 本文件记录用户画像插件的版本更新，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.2] - 2026-09-12
+
+### 新增
+- 图片卡片每个展示模块独立开关：`card_show_tags` / `card_show_stats` / `card_show_impression` / `card_show_traits` / `card_show_social` / `card_show_criminal`，全部关闭时只保留头部与页脚
+
+### 优化
+- 重排图片卡片视觉：白环圆形头像、右侧按风险分着色的风险徽章、头部风险色描边条、带强调条的模块标题、放大的统计数值、人物印象高亮卡片与居中页脚生成时间
+
 ## [1.9.1] - 2026-09-11
 
 ### 修复
