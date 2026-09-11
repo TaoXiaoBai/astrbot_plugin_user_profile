@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.9.2-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.9.3-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 

@@ -563,7 +563,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为与摘录，输出结构化风险画像，并供邀请守卫只读调用",
-    "1.9.2",
+    "1.9.3",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1595,16 +1595,33 @@ class UserProfilePlugin(Star):
                         )
                         draw.text((padding + x + 14, y + py + 8), label, fill=ink, font=small_font)
                 elif kind == "stats":
+                    stat_palette = [
+                        ((235, 242, 252), (43, 93, 168)),
+                        ((232, 246, 240), (35, 122, 87)),
+                        ((240, 236, 252), (102, 82, 180)),
+                        ((252, 241, 230), (176, 108, 38)),
+                    ]
                     card_gap = 12
                     card_width = (content_width - card_gap * 3) // 4
                     for index, (label, value) in enumerate(payload):
                         x = padding + index * (card_width + card_gap)
+                        fill, ink = stat_palette[index % len(stat_palette)]
+                        label_ink = tuple(int(c + (255 - c) * 0.30) for c in ink)
                         draw.rounded_rectangle(
                             (x, y, x + card_width, y + block_h),
-                            radius=12, fill=(255, 255, 255), outline=(226, 231, 238),
+                            radius=14, fill=fill,
                         )
-                        draw.text((x + 16, y + 14), str(label), fill=(108, 118, 130), font=small_font)
-                        draw.text((x + 16, y + 42), str(value), fill=(31, 45, 61), font=value_font)
+                        label_text, value_text = str(label), str(value)
+                        lb = draw.textbbox((0, 0), label_text, font=small_font)
+                        vb = draw.textbbox((0, 0), value_text, font=value_font)
+                        draw.text(
+                            (x + (card_width - (lb[2] - lb[0])) / 2 - lb[0], y + 13),
+                            label_text, fill=label_ink, font=small_font,
+                        )
+                        draw.text(
+                            (x + (card_width - (vb[2] - vb[0])) / 2 - vb[0], y + 41),
+                            value_text, fill=ink, font=value_font,
+                        )
                 else:
                     fill = (255, 255, 255)
                     if kind == "impression":
