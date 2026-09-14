@@ -70,6 +70,7 @@ from main import (
     SocialEventFilter,
     TagEngine,
     UserProfilePlugin,
+    _effective_group_count,
     _layout_pills,
     _new_stat,
     _risk_level,
@@ -79,13 +80,17 @@ from main import (
 
 
 class Event:
-    def __init__(self, raw, sender="11111", group="22222", text="", messages=None):
+    def __init__(self, raw, sender="11111", group="22222", text="", messages=None,
+                 platform="snowluma", umo=""):
         self.message_obj = types.SimpleNamespace(raw_message=raw, self_id="99999")
         self._sender, self._group, self._text = sender, group, text
         self._messages = messages or []
+        self._platform = platform
+        self.unified_msg_origin = umo or (f"{platform}:GroupMessage:{group}" if group else "")
         self.sent = []
     def get_sender_id(self): return self._sender
     def get_group_id(self): return self._group
+    def get_platform_id(self): return self._platform
     def get_message_str(self): return self._text
     def get_messages(self): return self._messages
     def is_admin(self): return False
@@ -173,6 +178,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin._check_query_permission("11111", other)[0])
         other.is_admin = lambda: True
         self.assertTrue(plugin._check_query_permission("11111", other)[0])
+
+    def test_v428_default_provider_path_is_supported(self):
+        context = types.SimpleNamespace(get_config=lambda: {
+            "provider_settings": {},
+            "agent_runner": {"config": {"model": {"provider_id": "openai_1/model"}}},
+        })
+        self.assertEqual(
+            TagEngine._default_provider_id(context), "openai_1/model"
+        )
+        legacy = types.SimpleNamespace(get_config=lambda: {
+            "provider_settings": {"default_provider_id": "legacy/model"},
+            "agent_runner": {"config": {"model": {"provider_id": "new/model"}}},
+        })
+        self.assertEqual(TagEngine._default_provider_id(legacy), "legacy/model")
 
     async def test_llm_timeout_configuration_is_applied(self):
         config = self.make_plugin({
@@ -398,13 +417,83 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             manager.get_filtered_conversations.await_args.kwargs["page"], 2
         )
 
+    async def test_platform_history_matches_sender_and_reuses_scope_cache(self):
+        plugin = self.make_plugin({"platform_history_scan_limit": 700})
+        await plugin._ensure_loaded()
+        plugin._stats["11111"] = _new_stat()
+        records = [
+            types.SimpleNamespace(
+                sender_id="11111", created_at=90,
+                content={"type": "user", "message": [{"type": "plain", "text": "[Image]"}]},
+            ),
+            types.SimpleNamespace(
+                sender_id="11111", created_at=100,
+                content={"type": "user", "message": [{"type": "plain", "text": "目标历史发言"}]},
+            ),
+            types.SimpleNamespace(
+                sender_id="22222", created_at=110,
+                content={"type": "user", "message": [{"type": "plain", "text": "他人发言"}]},
+            ),
+            types.SimpleNamespace(
+                sender_id="11111", created_at=120,
+                content={"type": "bot", "message": [{"type": "plain", "text": "机器人消息"}]},
+            ),
+        ]
+        history_manager = types.SimpleNamespace(get=AsyncMock(return_value=records))
+        plugin.context = types.SimpleNamespace(
+            message_history_manager=history_manager,
+            conversation_manager=None,
+        )
+        event = Event({}, sender="99999", group="22222")
+
+        first = await plugin._scan_platform_history("11111", event)
+        second = await plugin._scan_platform_history("11111", event)
+
+        self.assertTrue(first["available"])
+        self.assertEqual(first["matched_count"], 2)
+        self.assertEqual(first["first"], 90)
+        self.assertEqual(first["last"], 100)
+        self.assertEqual(first["quotes"], ["[群 22222] 目标历史发言"])
+        self.assertEqual(second["quotes"], first["quotes"])
+        history_manager.get.assert_awaited_once_with(
+            platform_id="snowluma",
+            user_id="snowluma:GroupMessage:22222",
+            page_size=700,
+        )
+
+    async def test_history_v2_forces_one_v3_rescan_and_uses_platform_count(self):
+        plugin = self.make_plugin({"history_rescan_interval": 86400})
+        await plugin._ensure_loaded()
+        st = plugin._stats["11111"] = _new_stat()
+        st.update({
+            "history_version": 2, "history_complete": True,
+            "history_scanned_at": int(__import__("time").time()), "g_count": 2,
+        })
+        plugin._tags_cache["11111"] = {
+            "status": "empty", "fingerprint": "stale", "time": 1,
+        }
+        plugin._scan_history = AsyncMock(return_value={
+            "first": 10, "last": 20, "complete": True,
+            "quotes": ["历史原话"], "next_page": 1,
+            "scanned_count": 3, "platform_count": 9, "failed": False,
+        })
+
+        self.assertTrue(await plugin._ensure_history_scanned("11111", event=Event({})))
+        self.assertEqual(st["history_version"], 3)
+        self.assertEqual(st["platform_history_count"], 9)
+        self.assertEqual(st["history_quotes"], ["历史原话"])
+        self.assertEqual(_effective_group_count(st), 9)
+        self.assertNotIn("11111", plugin._tags_cache)
+        self.assertTrue(plugin._tags_dirty)
+        plugin._scan_history.assert_awaited_once()
+
     async def test_batch_history_scan_reports_progress_and_precise_totals(self):
         plugin = self.make_plugin({"history_scan_batch_limit": 5})
         await plugin._ensure_loaded()
         for qq in ("11111", "11112", "11113", "11114", "11115", "11116"):
             plugin._stats[qq] = _new_stat()
 
-        async def scan(qq, force=False, restart=None):
+        async def scan(qq, force=False, restart=None, event=None):
             await asyncio.sleep(0)
             if qq == "11114":
                 raise RuntimeError("scan failed")

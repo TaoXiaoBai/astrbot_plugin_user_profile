@@ -196,10 +196,16 @@
         "hint": "每次扫描最多翻几页会话历史，页数越大覆盖越全但越慢；最小按 1 处理。单个 QQ 匹配的会话数通常很少，一般无需调大。"
       },
       "history_scan_page_size": {
-        "description": "每页会话数",
+        "description": "每页旧会话数",
         "type": "int",
         "default": 10,
-        "hint": "每次扫描每页返回的会话数，最小按 1 处理。与扫描页数相乘即单次最多读取的会话数。"
+        "hint": "扫描旧版 conversations 会话历史时每页返回的会话数，最小按 1 处理。与扫描页数相乘即单次最多读取的旧会话数。"
+      },
+      "platform_history_scan_limit": {
+        "description": "每群持久化消息扫描数",
+        "type": "int",
+        "default": 700,
+        "hint": "兼容新版 AstrBot“持久化群聊消息记录”：每个已知群最多读取的最近消息数，运行时限制为 50-5000。建议与 AstrBot 的群聊历史最大保存数保持一致；数值越大，老人画像和近期原话回填越完整，但查询时读取量也越大。"
       },
       "history_scan_cooldown": {
         "description": "未完成扫描冷却时间",
@@ -241,19 +247,19 @@
         "description": "画像分析模型",
         "type": "string",
         "default": "",
-        "hint": "执行用户画像语义分析的 AstrBot provider ID；留空使用全局默认模型。填写不存在或不可用的 ID 时自动降级为仅规则画像。"
+        "hint": "执行用户画像语义分析的 AstrBot provider ID；留空自动读取 AstrBot 默认聊天模型（兼容 4.28 的 agent_runner.config.model.provider_id）。填写不存在或不可用的 ID 时自动降级为仅规则画像并写入日志。"
       },
       "llm_tag_cache_ttl": {
         "description": "LLM 分析缓存时间",
         "type": "int",
         "default": 86400,
-        "hint": "成功和空结果的缓存秒数；0 表示关闭缓存。材料、provider 或 schema 变化会立即失效。"
+        "hint": "LLM 成功画像的缓存秒数；0 表示关闭成功缓存。材料、历史消息数、provider 或 schema 变化会立即失效。"
       },
       "llm_failure_cache_ttl": {
-        "description": "LLM 失败短缓存",
+        "description": "LLM 空结果/失败短缓存",
         "type": "int",
         "default": 300,
-        "hint": "模型超时或失败后短期缓存秒数，避免故障期间反复请求；0 表示不缓存失败。"
+        "hint": "模型返回空结果、超时或失败后的短缓存秒数，避免故障期间反复请求；0 表示不缓存。"
       },
       "llm_timeout_seconds": {
         "description": "LLM 超时秒数",

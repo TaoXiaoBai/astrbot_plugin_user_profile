@@ -300,9 +300,11 @@ class TagEngine:
         st = st or {}
         tags = []
         now = int(time.time())
-        g_count = int(st.get("g_count") or 0)
+        observed_group_count = int(st.get("g_count") or 0)
+        g_count = max(observed_group_count, int(st.get("platform_history_count") or 0))
         p_count = int(st.get("p_count") or 0)
         total = g_count + p_count
+        observed_total = observed_group_count + p_count
         groups = st.get("groups") or {}
         group_count = len(groups)
         first_values = [
@@ -347,8 +349,9 @@ class TagEngine:
         if last_seen and (now - last_seen) > 30 * 86400:
             tags.append(self._tag("long_inactive", 0.75, "stats", f"最近发言 {_fmt_time(last_seen)}"))
 
-        # 内容/行为信号标签
-        if total > 0:
+        # 内容/行为信号只按插件自身完整采集样本计算比例；持久化历史
+        # 只补活跃度，不稀释实时采集的图片、链接、@、长度和夜间占比。
+        if observed_total > 0:
             images = int(st.get("images") or 0)
             links = int(st.get("links") or 0)
             qrs = int(st.get("qrs") or 0)
@@ -356,11 +359,11 @@ class TagEngine:
             total_chars = int(st.get("total_chars") or 0)
             night_count = int(st.get("night_count") or 0)
 
-            img_ratio = images / total
-            link_ratio = links / total
-            mention_ratio = mentions / total
-            night_ratio = night_count / total
-            avg_len = total_chars / total
+            img_ratio = images / observed_total
+            link_ratio = links / observed_total
+            mention_ratio = mentions / observed_total
+            night_ratio = night_count / observed_total
+            avg_len = total_chars / observed_total
 
             img_th = self.config["tag_image_threshold"]
             link_th = self.config["tag_link_threshold"]
@@ -431,7 +434,9 @@ class TagEngine:
             return empty
         provider_id = config.get("llm_provider_id") or self._default_provider_id(context)
         if not provider_id:
-            return empty
+            raise RuntimeError(
+                "未找到画像分析模型：请填写 llm_provider_id，或配置 AstrBot 默认聊天模型"
+            )
 
         limit = int(config.get("llm_material_max_chars", 6000))
         material_lines = []
@@ -456,14 +461,14 @@ class TagEngine:
             f"{_tag_display(str(t.get('tag') or ''))}({t.get('confidence', 0)})"
             for t in safe_base[:8]
         ) or "无"
-        total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
+        observed_total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
         signals = []
-        if total > 0:
+        if observed_total > 0:
             signals.extend((
-                f"图片消息占比 {int(st.get('images') or 0) / total:.0%}",
-                f"含链接消息占比 {int(st.get('links') or 0) / total:.0%}",
-                f"含@消息占比 {int(st.get('mentions') or 0) / total:.0%}",
-                f"夜间发言占比 {int(st.get('night_count') or 0) / total:.0%}",
+                f"图片消息占比 {int(st.get('images') or 0) / observed_total:.0%}",
+                f"含链接消息占比 {int(st.get('links') or 0) / observed_total:.0%}",
+                f"含@消息占比 {int(st.get('mentions') or 0) / observed_total:.0%}",
+                f"夜间发言占比 {int(st.get('night_count') or 0) / observed_total:.0%}",
             ))
         prompt = (
             "你正在为 QQ 用户生成结构化画像。下面 <untrusted_evidence> 内是用户提供的"
@@ -501,14 +506,28 @@ class TagEngine:
             gc = context.get_config()
         except Exception:
             return ""
-        if isinstance(gc, dict):
-            ps = gc.get("provider_settings") or {}
-            if isinstance(ps, dict):
-                return str(ps.get("default_provider_id") or "")
-        ps = getattr(gc, "provider_settings", None)
-        if ps is not None:
-            return str(getattr(ps, "default_provider_id", "") or "")
-        return ""
+        if not isinstance(gc, dict):
+            ps = getattr(gc, "provider_settings", None)
+            legacy = str(getattr(ps, "default_provider_id", "") or "") if ps is not None else ""
+            if legacy:
+                return legacy
+            runner = getattr(gc, "agent_runner", None)
+            runner_cfg = getattr(runner, "config", None)
+            model = getattr(runner_cfg, "model", None)
+            return str(getattr(model, "provider_id", "") or "")
+
+        # AstrBot <= 4.27 的旧配置路径。
+        ps = gc.get("provider_settings") or {}
+        if isinstance(ps, dict):
+            legacy = str(ps.get("default_provider_id") or "")
+            if legacy:
+                return legacy
+
+        # AstrBot 4.28+：默认聊天模型迁移至 agent_runner.config.model.provider_id。
+        runner = gc.get("agent_runner") or {}
+        runner_cfg = runner.get("config") or {} if isinstance(runner, dict) else {}
+        model = runner_cfg.get("model") or {} if isinstance(runner_cfg, dict) else {}
+        return str(model.get("provider_id") or "") if isinstance(model, dict) else ""
 
 
 def _unwrap_event(event):
@@ -528,16 +547,25 @@ def _fmt_time(ts) -> str:
         return "-"
 
 
+def _effective_group_count(st: dict | None) -> int:
+    st = st if isinstance(st, dict) else {}
+    return max(
+        int(_finite_float(st.get("g_count"), 0) or 0),
+        int(_finite_float(st.get("platform_history_count"), 0) or 0),
+    )
+
+
 def _new_stat() -> dict:
     return {
         "g_count": 0, "g_first": 0, "g_last": 0, "groups": {},
         "p_count": 0, "p_first": 0, "p_last": 0,
         "images": 0, "links": 0, "qrs": 0, "mentions": 0,
         "total_chars": 0, "night_count": 0,
-        "history_version": 2, "history_first": 0, "history_last": 0,
+        "history_version": 3, "history_first": 0, "history_last": 0,
         "history_complete": False, "history_scanned_at": 0,
         "history_next_page": 1, "history_scanned_count": 0,
         "history_last_error": "", "history_quotes": [],
+        "platform_history_count": 0, "platform_history_scopes": [],
         "friend_add_time": 0, "friend_request_comment": "",
         "friend_request_time": 0, "join_sources": [],
     }
@@ -563,7 +591,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为与摘录，输出结构化风险画像，并供邀请守卫只读调用",
-    "1.9.3",
+    "1.9.5",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -579,6 +607,9 @@ class UserProfilePlugin(Star):
         self._load_lock = asyncio.Lock()
         self._scan_lock = asyncio.Lock()
         self._history_locks: dict[str, asyncio.Lock] = {}
+        self._platform_history_cache: dict[tuple[str, str], tuple[float, int, list]] = {}
+        self._platform_history_flights: dict[tuple[str, str, int], asyncio.Task] = {}
+        self._platform_history_flights_lock = asyncio.Lock()
         self._user_generations: dict[str, int] = {}
         self._tag_request_versions: dict[str, int] = {}
         self._tag_flights: dict[str, asyncio.Task] = {}
@@ -612,6 +643,27 @@ class UserProfilePlugin(Star):
         except Exception:
             is_admin = False
         return sender, group_id, is_admin
+
+    @staticmethod
+    def _event_history_scope(event) -> dict | None:
+        """读取新版 AstrBot 持久化消息所需的 platform_id / UMO 作用域。"""
+        if event is None:
+            return None
+        try:
+            platform_id = str(event.get_platform_id() or "").strip()
+        except Exception:
+            platform_id = ""
+        try:
+            user_id = str(event.unified_msg_origin or "").strip()
+        except Exception:
+            user_id = ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+        except Exception:
+            group_id = ""
+        if not platform_id or not user_id or not group_id:
+            return None
+        return {"platform_id": platform_id, "user_id": user_id, "group_id": group_id}
 
     def _check_query_permission(
         self, target_qq: str, event
@@ -699,6 +751,19 @@ class UserProfilePlugin(Star):
                 st["g_first"] = int(st.get("g_first") or now)
                 groups = st.setdefault("groups", {})
                 groups[group_id] = int(groups.get(group_id, 0) or 0) + 1
+                scope = self._event_history_scope(event)
+                if scope:
+                    scopes = st.setdefault("platform_history_scopes", [])
+                    if not isinstance(scopes, list):
+                        scopes = st["platform_history_scopes"] = []
+                    key = (scope["platform_id"], scope["user_id"])
+                    if not any(
+                        isinstance(item, dict)
+                        and (str(item.get("platform_id") or ""), str(item.get("user_id") or "")) == key
+                        for item in scopes
+                    ):
+                        scopes.append(scope)
+                        del scopes[:-50]
             else:
                 st["p_count"] = int(st.get("p_count") or 0) + 1
                 st["p_last"] = now
@@ -1067,7 +1132,10 @@ class UserProfilePlugin(Star):
             pending = [
                 qq
                 for qq in all_targets
-                if not (self._stats.get(qq) or {}).get("history_complete")
+                if (
+                    int((self._stats.get(qq) or {}).get("history_version") or 0) < 3
+                    or not (self._stats.get(qq) or {}).get("history_complete")
+                )
             ]
             pending_total = len(pending)
             remaining = max(0, pending_total - limit)
@@ -1098,7 +1166,7 @@ class UserProfilePlugin(Star):
             before = dict(self._stats.get(target_qq) or {})
             try:
                 await self._ensure_history_scanned(
-                    target_qq, force=True, restart=single_mode
+                    target_qq, force=True, restart=single_mode, event=event
                 )
                 after = self._stats.get(target_qq) or {}
                 backfilled = bool(
@@ -1353,11 +1421,11 @@ class UserProfilePlugin(Star):
                 history_lines = stats.get("history_quotes")
                 history_lines = history_lines if isinstance(history_lines, list) else []
                 if not history_lines and not self.config.get("history_scan_enabled", True):
-                    history_lines = await self._search_history_quotes(qq)
+                    history_lines = await self._search_history_quotes(qq, event=event)
                 quotes = [clean_text(line, _QUOTE_MAX_LEN) for line in history_lines if line]
 
         groups = stats.get("groups") if isinstance(stats.get("groups"), dict) else {}
-        g_count = max(0, int(_finite_float(stats.get("g_count"), 0)))
+        g_count = _effective_group_count(stats)
         p_count = max(0, int(_finite_float(stats.get("p_count"), 0)))
         tag_models = []
         for item in tags:
@@ -1702,7 +1770,7 @@ class UserProfilePlugin(Star):
 
         await self._ensure_loaded()
         # 按需回填历史时间/原话（受开关、冷却与 history_complete 控制）
-        await self._ensure_history_scanned(qq)
+        await self._ensure_history_scanned(qq, event=event)
         st = self._stats.get(qq) or {}
         quotes = list(self._quotes.get(qq) or [])
         if not self.config.get("llm_include_private_quotes", True):
@@ -1716,10 +1784,10 @@ class UserProfilePlugin(Star):
             history_lines = list(st.get("history_quotes") or [])
             if not history_lines and not self.config.get("history_scan_enabled", True):
                 # 未启用历史扫描时退化为按需补一次原话（仅本次查询，不落盘）
-                history_lines = await self._search_history_quotes(qq)
+                history_lines = await self._search_history_quotes(qq, event=event)
             quotes = [{"t": 0, "src": "历史会话", "text": line} for line in history_lines]
 
-        total = int(st.get("g_count") or 0) + int(st.get("p_count") or 0)
+        total = _effective_group_count(st) + int(st.get("p_count") or 0)
 
         # 前科与黑名单必须在空画像判断前读取，纯前科用户也应生成画像。
         fetched = await asyncio.gather(
@@ -1785,7 +1853,7 @@ class UserProfilePlugin(Star):
             if value
         ]
         activity = {
-            "group_messages": int(st.get("g_count") or 0),
+            "group_messages": _effective_group_count(st),
             "private_messages": int(st.get("p_count") or 0),
             "active_groups": len(st.get("groups") or {}),
             "first_seen": min(first_values) if first_values else 0,
@@ -1882,7 +1950,10 @@ class UserProfilePlugin(Star):
         cached = self._tags_cache.get(qq) if self._tags_cache is not None else None
         if isinstance(cached, dict) and cached.get("fingerprint") == fingerprint:
             status = str(cached.get("status") or "success")
-            ttl = self.config["llm_failure_cache_ttl"] if status == "error" else self._llm_tag_cache_ttl()
+            ttl = (
+                self.config["llm_failure_cache_ttl"]
+                if status in ("error", "empty") else self._llm_tag_cache_ttl()
+            )
             if ttl > 0 and now - int(cached.get("time") or 0) <= ttl:
                 self._llm_status[qq] = "cached_" + status
                 analysis = sanitize_llm_analysis(cached)
@@ -1915,6 +1986,10 @@ class UserProfilePlugin(Star):
                     )
                 analysis = sanitize_llm_analysis(raw)
                 status = "success" if any(analysis.values()) else "empty"
+                if status == "empty":
+                    logger.warning(
+                        f"user_profile: LLM analysis returned empty result for {qq}"
+                    )
             except Exception as exc:
                 status = "error"
                 logger.warning(f"user_profile: LLM analysis failed for {qq}: {exc}")
@@ -1950,7 +2025,7 @@ class UserProfilePlugin(Star):
     def _format_activity(self, st: dict) -> str:
         if not st:
             return ""
-        g = int(st.get("g_count") or 0)
+        g = _effective_group_count(st)
         p = int(st.get("p_count") or 0)
         if not g and not p:
             return ""
@@ -2096,14 +2171,157 @@ class UserProfilePlugin(Star):
 
     # ---------------- 会话历史扫描与回填 ----------------
 
-    async def _scan_history(self, qq: str, start_page: int = 1) -> dict:
+    @staticmethod
+    def _history_record_timestamp(value: Any) -> int:
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    async def _get_platform_history_records(
+        self, manager, platform_id: str, user_id: str, limit: int
+    ) -> list:
+        """同一历史作用域短期只读一次，避免批量扫描对每个 QQ 重复查询。"""
+        cache_key = (platform_id, user_id)
+        cached = self._platform_history_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] <= 30 and cached[1] >= limit:
+            return cached[2][-limit:]
+
+        flight_key = (platform_id, user_id, limit)
+        async with self._platform_history_flights_lock:
+            task = self._platform_history_flights.get(flight_key)
+            if task is None:
+                task = asyncio.create_task(manager.get(
+                    platform_id=platform_id, user_id=user_id, page_size=limit
+                ))
+                self._platform_history_flights[flight_key] = task
+        try:
+            records = await task
+            records = records if isinstance(records, list) else []
+            self._platform_history_cache[cache_key] = (time.monotonic(), limit, records)
+            return records
+        finally:
+            async with self._platform_history_flights_lock:
+                if self._platform_history_flights.get(flight_key) is task:
+                    self._platform_history_flights.pop(flight_key, None)
+
+    async def _scan_platform_history(self, qq: str, event=None) -> dict:
+        """读取 AstrBot 新版 platform_message_history，按 sender_id 精确筛选。"""
+        result = {
+            "available": False, "first": 0, "last": 0, "quotes": [],
+            "matched_count": 0, "scanned_count": 0, "failed": False,
+        }
+        manager = getattr(self.context, "message_history_manager", None)
+        getter = getattr(manager, "get", None)
+        if not callable(getter):
+            return result
+
+        st = self._stats.get(qq) if isinstance(self._stats, dict) else {}
+        st = st if isinstance(st, dict) else {}
+        scopes = []
+        seen = set()
+
+        def add_scope(scope):
+            if not isinstance(scope, dict):
+                return
+            platform_id = str(scope.get("platform_id") or "").strip()
+            user_id = str(scope.get("user_id") or "").strip()
+            group_id = str(scope.get("group_id") or "").strip()
+            key = (platform_id, user_id)
+            if platform_id and user_id and key not in seen:
+                seen.add(key)
+                scopes.append({
+                    "platform_id": platform_id, "user_id": user_id,
+                    "group_id": group_id,
+                })
+
+        for scope in st.get("platform_history_scopes") or []:
+            add_scope(scope)
+        current = self._event_history_scope(event)
+        add_scope(current)
+
+        # 当前事件能确定 UMO 格式时，把用户画像已知的其他群也映射到同一平台。
+        if current and ":" in current["user_id"]:
+            prefix = current["user_id"].rsplit(":", 1)[0]
+            groups = st.get("groups") if isinstance(st.get("groups"), dict) else {}
+            for group_id in groups:
+                group_id = str(group_id or "").strip()
+                if group_id:
+                    add_scope({
+                        "platform_id": current["platform_id"],
+                        "user_id": f"{prefix}:{group_id}",
+                        "group_id": group_id,
+                    })
+
+        if not scopes:
+            return result
+        result["available"] = True
+        limit = int(self.config.get("platform_history_scan_limit", 700))
+        loaded = await asyncio.gather(*(
+            self._get_platform_history_records(
+                manager, scope["platform_id"], scope["user_id"], limit
+            )
+            for scope in scopes
+        ), return_exceptions=True)
+
+        matched = []
+        for scope, records in zip(scopes, loaded):
+            if isinstance(records, BaseException):
+                result["failed"] = True
+                logger.warning(
+                    "user_profile: persisted group history scan "
+                    f"{scope['platform_id']}/{scope['user_id']} failed: {records}"
+                )
+                continue
+            records = records if isinstance(records, list) else []
+            result["scanned_count"] += len(records)
+            for record in records:
+                if str(getattr(record, "sender_id", "") or "").strip() != qq:
+                    continue
+                content = getattr(record, "content", None)
+                if not isinstance(content, dict) or str(content.get("type") or "").lower() != "user":
+                    continue
+                ts = self._history_record_timestamp(getattr(record, "created_at", 0))
+                result["matched_count"] += 1
+                if ts and (not result["first"] or ts < result["first"]):
+                    result["first"] = ts
+                result["last"] = max(result["last"], ts)
+                text = clean_text(self._content_to_text(content.get("message")), _QUOTE_MAX_LEN)
+                media_only = bool(re.fullmatch(
+                    r"(?:\[(?:image|record|video|file|audio)\]\s*)+", text, re.I
+                ))
+                if text and not text.startswith("/") and not media_only:
+                    matched.append((ts, scope.get("group_id") or "", text))
+
+        for _, group_id, text in sorted(matched, key=lambda item: item[0]):
+            line = f"[群 {group_id}] {text}" if group_id else text
+            if line not in result["quotes"]:
+                result["quotes"].append(line)
+        result["quotes"] = result["quotes"][-_HISTORY_QUOTE_KEEP:]
+        return result
+
+    async def _scan_history(self, qq: str, start_page: int = 1, event=None) -> dict:
         result = {
             "first": 0, "last": 0, "complete": False, "quotes": [],
             "next_page": start_page, "scanned_count": 0, "failed": False,
+            "platform_count": 0,
         }
+        platform = await self._scan_platform_history(qq, event)
+        if platform.get("available"):
+            result["first"] = int(platform.get("first") or 0)
+            result["last"] = int(platform.get("last") or 0)
+            result["quotes"] = list(platform.get("quotes") or [])
+            result["platform_count"] = int(platform.get("matched_count") or 0)
+            result["scanned_count"] += int(platform.get("scanned_count") or 0)
+            result["failed"] = bool(platform.get("failed"))
+
         cm = getattr(self.context, "conversation_manager", None)
         if cm is None:
-            result["failed"] = True
+            result["complete"] = bool(platform.get("available") and not platform.get("failed"))
+            result["failed"] = not result["complete"]
             return result
         page_size = self._history_scan_page_size()
         total = 0
@@ -2113,7 +2331,7 @@ class UserProfilePlugin(Star):
                     page=page, page_size=page_size, search_query=qq, include_history=True
                 )
             except Exception as exc:
-                logger.warning(f"user_profile: history scan '{qq}' page {page} failed: {exc}")
+                logger.warning(f"user_profile: legacy history scan '{qq}' page {page} failed: {exc}")
                 result["failed"] = True
                 result["next_page"] = page
                 break
@@ -2131,8 +2349,8 @@ class UserProfilePlugin(Star):
                         matched.extend(speaker_lines(self._content_to_text(item.get("content")), qq))
                 if not matched:
                     continue
-                first = int(getattr(conv, "created_at", 0) or 0)
-                last = int(getattr(conv, "updated_at", 0) or 0)
+                first = self._history_record_timestamp(getattr(conv, "created_at", 0))
+                last = self._history_record_timestamp(getattr(conv, "updated_at", 0))
                 if first and (not result["first"] or first < result["first"]):
                     result["first"] = first
                 result["last"] = max(result["last"], last)
@@ -2141,16 +2359,17 @@ class UserProfilePlugin(Star):
                         result["quotes"].append(line)
             consumed = page * page_size
             if not convs or consumed >= int(total or 0):
-                result["complete"] = True
+                result["complete"] = not bool(platform.get("failed"))
                 result["next_page"] = 1
                 break
+        result["quotes"] = result["quotes"][-_HISTORY_QUOTE_KEEP:]
         return result
 
-    async def _search_history_quotes(self, qq: str) -> list:
-        return (await self._scan_history(qq)).get("quotes") or []
+    async def _search_history_quotes(self, qq: str, event=None) -> list:
+        return (await self._scan_history(qq, event=event)).get("quotes") or []
 
     async def _ensure_history_scanned(
-        self, qq: str, force: bool = False, restart: bool | None = None
+        self, qq: str, force: bool = False, restart: bool | None = None, event=None
     ) -> bool:
         if not self.config.get("history_scan_enabled", True):
             return False
@@ -2162,18 +2381,25 @@ class UserProfilePlugin(Star):
             st = self._stats.get(qq) or {}
             scanned_at = int(st.get("history_scanned_at") or 0)
             complete = bool(st.get("history_complete"))
-            if not force:
+            needs_upgrade = int(st.get("history_version") or 0) < 3
+            if not force and not needs_upgrade:
                 wait = self.config["history_rescan_interval"] if complete else self._history_scan_cooldown()
                 if scanned_at and now - scanned_at < wait:
                     return False
-            should_restart = complete or (force if restart is None else restart)
+            should_restart = needs_upgrade or complete or (force if restart is None else restart)
             start_page = 1 if should_restart else max(1, int(st.get("history_next_page") or 1))
             async with self._scan_semaphore:
-                scanned = await self._scan_history(qq, start_page=start_page)
+                scanned = await self._scan_history(qq, start_page=start_page, event=event)
             async with self._store_lock:
                 if generation != self._user_generation(qq):
                     return False
                 st = self._stats.setdefault(qq, _new_stat())
+                previous_material = (
+                    int(st.get("history_first") or 0),
+                    int(st.get("history_last") or 0),
+                    int(st.get("platform_history_count") or 0),
+                    tuple(st.get("history_quotes") or []),
+                )
                 if should_restart:
                     st["history_complete"] = False
                     st["history_next_page"] = 1
@@ -2192,13 +2418,27 @@ class UserProfilePlugin(Star):
                     + int(scanned.get("scanned_count") or 0)
                 )
                 st["history_last_error"] = "history_scan_failed" if failed else ""
+                st["platform_history_count"] = max(
+                    int(st.get("platform_history_count") or 0),
+                    int(scanned.get("platform_count") or 0),
+                )
                 merged = list(st.get("history_quotes") or [])
                 for line in scanned.get("quotes") or []:
                     if line not in merged:
                         merged.append(line)
                 st["history_quotes"] = merged[-_HISTORY_QUOTE_KEEP:]
-                st["history_version"] = 2
+                st["history_version"] = 3
                 st["history_scanned_at"] = now
+                current_material = (
+                    int(st.get("history_first") or 0),
+                    int(st.get("history_last") or 0),
+                    int(st.get("platform_history_count") or 0),
+                    tuple(st.get("history_quotes") or []),
+                )
+                if current_material != previous_material:
+                    self._tag_request_versions[qq] = self._tag_request_versions.get(qq, 0) + 1
+                    if self._tags_cache is not None and self._tags_cache.pop(qq, None) is not None:
+                        self._tags_dirty = True
                 self._dirty = True
         self._ensure_flush_task()
         return True
@@ -2249,8 +2489,8 @@ class UserProfilePlugin(Star):
                     "g_count", "g_first", "g_last", "p_count", "p_first", "p_last",
                     "images", "links", "qrs", "mentions", "total_chars", "night_count",
                     "history_version", "history_first", "history_last", "history_scanned_at",
-                    "history_next_page", "history_scanned_count", "friend_add_time",
-                    "friend_request_time",
+                    "history_next_page", "history_scanned_count", "platform_history_count",
+                    "friend_add_time", "friend_request_time",
                 )
                 for key in numeric_keys:
                     st[key] = max(0, int(_finite_float(st.get(key), 0)))
@@ -2261,6 +2501,10 @@ class UserProfilePlugin(Star):
                     st["groups"] = {}
                 joins = st.get("join_sources")
                 st["join_sources"] = [item for item in joins if isinstance(item, dict)] if isinstance(joins, list) else []
+                scopes = st.get("platform_history_scopes")
+                st["platform_history_scopes"] = [
+                    item for item in scopes if isinstance(item, dict)
+                ] if isinstance(scopes, list) else []
                 history_quotes = st.get("history_quotes")
                 st["history_quotes"] = [clean_text(item, _QUOTE_MAX_LEN) for item in history_quotes if item] if isinstance(history_quotes, list) else []
             quotes = {

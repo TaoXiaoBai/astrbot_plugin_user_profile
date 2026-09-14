@@ -33,6 +33,7 @@ _DEFAULTS = {
     "flush_interval": 60,
     "history_scan_pages": 3,
     "history_scan_page_size": 10,
+    "platform_history_scan_limit": 700,
     "history_scan_cooldown": 3600,
     "history_rescan_interval": 86400,
     "history_scan_batch_limit": 200,
@@ -64,6 +65,7 @@ _INT_RULES = {
     "flush_interval": (10, 3600),
     "history_scan_pages": (1, 100),
     "history_scan_page_size": (1, 100),
+    "platform_history_scan_limit": (50, 5000),
     "history_scan_cooldown": (0, 86400),
     "history_rescan_interval": (0, 2592000),
     "history_scan_batch_limit": (1, 1000),
@@ -213,8 +215,8 @@ def build_material_fingerprint(
 ) -> str:
     stats = stats if isinstance(stats, dict) else {}
     signal_keys = (
-        "g_count", "p_count", "images", "links", "qrs", "mentions",
-        "total_chars", "night_count",
+        "g_count", "p_count", "platform_history_count", "images", "links",
+        "qrs", "mentions", "total_chars", "night_count",
     )
     signals = {
         key: _bounded_int(stats.get(key), 0, 0, 2**63 - 1)

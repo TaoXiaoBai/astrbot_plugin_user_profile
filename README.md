@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.9.3-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.9.5-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -25,7 +25,7 @@ LLM 是画像的**语义分析核心**，规则统计是它的**证据底座和�
 3. **LLM 阅读与理解**：查询画像时，LLM 同时阅读近期原话、基础标签和行为比例，不只按关键词匹配，而是结合上下文识别广告引流、诈骗索要信息、刷屏、重复内容、挑衅、友好、乐于助人、正常交流等倾向。
 4. **输出结构化判断**：LLM 返回 JSON 对象，包含最多 5 个带 `tag`、`confidence`、`reason` 的语义标签、一段 `impression` 人物印象和最多 5 项 `traits` 人格/行为特征。
 5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，再按可配置权重计算 0–100 风险分和风险等级；文字与图片入口共享同一个展示模型。
-6. **缓存与复用**：摘录、行为统计、基础标签、provider 和 schema 共同构成指纹；任一实际 prompt 输入变化都会失效。1.9.0 会在首次查询时刷新旧 tags-only 缓存，成功、空结果和短期失败均缓存，同一材料并发请求自动合并。
+6. **缓存与复用**：摘录、行为统计、历史消息数、基础标签、provider 和 schema 共同构成指纹；任一实际 prompt 输入变化或历史扫描发现新材料都会失效。成功结果使用常规缓存，空结果和失败使用短缓存，同一材料并发请求自动合并。
 
 LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。如果模型不可用、没有可分析原话或主动关闭 `llm_tags`，插件会保留统计、规则标签、前科和风险计算能力，但画像的语义理解会明显减弱。
 
@@ -39,7 +39,7 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 - **LLM 语义画像**：综合真实发言、规则标签和行为比例，输出带置信度与依据的广告、诈骗、刷屏、挑衅、友好、乐于助人、正常交流等结构化标签。
 - **独立行为采集**：统计群聊/私聊发言数、活跃群、首次与最近发言时间，以及图片、链接、二维码、@、消息长度、夜间活跃等信号。
 - **标签融合与风险分**：合并 LLM 语义标签、客观规则标签、社交来源和管理前科，计算 0–100 风险分。
-- **历史扫描回填**：按需扫描 AstrBot 已保存的会话历史，补充 LLM 分析材料，并减少将老群友误判为新人的情况。
+- **历史扫描回填**：优先读取新版 AstrBot“持久化群聊消息记录”（`platform_message_history`），按发送者 QQ 精确回填活跃度、首次/最近发言和近期原话；旧 `conversations` 会话历史继续作为兼容兜底，减少将老群友误判为新人。
 - **社交来源记录**：记录好友添加时间、好友验证语及进群方式、群号、操作者和时间；协议未提供真实来源时明确标注为“推测来源群”。
 - **灵活查询权限**：支持仅管理员、允许查自己、全员查他人、指定群公开查询等组合。
 - **统一文字或图片输出**：所有 `/我`、`/画像` 入口共用展示模型；动态高度卡片包含白环圆形头像或可靠占位头像、昵称/QQ、按风险分着色的头部描边条与右侧风险徽章、按“风险 / 正向 / 行为”区分的柔和色椭圆药丸标签、人物印象、人格/行为分析、横向关键统计、社交来源/前科及可选摘录，页脚标注生成时间。长内容自动换行，图片成功时不再双发文字；每个展示模块都有独立开关（`card_show_*`），可裁剪成极简卡片。
@@ -222,14 +222,15 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `history_scan_enabled` | `true` | 启用按需历史扫描；关闭后历史未知时不打新人标签 |
-| `history_scan_pages` | `3` | 单次最多读取的会话页数，未完成时保存下一页水位 |
-| `history_scan_page_size` | `10` | 每页会话数 |
+| `history_scan_pages` | `3` | 旧 `conversations` 会话历史单次最多读取页数，未完成时保存下一页水位 |
+| `history_scan_page_size` | `10` | 每页旧会话数 |
+| `platform_history_scan_limit` | `700` | 新版持久化群聊历史每个已知群最多读取的最近消息数，建议与 AstrBot 保存上限一致 |
 | `history_scan_cooldown` | `3600` | 未完成扫描自动续跑的冷却秒数 |
 | `history_rescan_interval` | `86400` | 扫描完成后从第一页检查新会话的间隔秒数 |
 | `history_scan_concurrency` | `4` | 批量扫描最大并发数 |
 | `history_scan_batch_limit` | `200` | `/画像扫描 本群/全部` 每批处理人数 |
 
-历史扫描只读取 **AstrBot 已保存的会话历史**，严格匹配说话人 QQ；页中途失败不会标记完成。旧 `history_complete` 数据会自动补齐版本、页水位和计数字段。Bot 从未保存过的 OneBot 服务端历史无法补齐。
+历史扫描优先读取新版 AstrBot 的 **持久化群聊消息记录**，使用 `sender_id` 精确匹配 QQ；插件会记住用户出现过的群历史作用域，聊天查询时也会补入当前群并映射已知群。旧 `conversations` 会话历史仍作为兼容兜底。两套来源的消息量不会直接相加，而与插件自有计数取较大值，避免重复统计；中途失败不会标记完成。升级前的 `history_version` 会在首次查询时自动升至 v3 并重扫。Bot 从未保存过的 OneBot 服务端历史仍无法补齐。
 
 ### LLM 画像分析
 
@@ -255,8 +256,8 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | --- | --- | --- |
 | `llm_tags` | `true` | 画像语义分析总开关 |
 | `llm_provider_id` | `""` | 执行画像分析的 provider；留空使用 AstrBot 默认模型 |
-| `llm_tag_cache_ttl` | `86400` | 成功及空结果缓存秒数；材料/provider/schema 改变立即失效 |
-| `llm_failure_cache_ttl` | `300` | 超时或失败的短期缓存秒数 |
+| `llm_tag_cache_ttl` | `86400` | 成功结果缓存秒数；材料/provider/schema 改变立即失效 |
+| `llm_failure_cache_ttl` | `300` | 空结果、超时或失败的短期缓存秒数 |
 | `llm_timeout_seconds` | `45` | 单次模型调用超时 |
 | `llm_max_concurrency` | `3` | 不同 QQ 的模型调用并发上限；同 QQ 同材料 singleflight 合并 |
 | `llm_material_max_chars` | `6000` | 发送给模型的摘录材料总字符上限 |
@@ -357,7 +358,7 @@ if instance is not None:
 - 启用 LLM 标签后，允许的近期摘录会发送给所选模型提供方；请按隐私政策配置。
 - 采集路径零 LLM、零网络；统计内存聚合后按 `flush_interval` 写入 KV。图片查询阶段会在线程中以 2.5 秒超时读取受限 QQ 官方域名头像，最多 2 MiB，不落盘；失败直接使用占位头像。
 - 每个 QQ 只保留最近 `quote_keep` 条，并可按 `quote_retention_days` 清理；消息热路径只检查当前 QQ，启动和管理员 `/画像清理` 才全量检查。
-- LLM 成功、空结果和短期失败都会缓存；同 QQ 同材料合并调用，不同 QQ 受有限 semaphore 控制，不同材料乱序完成时只有最新请求可更新缓存。
+- LLM 成功结果使用常规缓存，空结果和失败使用短缓存；同 QQ 同材料合并调用，不同 QQ 受有限 semaphore 控制，不同材料乱序完成时只有最新请求可更新缓存。
 - `/画像删除` 通过每 QQ 世代号使删除前已经在途的消息、历史扫描和 LLM 分析失去写回资格，不持锁等待；删除后的新消息仍可重新建立画像。
 - 容量淘汰同步删除统计、摘录、标签缓存；画像仍以 QQ 号为身份维度。
 
