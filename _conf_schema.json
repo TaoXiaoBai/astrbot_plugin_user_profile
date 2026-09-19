@@ -261,6 +261,12 @@
         "default": 300,
         "hint": "模型返回空结果、超时或失败后的短缓存秒数，避免故障期间反复请求；0 表示不缓存。"
       },
+      "llm_refresh_interval": {
+        "description": "LLM 画像最短刷新间隔",
+        "type": "int",
+        "default": 3600,
+        "hint": "即使发言材料变化，距上次成功分析不足该秒数仍沿用旧结论（防止短时间刷消息洗掉既有印象），到期后下一次查询自动重算；0 表示材料一变立即重算。建议 1800-86400。"
+      },
       "llm_timeout_seconds": {
         "description": "LLM 超时秒数",
         "type": "int",

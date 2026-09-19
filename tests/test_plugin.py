@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -253,7 +254,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
 
     async def test_llm_cache_misses_when_signals_or_base_tags_change(self):
-        plugin = self.make_plugin()
+        plugin = self.make_plugin({"llm_refresh_interval": 0})
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value=[])
         quotes = [{"t": 1, "src": "群 1", "text": "same quote"}]
         st = _new_stat()
@@ -268,6 +269,52 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         changed_tags = [{"tag": "image_spammer", "confidence": 0.9, "source": "stats"}]
         await plugin._get_or_make_llm_tags("11111", changed_stats, quotes, changed_tags)
         self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, 3)
+
+    async def test_llm_refresh_interval_gates_material_change(self):
+        plugin = self.make_plugin()
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value=[
+            {"tag": "friendly", "confidence": 0.9, "source": "llm"}
+        ])
+        st = _new_stat()
+        st["g_count"] = 1
+        quotes = [{"t": 1, "src": "群 1", "text": "same quote"}]
+        await plugin._get_or_make_llm_tags("11111", st, quotes, [])
+        self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, 1)
+        changed = dict(st)
+        changed["images"] = 1
+        tags = await plugin._get_or_make_llm_tags("11111", changed, quotes, [])
+        self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, 1)
+        self.assertEqual(tags[0]["tag"], "friendly")
+        self.assertEqual(plugin._llm_status["11111"], "cached_stale")
+        # 超过刷新间隔后下一次查询自动重算
+        plugin._tags_cache["11111"]["success_time"] = int(time.time()) - 7200
+        await plugin._get_or_make_llm_tags("11111", changed, quotes, [])
+        self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, 2)
+
+    async def test_llm_prior_analysis_passed_on_recompute(self):
+        plugin = self.make_plugin({"llm_refresh_interval": 0})
+        priors = []
+
+        async def generate(*args, **kwargs):
+            priors.append(kwargs.get("prior"))
+            return {
+                "tags": [{"tag": "friendly", "confidence": 0.9,
+                          "source": "llm", "reason": "发言友善"}],
+                "impression": "表达友好。",
+                "traits": ["友善"],
+            }
+
+        plugin._tag_engine.generate_llm_tags = generate
+        st = _new_stat()
+        st["g_count"] = 1
+        await plugin._get_or_make_llm_tags("11111", st, [{"text": "old"}], [])
+        changed = dict(st)
+        changed["images"] = 2
+        await plugin._get_or_make_llm_tags("11111", changed, [{"text": "old"}], [])
+        self.assertIsNone(priors[0])
+        self.assertEqual(priors[1]["impression"], "表达友好。")
+        self.assertEqual(priors[1]["tags"][0]["tag"], "friendly")
+        self.assertEqual(priors[1]["traits"], ["友善"])
 
     async def test_delete_blocks_inflight_llm_writeback_but_allows_new_messages(self):
         plugin = self.make_plugin()
@@ -340,7 +387,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         old_entered = asyncio.Event()
         release_old = asyncio.Event()
 
-        async def generate(qq, st, quotes, *args):
+        async def generate(qq, st, quotes, *args, **kwargs):
             if quotes[0]["text"] == "old":
                 old_entered.set()
                 await release_old.wait()
@@ -655,7 +702,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "11111", _new_stat(), [{"src": "群 1", "text": "hello"}], []
         )
         cached = plugin._tags_cache["11111"]
-        self.assertEqual(cached["schema_version"], 3)
+        self.assertEqual(cached["schema_version"], 4)
         self.assertEqual(cached["impression"], "友好")
         self.assertEqual(cached["traits"], ["稳定"])
 

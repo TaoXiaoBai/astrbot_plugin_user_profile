@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 
-LLM_SCHEMA_VERSION = 3
+LLM_SCHEMA_VERSION = 4
 LLM_TAGS = frozenset({
     "spam_suspect", "ad_suspect", "troll", "friendly", "helpful",
     "nsfw_tendency", "political_sensitive", "scam_suspect", "repetitive",
@@ -40,6 +40,7 @@ _DEFAULTS = {
     "history_scan_concurrency": 4,
     "llm_tag_cache_ttl": 86400,
     "llm_failure_cache_ttl": 300,
+    "llm_refresh_interval": 3600,
     "llm_timeout_seconds": 45,
     "llm_max_concurrency": 3,
     "llm_material_max_chars": 6000,
@@ -72,6 +73,7 @@ _INT_RULES = {
     "history_scan_concurrency": (1, 20),
     "llm_tag_cache_ttl": (0, 2592000),
     "llm_failure_cache_ttl": (0, 86400),
+    "llm_refresh_interval": (0, 2592000),
     "llm_timeout_seconds": (1, 300),
     "llm_max_concurrency": (1, 20),
     "llm_material_max_chars": (500, 20000),

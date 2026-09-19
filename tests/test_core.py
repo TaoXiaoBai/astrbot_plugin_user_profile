@@ -60,7 +60,7 @@ class CoreTests(unittest.TestCase):
             ],
         }
         result = sanitize_llm_analysis(raw)
-        self.assertEqual(LLM_SCHEMA_VERSION, 3)
+        self.assertEqual(LLM_SCHEMA_VERSION, 4)
         self.assertEqual([tag["tag"] for tag in result["tags"]], ["friendly"])
         self.assertNotIn("\x00", result["impression"])
         self.assertLessEqual(len(result["impression"]), 240)
