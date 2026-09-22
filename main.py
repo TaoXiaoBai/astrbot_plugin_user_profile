@@ -66,6 +66,10 @@ _HISTORY_QUOTE_KEEP = 10  # 会话历史补充原话的最大条数
 _STATS_KEY = "up_stats"
 _QUOTES_KEY = "up_quotes"
 _TAGS_KEY = "up_tags"
+_MUTE_EVENTS_KEY = "up_bot_mute_events"
+_MUTE_DELETE_CUTOFFS_KEY = "up_bot_mute_delete_cutoffs"
+_MUTE_EVENT_KEEP_DEFAULT = 100
+_MUTE_SEEN_LEDGER_LIMIT = 5000
 
 
 def _normalize_guard_invite_records(records: Any) -> dict[str, list[dict]]:
@@ -102,6 +106,8 @@ _TAG_DISPLAY_NAMES = {
     "frequent_inviter": "频繁邀请",
     "inviter": "曾邀请进群",
     "invite_rejected": "邀请被拒",
+    "bot_mute_operator": "曾禁言 bot",
+    "bot_mute_associated": "关联群禁言警告",
     "image_spammer": "图片刷屏",
     "link_spammer": "链接刷屏",
     "qr_spammer": "二维码刷屏",
@@ -151,7 +157,7 @@ _RISK_TAGS = frozenset({
     "ban_history", "invite_rejected", "kick_history", "frequent_inviter",
     "ad_suspect", "scam_suspect", "spam_suspect", "troll",
     "nsfw_tendency", "political_sensitive", "qr_spammer", "link_spammer",
-    "image_spammer",
+    "image_spammer", "bot_mute_operator", "bot_mute_associated",
 })
 
 
@@ -624,8 +630,8 @@ class SocialEventFilter(filter.CustomFilter):
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为与摘录，输出结构化风险画像，并供邀请守卫只读调用",
-    "1.9.6",
+    "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
+    "1.10.0",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -634,8 +640,12 @@ class UserProfilePlugin(Star):
         self._stats: dict | None = None
         self._quotes: dict | None = None
         self._tags_cache: dict | None = None
+        self._mute_events: dict | None = None
+        self._mute_delete_cutoffs: dict | None = None
         self._dirty = False
         self._tags_dirty = False
+        self._mute_events_dirty = False
+        self._mute_delete_cutoffs_dirty = False
         self._flush_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
         self._load_lock = asyncio.Lock()
@@ -775,6 +785,7 @@ class UserProfilePlugin(Star):
         images, mentions = self._message_component_signals(event)
         now = int(time.time())
         await self._ensure_loaded()
+        pruned = []
         async with self._store_lock:
             if generation != self._user_generation(qq):
                 return
@@ -822,9 +833,27 @@ class UserProfilePlugin(Star):
                 del qlist[:-self._quote_keep()]
             self._apply_quote_retention_locked(now, qq=qq)
             cap = self._max_tracked()
-            if len(self._stats) > cap:
-                self._prune_oldest(max(100, int(cap * 0.9)))
+            if len(self._stats) > cap and isinstance(self._mute_delete_cutoffs, dict):
+                pruned = self._prune_oldest(max(100, int(cap * 0.9)))
+                cutoff = int(time.time() * 1000)
+                for old_qq in pruned:
+                    self._mute_delete_cutoffs[old_qq] = max(
+                        cutoff, int(self._mute_delete_cutoffs.get(old_qq) or 0)
+                    )
+                self._mute_delete_cutoffs_dirty = bool(pruned) or self._mute_delete_cutoffs_dirty
+            elif len(self._stats) > cap:
+                logger.warning(
+                    "user_profile: skip eviction while mute deletion cutoffs are unavailable"
+                )
             self._dirty = True
+        for old_qq in pruned:
+            await self._cancel_guard_profile_deliveries(old_qq)
+        if pruned:
+            async with self._store_lock:
+                for old_qq in pruned:
+                    self._user_generations[old_qq] = self._user_generation(old_qq) + 1
+                    self._mute_events.pop(old_qq, None)
+                self._mute_events_dirty = True
         self._ensure_flush_task()
 
     @staticmethod
@@ -1063,6 +1092,34 @@ class UserProfilePlugin(Star):
             await self._dispatch_chat_query(event, rest, "regex_fallback")
         event.stop_event()
 
+    async def _cancel_guard_profile_deliveries(self, qq: str) -> None:
+        try:
+            metadata = self.context.get_registered_star(INVITE_GUARD_STAR_NAME)
+            guard = getattr(metadata, "star_cls", None) if metadata else None
+            cancel = getattr(guard, "cancel_pending_profile_targets", None)
+            if not callable(cancel):
+                return
+            result = cancel(qq)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(f"user_profile: cancel guard profile delivery failed: {exc}")
+
+    def _delete_profile_locked(self, qq: str) -> bool:
+        existed = (
+            qq in self._stats or qq in self._quotes or qq in self._tags_cache
+            or qq in self._mute_events
+        )
+        self._user_generations[qq] = self._user_generation(qq) + 1
+        self._tag_request_versions[qq] = self._tag_request_versions.get(qq, 0) + 1
+        self._stats.pop(qq, None)
+        self._quotes.pop(qq, None)
+        self._tags_cache.pop(qq, None)
+        self._mute_events.pop(qq, None)
+        self._llm_status.pop(qq, None)
+        self._dirty = self._tags_dirty = self._mute_events_dirty = True
+        return existed
+
     @filter.command("画像删除")
     async def delete_profile_command(self, event: AstrMessageEvent):
         sender, _, is_admin = self._event_identity(event)
@@ -1076,18 +1133,24 @@ class UserProfilePlugin(Star):
             await event.send(MessageChain(chain=[Plain("只有管理员可以删除他人的画像数据。")]))
             return
         await self._ensure_loaded()
+        if not await self._ensure_mute_delete_cutoffs_available():
+            await event.send(MessageChain(chain=[Plain(
+                "删除保护账本暂时不可用，请稍后重试；本次未执行删除。"
+            )]))
+            return
+        cutoff = int(time.time() * 1000)
         async with self._store_lock:
-            existed = qq in self._stats or qq in self._quotes or qq in self._tags_cache
-            self._user_generations[qq] = self._user_generation(qq) + 1
-            self._tag_request_versions[qq] = self._tag_request_versions.get(qq, 0) + 1
-            self._stats.pop(qq, None)
-            self._quotes.pop(qq, None)
-            self._tags_cache.pop(qq, None)
-            self._llm_status.pop(qq, None)
-            self._dirty = self._tags_dirty = True
+            existed = self._delete_profile_locked(qq)
+            self._mute_delete_cutoffs[qq] = max(
+                cutoff, int(self._mute_delete_cutoffs.get(qq) or 0)
+            )
+            self._mute_delete_cutoffs_dirty = True
+        await self._cancel_guard_profile_deliveries(qq)
+        async with self._store_lock:
+            existed = self._delete_profile_locked(qq) or existed
         await self._flush()
         await event.send(MessageChain(chain=[Plain(
-            f"已删除 QQ {qq} 的画像统计、摘录和 LLM 缓存。" if existed else f"QQ {qq} 没有已保存的画像数据。"
+            f"已删除 QQ {qq} 的画像统计、摘录、管理事件和 LLM 缓存。" if existed else f"QQ {qq} 没有已保存的画像数据。"
         )]))
 
     @filter.command("画像清理")
@@ -1428,7 +1491,7 @@ class UserProfilePlugin(Star):
             self._load_invite_guard_records(qq), self._load_ban_entry(qq),
             return_exceptions=True,
         )
-        criminal_lines = []
+        criminal_lines = self._format_personal_mute_events(qq)
         for value in criminal_results:
             if isinstance(value, list):
                 criminal_lines.extend(clean_text(line, 180) for line in value if line)
@@ -1760,14 +1823,242 @@ class UserProfilePlugin(Star):
             logger.warning(f"user_profile: render image failed: {exc}")
             return None
 
-    # ---------------- 可信插件间 API（只读，不套聊天用户权限） ----------------
+    # ---------------- 可信插件间 API（不套聊天用户权限） ----------------
+
+    async def record_bot_mute_event(
+        self, qq: str, *, event_key: str, group_id: str, event_time: int,
+        duration: int | None, operator_id: str, inviter_id: str = "",
+        attribution: str = "operator", risk_increment: int = 35,
+        risk_cap: int = 70, self_id: str = "",
+        event_created_at_ms: int | None = None,
+    ) -> dict:
+        """可信写入 API：返回 recorded/duplicate/disabled/invalid/failure。"""
+        if not self._enabled():
+            return {"status": "disabled"}
+        qq = str(qq or "").strip()
+        operator_id = str(operator_id or "").strip()
+        inviter_id = str(inviter_id or "").strip()
+        self_id = str(self_id or "").strip()
+        attribution = str(attribution or "").strip().lower()
+        event_key = clean_text(event_key, 160)
+        group_id = clean_text(group_id, 32)
+        if (
+            not re.fullmatch(r"\d{5,12}", qq)
+            or not re.fullmatch(r"\d{5,12}", operator_id)
+            or qq == self_id
+            or operator_id == self_id
+            or not event_key
+            or not group_id
+        ):
+            return {"status": "invalid"}
+        if attribution == "operator":
+            valid_attribution = qq == operator_id
+        elif attribution == "associated_inviter":
+            valid_attribution = bool(
+                re.fullmatch(r"\d{5,12}", inviter_id) and qq == inviter_id
+            )
+        else:
+            valid_attribution = False
+        if not valid_attribution:
+            return {"status": "invalid"}
+        try:
+            timestamp = max(0, int(event_time))
+        except (TypeError, ValueError, OverflowError):
+            timestamp = 0
+        try:
+            seconds = None if duration is None else max(0, min(366 * 86400, int(duration)))
+        except (TypeError, ValueError, OverflowError):
+            seconds = None
+        increment = max(0, min(100, int(_finite_float(risk_increment, 35))))
+        cap = max(0, min(100, int(_finite_float(risk_cap, 70))))
+        created_at_ms = max(0, int(_finite_float(event_created_at_ms, 0)))
+        try:
+            await self._ensure_loaded()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {"status": "failure", "error": clean_text(exc, 160)}
+        if not await self._ensure_mute_delete_cutoffs_available():
+            return {"status": "failure", "error": "delete_cutoffs_unavailable"}
+        generation = self._user_generation(qq)
+        async with self._store_lock:
+            if generation != self._user_generation(qq):
+                return {"status": "failure", "error": "generation_changed"}
+            cutoff = int(self._mute_delete_cutoffs.get(qq) or 0)
+            if cutoff and created_at_ms <= cutoff:
+                return {"status": "cancelled"}
+            existing_account = qq in self._mute_events
+            account = self._mute_events.setdefault(qq, self._new_mute_account())
+            if not isinstance(account, dict):
+                account = self._mute_events[qq] = self._new_mute_account()
+            seen = account.setdefault("seen", [])
+            if event_key in seen:
+                return {"status": "duplicate"}
+            if len(seen) >= _MUTE_SEEN_LEDGER_LIMIT:
+                return {"status": "failure", "error": "seen_ledger_full"}
+            previous_account = {
+                "events": list(account.get("events") or []),
+                "seen": list(seen),
+                "risk_total": int(_finite_float(account.get("risk_total"), 0)),
+                "operator_count": int(_finite_float(account.get("operator_count"), 0)),
+                "associated_count": int(_finite_float(account.get("associated_count"), 0)),
+                "last_risk_cap": int(_finite_float(account.get("last_risk_cap"), 70)),
+                "last_time": int(_finite_float(account.get("last_time"), 0)),
+            }
+            event_record = {
+                "event_key": event_key, "group_id": group_id, "time": timestamp,
+                "duration": seconds, "operator_id": operator_id,
+                "inviter_id": inviter_id, "attribution": attribution,
+                "risk_increment": increment, "risk_cap": cap,
+            }
+            events = account.setdefault("events", [])
+            events.append(event_record)
+            del events[:-self.config["mute_event_keep"]]
+            seen.append(event_key)
+            account["risk_total"] = max(0, int(account.get("risk_total") or 0)) + increment
+            count_key = "operator_count" if attribution == "operator" else "associated_count"
+            account[count_key] = max(0, int(account.get(count_key) or 0)) + 1
+            account["last_risk_cap"] = cap
+            account["last_time"] = timestamp
+            if not existing_account and len(self._mute_events) > self._max_tracked():
+                self._mute_events.pop(qq, None)
+                return {"status": "failure", "error": "tracked_user_limit"}
+            try:
+                await self.put_kv_data(_MUTE_EVENTS_KEY, self._mute_events)
+            except asyncio.CancelledError:
+                self._mute_events[qq] = previous_account
+                raise
+            except Exception as exc:
+                self._mute_events[qq] = previous_account
+                return {"status": "failure", "error": clean_text(exc, 160)}
+            if generation != self._user_generation(qq):
+                if previous_account["seen"]:
+                    self._mute_events[qq] = previous_account
+                else:
+                    self._mute_events.pop(qq, None)
+                try:
+                    await self.put_kv_data(_MUTE_EVENTS_KEY, self._mute_events)
+                except Exception as exc:
+                    return {"status": "failure", "error": clean_text(exc, 160)}
+                return {"status": "failure", "error": "generation_changed"}
+            self._mute_events_dirty = False
+        return {"status": "recorded"}
+
+    @staticmethod
+    def _valid_persisted_mute_event(qq: str, item: Any) -> bool:
+        if not isinstance(item, dict) or not clean_text(item.get("event_key"), 160):
+            return False
+        if not clean_text(item.get("group_id"), 32):
+            return False
+        operator = str(item.get("operator_id") or "").strip()
+        inviter = str(item.get("inviter_id") or "").strip()
+        attribution = str(item.get("attribution") or "")
+        if not re.fullmatch(r"\d{5,12}", operator):
+            return False
+        if attribution == "operator":
+            return qq == operator
+        return (
+            attribution == "associated_inviter"
+            and re.fullmatch(r"\d{5,12}", inviter) is not None
+            and qq == inviter
+        )
+
+    @staticmethod
+    def _new_mute_account() -> dict:
+        return {
+            "events": [], "seen": [], "risk_total": 0,
+            "operator_count": 0, "associated_count": 0,
+            "last_risk_cap": 70, "last_time": 0,
+        }
+
+    def _personal_mute_account(self, qq: str) -> dict:
+        if not isinstance(self._mute_events, dict):
+            return self._new_mute_account()
+        account = self._mute_events.get(str(qq))
+        return account if isinstance(account, dict) else self._new_mute_account()
+
+    def _personal_mute_events(self, qq: str) -> list[dict]:
+        qq = str(qq)
+        events = self._personal_mute_account(qq).get("events")
+        if not isinstance(events, list):
+            return []
+        return [item for item in events if self._valid_persisted_mute_event(qq, item)]
+
+    def _mute_event_risk(self, qq: str) -> int:
+        account = self._personal_mute_account(qq)
+        total = max(0, int(_finite_float(account.get("risk_total"), 0)))
+        if not total:
+            return 0
+        cap = max(0, min(100, int(_finite_float(
+            account.get("last_risk_cap"), 70
+        ))))
+        try:
+            guard_md = self.context.get_registered_star(INVITE_GUARD_STAR_NAME)
+            guard = getattr(guard_md, "star_cls", None) if guard_md else None
+            if guard is not None and hasattr(guard, "_cfg"):
+                cap = max(0, min(100, int(_finite_float(
+                    guard._cfg("mute_revenge", "profile_mute_risk_cap", cap), cap
+                ))))
+        except Exception:
+            pass
+        return min(cap, total)
+
+    def _format_personal_mute_events(self, qq: str) -> list[str]:
+        lines = []
+        for item in self._personal_mute_events(qq)[-10:]:
+            role = (
+                "亲自禁言 bot" if item.get("attribution") == "operator"
+                else "关联责任（其邀请群内 bot 被禁言）"
+            )
+            lines.append(
+                f"{role}：群 {clean_text(item.get('group_id'), 32) or '?'}，"
+                f"操作者 {clean_text(item.get('operator_id'), 32) or '未知'}，"
+                f"时间 {_fmt_time(item.get('time'))}，时长 {self._format_mute_seconds(item.get('duration'))}"
+            )
+        return lines
+
+    @staticmethod
+    def _format_mute_seconds(value: Any) -> str:
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return "未知"
+        if seconds < 0:
+            return "未知"
+        if seconds == 0:
+            return "0 秒"
+        parts = []
+        for unit, label in ((86400, "天"), (3600, "小时"), (60, "分钟")):
+            amount, seconds = divmod(seconds, unit)
+            if amount:
+                parts.append(f"{amount}{label}")
+        if seconds or not parts:
+            parts.append(f"{seconds}秒")
+        return " ".join(parts)
+
+    def _mute_event_tags(self, qq: str) -> list[dict]:
+        account = self._personal_mute_account(qq)
+        operator_count = max(0, int(_finite_float(account.get("operator_count"), 0)))
+        associated_count = max(0, int(_finite_float(account.get("associated_count"), 0)))
+        tags = []
+        if operator_count:
+            tags.append({
+                "tag": "bot_mute_operator", "confidence": 1.0, "source": "mute_event",
+                "evidence": f"有 {operator_count} 次可验证的亲自禁言 bot 记录",
+            })
+        if associated_count:
+            tags.append({
+                "tag": "bot_mute_associated", "confidence": 1.0, "source": "mute_event",
+                "evidence": f"有 {associated_count} 次所邀请群发生 bot 被禁言的关联责任记录",
+            })
+        return tags
 
     async def get_profile_tags_with_score(
         self, qq: str, event=None, exclude_request_key: str = ""
     ) -> dict:
         """可信插件内部只读 API：返回标签、风险分和等级，不校验聊天权限。"""
         tags = await self.get_profile_tags(qq, event, exclude_request_key)
-        score = self._calc_risk_score(tags)
+        score = max(0, min(100, self._calc_risk_score(tags) + self._mute_event_risk(str(qq))))
         cached = self._tags_cache.get(str(qq)) if isinstance(self._tags_cache, dict) else None
         analysis = sanitize_llm_analysis(cached)
         return {
@@ -1834,6 +2125,7 @@ class UserProfilePlugin(Star):
 
         # 基础标签
         base_tags = self._tag_engine.generate_base_tags(qq, st, quotes, guard_records, ban_lines)
+        base_tags.extend(self._mute_event_tags(qq))
         has_social = bool(
             int(st.get("friend_add_time") or 0)
             or str(st.get("friend_request_comment") or "").strip()
@@ -2536,8 +2828,27 @@ class UserProfilePlugin(Star):
                     logger.warning(f"user_profile: load {key} failed: {exc}")
                     return {}
 
-            stats, quotes, tags = await asyncio.gather(
-                load(_STATS_KEY), load(_QUOTES_KEY), load(_TAGS_KEY)
+            async def load_mute_events():
+                value = await self.get_kv_data(_MUTE_EVENTS_KEY, {})
+                if not isinstance(value, dict):
+                    raise ValueError("invalid persisted mute evidence")
+                return value
+
+            async def load_mute_delete_cutoffs():
+                try:
+                    value = await self.get_kv_data(_MUTE_DELETE_CUTOFFS_KEY, {})
+                    if not isinstance(value, dict):
+                        raise ValueError("invalid persisted mute deletion cutoffs")
+                    return value
+                except Exception as exc:
+                    logger.warning(
+                        f"user_profile: load {_MUTE_DELETE_CUTOFFS_KEY} failed: {exc}"
+                    )
+                    return None
+
+            stats, quotes, tags, mute_events, mute_delete_cutoffs = await asyncio.gather(
+                load(_STATS_KEY), load(_QUOTES_KEY), load(_TAGS_KEY),
+                load_mute_events(), load_mute_delete_cutoffs(),
             )
             for qq, st in list(stats.items()):
                 if not isinstance(st, dict):
@@ -2571,10 +2882,99 @@ class UserProfilePlugin(Star):
                 if isinstance(items, list)
             }
             tags = {str(qq): value for qq, value in tags.items()}
+            keep = self.config["mute_event_keep"]
+            accounts = {}
+            for qq, value in mute_events.items():
+                qq = str(qq)
+                if not re.fullmatch(r"\d{5,12}", qq):
+                    continue
+                if isinstance(value, list):
+                    valid = [
+                        item for item in value
+                        if self._valid_persisted_mute_event(qq, item)
+                    ]
+                    account = self._new_mute_account()
+                    account["events"] = valid[-keep:]
+                    account["seen"] = list(dict.fromkeys(
+                        str(item["event_key"]) for item in valid
+                    ))[:_MUTE_SEEN_LEDGER_LIMIT]
+                    account["risk_total"] = sum(
+                        max(0, min(100, int(_finite_float(item.get("risk_increment"), 0))))
+                        for item in valid
+                    )
+                    account["operator_count"] = sum(
+                        item.get("attribution") == "operator" for item in valid
+                    )
+                    account["associated_count"] = len(valid) - account["operator_count"]
+                    if valid:
+                        account["last_risk_cap"] = max(0, min(100, int(
+                            _finite_float(valid[-1].get("risk_cap"), 70)
+                        )))
+                        account["last_time"] = max(0, int(_finite_float(
+                            valid[-1].get("time"), 0
+                        )))
+                    self._mute_events_dirty = True
+                elif isinstance(value, dict):
+                    valid = [
+                        item for item in value.get("events", [])
+                        if self._valid_persisted_mute_event(qq, item)
+                    ] if isinstance(value.get("events"), list) else []
+                    account = self._new_mute_account()
+                    account["events"] = valid[-keep:]
+                    seen = value.get("seen")
+                    if not isinstance(seen, list):
+                        seen = []
+                    normalized_seen = [
+                        clean_text(item, 160) for item in seen
+                        if isinstance(item, str) and item
+                    ]
+                    normalized_seen.extend(str(item["event_key"]) for item in valid)
+                    account["seen"] = list(dict.fromkeys(
+                        normalized_seen
+                    ))[:_MUTE_SEEN_LEDGER_LIMIT]
+                    for field in ("risk_total", "operator_count", "associated_count", "last_time"):
+                        account[field] = max(0, int(_finite_float(value.get(field), 0)))
+                    account["last_risk_cap"] = max(0, min(100, int(_finite_float(
+                        value.get("last_risk_cap"), 70
+                    ))))
+                else:
+                    continue
+                accounts[qq] = account
             self._stats, self._quotes, self._tags_cache = stats, quotes, tags
+            self._mute_events = accounts
+            self._mute_delete_cutoffs = (
+                {
+                    str(qq): max(0, int(_finite_float(value, 0)))
+                    for qq, value in mute_delete_cutoffs.items()
+                    if re.fullmatch(r"\d{5,12}", str(qq))
+                }
+                if isinstance(mute_delete_cutoffs, dict) else None
+            )
             async with self._store_lock:
                 if self._apply_quote_retention_locked(int(time.time())):
                     self._dirty = True
+
+    async def _ensure_mute_delete_cutoffs_available(self) -> bool:
+        if isinstance(self._mute_delete_cutoffs, dict):
+            return True
+        try:
+            value = await self.get_kv_data(_MUTE_DELETE_CUTOFFS_KEY, {})
+            if not isinstance(value, dict):
+                raise ValueError("invalid persisted mute deletion cutoffs")
+        except Exception as exc:
+            logger.warning(
+                f"user_profile: strict load {_MUTE_DELETE_CUTOFFS_KEY} failed: {exc}"
+            )
+            return False
+        normalized = {
+            str(qq): max(0, int(_finite_float(cutoff, 0)))
+            for qq, cutoff in value.items()
+            if re.fullmatch(r"\d{5,12}", str(qq))
+        }
+        async with self._store_lock:
+            if self._mute_delete_cutoffs is None:
+                self._mute_delete_cutoffs = normalized
+        return True
 
     def _apply_quote_retention_locked(self, now: int, qq: str | None = None) -> int:
         days = self.config["quote_retention_days"]
@@ -2624,9 +3024,15 @@ class UserProfilePlugin(Star):
                 logger.warning(f"user_profile: flush failed: {exc}")
 
     async def _flush(self):
-        if self._stats is None or not (self._dirty or self._tags_dirty):
+        if self._stats is None or not (
+            self._dirty or self._tags_dirty or self._mute_events_dirty
+            or self._mute_delete_cutoffs_dirty
+        ):
             return
         async with self._store_lock:
+            if self._mute_delete_cutoffs_dirty:
+                await self.put_kv_data(_MUTE_DELETE_CUTOFFS_KEY, self._mute_delete_cutoffs or {})
+                self._mute_delete_cutoffs_dirty = False
             if self._dirty:
                 await self.put_kv_data(_STATS_KEY, self._stats)
                 await self.put_kv_data(_QUOTES_KEY, self._quotes or {})
@@ -2634,6 +3040,9 @@ class UserProfilePlugin(Star):
             if self._tags_dirty:
                 await self.put_kv_data(_TAGS_KEY, self._tags_cache or {})
                 self._tags_dirty = False
+            if self._mute_events_dirty:
+                await self.put_kv_data(_MUTE_EVENTS_KEY, self._mute_events or {})
+                self._mute_events_dirty = False
 
     async def terminate(self):
         if self._flush_task and not self._flush_task.done():
@@ -2698,10 +3107,14 @@ class UserProfilePlugin(Star):
             if self._tags_cache is not None:
                 self._tags_cache.pop(old_qq, None)
                 self._tags_dirty = True
+            if self._mute_events is not None and old_qq in self._mute_events:
+                self._mute_events.pop(old_qq, None)
+                self._mute_events_dirty = True
             self._llm_status.pop(old_qq, None)
             history_lock = self._history_locks.get(old_qq)
             if history_lock is not None and not history_lock.locked():
                 self._history_locks.pop(old_qq, None)
+        return [old_qq for old_qq, _ in victims]
 
     # ---------------- 工具 ----------------
 

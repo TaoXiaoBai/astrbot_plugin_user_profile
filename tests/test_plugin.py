@@ -875,5 +875,242 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class MuteEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    make_plugin = PluginTests.make_plugin
+
+    async def test_mute_evidence_is_immediate_idempotent_and_persistent(self):
+        plugin = self.make_plugin({"history_scan_enabled": False, "llm_tags": False})
+        kwargs = dict(event_key="stable:one", group_id="30000", event_time=100,
+                      duration=3600, operator_id="22222", self_id="99999",
+                      risk_increment=35, risk_cap=70)
+        self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "recorded")
+        self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "duplicate")
+        result = await plugin.get_profile_tags_with_score("22222")
+        self.assertEqual(result["score"], 85)
+        self.assertIn("bot_mute_operator", [tag["tag"] for tag in result["tags"]])
+        model = await plugin._build_profile_model("22222", None)
+        self.assertIn("亲自禁言 bot", " ".join(model["criminal"]))
+        self.assertIn("曾禁言 bot", plugin._profile_model_to_text(model))
+        restarted = self.make_plugin({"history_scan_enabled": False, "llm_tags": False})
+        restarted._kv = copy.deepcopy(plugin._kv)
+        self.assertEqual((await restarted.record_bot_mute_event("22222", **kwargs))["status"], "duplicate")
+        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 85)
+        self.assertEqual((await restarted.record_bot_mute_event(
+            "22222", **{**kwargs, "event_key": "stable:two"}))["status"], "recorded")
+        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 100)
+
+    async def test_associated_role_and_invalid_identity(self):
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        kwargs = dict(event_key="stable:invite", group_id="30000", event_time=1,
+                      duration=60, operator_id="22222", inviter_id="33333",
+                      attribution="associated_inviter", self_id="99999")
+        for qq in ("22222", "99999", "bad"):
+            self.assertEqual((await plugin.record_bot_mute_event(qq, **kwargs))["status"], "invalid")
+        self.assertEqual((await plugin.record_bot_mute_event("33333", **kwargs))["status"], "recorded")
+        tags = await plugin.get_profile_tags("33333")
+        self.assertIn("bot_mute_associated", [tag["tag"] for tag in tags])
+        self.assertNotIn("bot_mute_operator", [tag["tag"] for tag in tags])
+        text = await plugin._build_profile_text("33333", None)
+        self.assertIn("关联责任", text)
+        self.assertNotIn("亲自禁言 bot：", text)
+
+    async def test_failed_write_retries_without_poisoning_and_delete_clears(self):
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        original = plugin.put_kv_data
+        calls = 0
+        async def flaky(key, value):
+            nonlocal calls
+            if key == "up_bot_mute_events" and calls == 0:
+                calls += 1
+                raise RuntimeError("kv down")
+            await original(key, value)
+        plugin.put_kv_data = flaky
+        kwargs = dict(event_key="stable:retry", group_id="30000", event_time=1,
+                      duration=None, operator_id="22222", self_id="99999")
+        self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "failure")
+        self.assertFalse(plugin._personal_mute_events("22222"))
+        self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "recorded")
+        await plugin.delete_profile_command(Event({}, sender="22222", group="",
+                                                  text="/画像删除 自己"))
+        self.assertNotIn("22222", plugin._kv["up_bot_mute_events"])
+
+    async def test_concurrent_writes_and_bounded_retention(self):
+        plugin = self.make_plugin({"mute_event_keep": 2})
+        kwargs = dict(group_id="30000", event_time=1, duration=1,
+                      operator_id="22222", self_id="99999")
+        answers = await asyncio.gather(*(plugin.record_bot_mute_event(
+            "22222", event_key="stable:concurrent", **kwargs) for _ in range(8)))
+        self.assertEqual([item["status"] for item in answers].count("recorded"), 1)
+        for index in range(3):
+            await plugin.record_bot_mute_event(
+                "22222", event_key=f"stable:{index}", **kwargs)
+        self.assertEqual(len(plugin._personal_mute_events("22222")), 2)
+
+    async def test_display_truncation_never_reduces_aggregate_or_dedup(self):
+        plugin = self.make_plugin({"mute_event_keep": 1, "history_scan_enabled": False,
+                                   "llm_tags": False})
+        common = dict(group_id="30000", duration=1, operator_id="22222",
+                      self_id="99999", risk_cap=100)
+        first = await plugin.record_bot_mute_event(
+            "22222", event_key="stable:high", event_time=1,
+            risk_increment=80, **common)
+        second = await plugin.record_bot_mute_event(
+            "22222", event_key="stable:low", event_time=2,
+            risk_increment=1, **common)
+        self.assertEqual((first["status"], second["status"]), ("recorded", "recorded"))
+        self.assertEqual(len(plugin._personal_mute_events("22222")), 1)
+        self.assertEqual(plugin._mute_event_risk("22222"), 81)
+        restarted = self.make_plugin({"mute_event_keep": 1, "history_scan_enabled": False,
+                                      "llm_tags": False})
+        restarted._kv = copy.deepcopy(plugin._kv)
+        replay = await restarted.record_bot_mute_event(
+            "22222", event_key="stable:high", event_time=1,
+            risk_increment=80, **common)
+        self.assertEqual(replay["status"], "duplicate")
+        self.assertEqual(restarted._mute_event_risk("22222"), 81)
+
+    async def test_current_guard_cap_applies_at_query_time(self):
+        cap = {"value": 70}
+        guard = types.SimpleNamespace(
+            _cfg=lambda group, key, default: cap["value"]
+        )
+        plugin = self.make_plugin({"history_scan_enabled": False, "llm_tags": False})
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=guard)
+        )
+        for index in range(2):
+            await plugin.record_bot_mute_event(
+                "22222", event_key=f"stable:cap:{index}", group_id="30000",
+                event_time=index + 1, duration=1, operator_id="22222",
+                self_id="99999", risk_increment=35, risk_cap=70)
+        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 100)
+        cap["value"] = 10
+        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 60)
+
+    async def test_mute_load_failure_does_not_overwrite_persisted_evidence(self):
+        plugin = self.make_plugin()
+        original = plugin.get_kv_data
+        async def failed(key, default):
+            if key == "up_bot_mute_events":
+                raise RuntimeError("kv unavailable")
+            return await original(key, default)
+        plugin.get_kv_data = failed
+        self.assertEqual((await plugin.record_bot_mute_event(
+            "22222", event_key="stable:retry", group_id="30000",
+            event_time=1, duration=1, operator_id="22222", self_id="99999"))["status"], "failure")
+        self.assertIsNone(plugin._stats)
+
+    async def test_eviction_and_corrupt_evidence_are_safe(self):
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        await plugin.record_bot_mute_event(
+            "22222", event_key="stable:e", group_id="30000", event_time=1,
+            duration=1, operator_id="22222", self_id="99999")
+        plugin._stats["22222"] = _new_stat()
+        plugin._prune_oldest(0)
+        await plugin._flush()
+        self.assertNotIn("22222", plugin._kv["up_bot_mute_events"])
+        plugin._kv["up_bot_mute_events"] = {"33333": [{
+            "event_key": "bad", "group_id": "30000", "operator_id": "22222",
+            "attribution": "operator", "risk_increment": 9999,
+        }]}
+        restarted = self.make_plugin({"history_scan_enabled": False})
+        restarted._kv = copy.deepcopy(plugin._kv)
+        self.assertEqual(await restarted.get_profile_tags("33333"), [])
+
+
+    async def test_profile_delete_cancels_guard_pending_but_not_future_new_event(self):
+        guard = types.SimpleNamespace(cancel_pending_profile_targets=AsyncMock(
+            return_value={"status": "cancelled", "cancelled": 1}
+        ))
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=guard)
+        )
+        with patch("main.time.time", return_value=200):
+            await plugin.delete_profile_command(Event(
+                {}, sender="22222", group="", text="/画像删除 自己"
+            ))
+        guard.cancel_pending_profile_targets.assert_awaited_once_with("22222")
+        old = await plugin.record_bot_mute_event(
+            "22222", event_key="stable:old", group_id="30000", event_time=1,
+            duration=1, operator_id="22222", self_id="99999",
+            event_created_at_ms=100_000,
+        )
+        new = await plugin.record_bot_mute_event(
+            "22222", event_key="stable:new", group_id="30000", event_time=2,
+            duration=1, operator_id="22222", self_id="99999",
+            event_created_at_ms=201_000,
+        )
+        self.assertEqual(old["status"], "cancelled")
+        self.assertEqual(new["status"], "recorded")
+
+    async def test_restarted_cutoff_read_failure_fails_closed_then_recovers(self):
+        original = self.make_plugin({"history_scan_enabled": False})
+        with patch("main.time.time", return_value=200):
+            await original.delete_profile_command(Event(
+                {}, sender="22222", group="", text="/画像删除 自己"
+            ))
+        restarted = self.make_plugin({"history_scan_enabled": False})
+        restarted._kv = copy.deepcopy(original._kv)
+        persisted = copy.deepcopy(restarted._kv)
+        real_get = restarted.get_kv_data
+        failures = {"enabled": True}
+        async def flaky_get(key, default):
+            if key == "up_bot_mute_delete_cutoffs" and failures["enabled"]:
+                raise RuntimeError("cutoff kv unavailable")
+            return await real_get(key, default)
+        restarted.get_kv_data = flaky_get
+        old = dict(event_key="stable:before_delete", group_id="30000",
+                   event_time=1, duration=1, operator_id="22222",
+                   self_id="99999", event_created_at_ms=100_000)
+        first = await restarted.record_bot_mute_event("22222", **old)
+        self.assertEqual(first["status"], "failure")
+        self.assertNotIn("22222", restarted._kv.get("up_bot_mute_events", {}))
+        self.assertEqual(restarted._kv, persisted)
+        self.assertIsNone(restarted._mute_delete_cutoffs)
+        failures["enabled"] = False
+        second = await restarted.record_bot_mute_event("22222", **old)
+        self.assertEqual(second["status"], "cancelled")
+        self.assertNotIn("22222", restarted._kv.get("up_bot_mute_events", {}))
+        self.assertEqual((await restarted.record_bot_mute_event(
+            "22222", **{**old, "event_key": "stable:after_delete",
+                        "event_created_at_ms": 201_000}
+        ))["status"], "recorded")
+
+    async def test_delete_waits_for_inflight_record_then_removes_it(self):
+        guard = types.SimpleNamespace(cancel_pending_profile_targets=AsyncMock(
+            return_value={"status": "cancelled", "cancelled": 1}
+        ))
+        plugin = self.make_plugin({"history_scan_enabled": False})
+        plugin.context = types.SimpleNamespace(
+            get_registered_star=lambda name: types.SimpleNamespace(star_cls=guard)
+        )
+        original_put = plugin.put_kv_data
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        async def blocking_put(key, value):
+            if key == "up_bot_mute_events":
+                entered.set()
+                await release.wait()
+            await original_put(key, value)
+        plugin.put_kv_data = blocking_put
+        record = asyncio.create_task(plugin.record_bot_mute_event(
+            "22222", event_key="stable:inflight", group_id="30000",
+            event_time=1, duration=1, operator_id="22222", self_id="99999",
+            event_created_at_ms=100_000,
+        ))
+        await entered.wait()
+        with patch("main.time.time", return_value=200):
+            deleting = asyncio.create_task(plugin.delete_profile_command(Event(
+                {}, sender="22222", group="", text="/画像删除 自己"
+            )))
+            await asyncio.sleep(0)
+            release.set()
+            self.assertEqual((await record)["status"], "recorded")
+            await deleting
+        self.assertNotIn("22222", plugin._mute_events)
+        self.assertNotIn("22222", plugin._kv.get("up_bot_mute_events", {}))
+
+
 if __name__ == "__main__":
     unittest.main()
