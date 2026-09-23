@@ -344,6 +344,12 @@
         "type": "bool",
         "default": true,
         "hint": "只读获取 astrbot_plugin_qq_tools 的 ban_list 以生成 ban_history；插件未安装或读取失败时自动跳过，不执行拉黑或其他写操作。"
+      },
+      "silent_for_banned": {
+        "description": "黑名单用户命令静默",
+        "type": "bool",
+        "default": true,
+        "hint": "调用者为 qq_tools 黑名单用户时不回复任何画像命令（/画像、/我、/画像删除、/画像扫描等），照常静默采集其发言数据。依赖上方「联动 QQ 黑名单」开关；关闭则黑名单用户可正常使用命令。"
       }
     }
   },

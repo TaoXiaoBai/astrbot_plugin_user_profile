@@ -39,6 +39,7 @@ _DEFAULTS = {
     "history_rescan_interval": 86400,
     "history_scan_batch_limit": 200,
     "history_scan_concurrency": 4,
+    "silent_for_banned": True,
     "llm_tag_cache_ttl": 86400,
     "llm_failure_cache_ttl": 300,
     "llm_refresh_interval": 3600,

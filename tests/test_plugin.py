@@ -95,6 +95,7 @@ class Event:
     def get_message_str(self): return self._text
     def get_messages(self): return self._messages
     def is_admin(self): return False
+    def stop_event(self): pass
     async def send(self, chain): self.sent.append(chain)
 
 
@@ -315,6 +316,33 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(priors[1]["impression"], "表达友好。")
         self.assertEqual(priors[1]["tags"][0]["tag"], "friendly")
         self.assertEqual(priors[1]["traits"], ["友善"])
+
+    async def test_banned_sender_commands_are_silent(self):
+        plugin = self.make_plugin()
+        await plugin._ensure_loaded()
+        plugin._load_ban_entry = AsyncMock(
+            return_value=["在 bot 黑名单中（2026-09-24，原因：违规）"]
+        )
+        for handler, text in (
+            (plugin.profile_command, "/画像 自己"),
+            (plugin.self_profile_command_short, "/我"),
+            (plugin.self_profile_command, "/我的画像"),
+            (plugin.delete_profile_command, "/画像删除 自己"),
+        ):
+            event = Event({}, sender="11111", text=text)
+            await handler(event)
+            self.assertEqual(event.sent, [], msg=f"{text} 应静默")
+        self.assertNotIn("11111", plugin._stats)
+
+    async def test_ban_silence_can_be_disabled(self):
+        plugin = self.make_plugin({"silent_for_banned": False})
+        await plugin._ensure_loaded()
+        plugin._load_ban_entry = AsyncMock(
+            return_value=["在 bot 黑名单中（2026-09-24，原因：违规）"]
+        )
+        event = Event({}, sender="11111", text="/画像")
+        await plugin.profile_command(event)
+        self.assertEqual(len(event.sent), 1)
 
     async def test_delete_blocks_inflight_llm_writeback_but_allows_new_messages(self):
         plugin = self.make_plugin()

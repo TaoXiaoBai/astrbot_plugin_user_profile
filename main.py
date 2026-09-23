@@ -631,7 +631,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.10.0",
+    "1.10.1",
 )
 class UserProfilePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -1039,6 +1039,10 @@ class UserProfilePlugin(Star):
 
     @filter.command("画像")
     async def profile_command(self, event: AstrMessageEvent):
+        sender, _, _ = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         if not self._enabled():
             await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
             return
@@ -1057,10 +1061,18 @@ class UserProfilePlugin(Star):
     @filter.command("我")
     async def self_profile_command_short(self, event: AstrMessageEvent):
         """快捷命令 /我：查自己的画像。"""
+        sender, _, _ = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         await self._dispatch_chat_query(event, "self", "shortcut_/我", True)
 
     @filter.command("我的画像", alias=["查自己"])
     async def self_profile_command(self, event: AstrMessageEvent):
+        sender, _, _ = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         await self._dispatch_chat_query(event, "self", "self_shortcut", True)
 
     @filter.regex(
@@ -1070,6 +1082,11 @@ class UserProfilePlugin(Star):
         """在 wake_prefix 不是 '/' 时处理完整、边界明确的斜杠命令。"""
         raw = (event.get_message_str() or "").strip()
         if event.is_at_or_wake_command and not raw.startswith("/"):
+            return
+
+        sender, _, _ = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
             return
 
         # 历史扫描走同一正则兜底，避免依赖 wake_prefix
@@ -1123,6 +1140,9 @@ class UserProfilePlugin(Star):
     @filter.command("画像删除")
     async def delete_profile_command(self, event: AstrMessageEvent):
         sender, _, is_admin = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         text = clean_text(event.get_message_str(), 100)
         target = re.sub(r"^/?画像删除(?:\s+|$)", "", text, count=1).strip()
         qq = sender if target in ("", "自己", "我", "me") else target
@@ -1155,7 +1175,10 @@ class UserProfilePlugin(Star):
 
     @filter.command("画像清理")
     async def cleanup_profile_command(self, event: AstrMessageEvent):
-        _, _, is_admin = self._event_identity(event)
+        sender, _, is_admin = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         if not is_admin:
             await event.send(MessageChain(chain=[Plain("画像清理仅限管理员使用。")]))
             return
@@ -1175,6 +1198,9 @@ class UserProfilePlugin(Star):
             await event.send(MessageChain(chain=[Plain("用户画像插件当前未启用。")]))
             return
         sender, group_id, is_admin = self._event_identity(event)
+        if await self._sender_silenced_by_ban(sender):
+            event.stop_event()
+            return
         if not is_admin:
             logger.warning(
                 f"user_profile: history scan denied sender={sender!r} group={group_id!r} rule=not_admin"
@@ -2488,6 +2514,18 @@ class UserProfilePlugin(Star):
             if isinstance(rec, dict):
                 lines.append(f"曾操作拉 bot 进群 {gid}（{_fmt_time(rec.get('time'))}）")
         return lines[:10]
+
+    async def _sender_silenced_by_ban(self, sender: str) -> bool:
+        """开关开启且调用者在 qq_tools 黑名单中时为 True（命令静默拦截）。"""
+        if not self.config.get("silent_for_banned", True):
+            return False
+        if not sender or not re.fullmatch(r"\d{5,12}", str(sender)):
+            return False
+        try:
+            return bool(await self._load_ban_entry(str(sender)))
+        except Exception as exc:
+            logger.warning(f"user_profile: ban silence check failed: {exc}")
+            return False
 
     async def _load_ban_entry(self, qq: str) -> list:
         """读取 qq_tools 黑名单中此 QQ 的条目；未装 qq_tools 或读取失败返回空。"""

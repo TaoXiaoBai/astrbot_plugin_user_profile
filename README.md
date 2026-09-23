@@ -291,6 +291,7 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `link_invite_guard` | `true` | 只读读取守卫邀请/入群摘要及群级禁言背景 |
 | `mute_event_keep` | `100` | 每 QQ 展示/保留的近期禁言明细 1–500 条；不影响累计风险与去重账本 |
 | `link_qq_tools_ban` | `true` | 只读读取 qq_tools 的 `ban_list` |
+| `silent_for_banned` | `true` | 黑名单用户调用画像命令时静默不回复（数据照常采集）；依赖 `link_qq_tools_ban` |
 
 守卫的每次风险增量与归因随证据持久化；单一 KV 账户同时保存近期展示明细、累计风险/归因次数及独立 seen 账本，明细截断不会降低风险。单人叠加量不超过守卫配置的累计上限，综合风险严格限制在 0–100；修改累计上限在下一次查询时生效。可靠事件 ID/协议时间用于跨重启去重，缺失时仅短窗口尽力去重。seen 账本最多 5000 键/人，达到上限后拒绝新增事件并保持待投递（不会丢弃旧键而重复计分），需人工删除/清理后恢复；`/画像删除` 与用户淘汰会清空该账户。
 
