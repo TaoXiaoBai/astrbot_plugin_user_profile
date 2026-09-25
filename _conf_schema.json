@@ -47,6 +47,36 @@
       }
     }
   },
+  "conversation_context": {
+    "description": "日常对话画像上下文",
+    "type": "object",
+    "items": {
+      "llm_context_inject": {
+        "description": "自动注入当前用户画像",
+        "type": "bool",
+        "default": true,
+        "hint": "在普通群聊和私聊进入对话 LLM 前，按真实发送者 QQ 注入已有的短画像。此流程只读现有内存/KV，不扫描历史、不生成新画像，也不受 enable_llm_tool 控制；任何异常均放行正常回复。"
+      },
+      "llm_context_max_chars": {
+        "description": "画像上下文字符上限",
+        "type": "int",
+        "default": 2000,
+        "hint": "自动注入块的硬上限，运行时限制 500-8000 字符。原话、私聊摘录、好友验证语和头像不会注入。"
+      },
+      "llm_context_include_management": {
+        "description": "包含管理历史",
+        "type": "bool",
+        "default": true,
+        "hint": "注入经清洗的用户禁言 bot、守卫拉黑/解封和 bot 主动删除好友等摘要；这些记录只是背景，不授权模型自动处罚。"
+      },
+      "llm_context_include_social": {
+        "description": "包含好友关系",
+        "type": "bool",
+        "default": true,
+        "hint": "注入脱敏的当前好友关系。好友列表中消失只表示关系缺失且原因未知，不推断是谁删除了谁。"
+      }
+    }
+  },
   "output": {
     "description": "输出与隐私",
     "type": "object",
@@ -374,6 +404,18 @@
         "type": "bool",
         "default": true,
         "hint": "某用户添加 bot 为好友、但无明确进群来源时，用其在群聊中发言最多的群作为推测来源群，明确标注“仅推测”。无好友事件时不推测。"
+      },
+      "friend_reconcile_enabled": {
+        "description": "启用好友列表对账",
+        "type": "bool",
+        "default": true,
+        "hint": "在拿到可用 OneBot 客户端后异步、单飞、节流读取好友列表。首次只建立基线；后续消失记为原因未知，恢复则记为关系恢复。失败不会覆盖基线。"
+      },
+      "friend_reconcile_interval": {
+        "description": "好友列表对账间隔",
+        "type": "int",
+        "default": 21600,
+        "hint": "同一 bot 两次好友列表对账的最短秒数，默认 6 小时，运行时限制 300-2592000 秒。对账在后台执行，不阻塞消息采集或 LLM 请求。"
       }
     }
   }

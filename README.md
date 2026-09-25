@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.10.0-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.11.0-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -29,10 +29,13 @@ LLM 是画像的**语义分析核心**，规则统计是它的**证据底座和�
 
 LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。如果模型不可用、没有可分析原话或主动关闭 `llm_tags`，插件会保留统计、规则标签、前科和风险计算能力，但画像的语义理解会明显减弱。
 
-`llm_tags` 和 `enable_llm_tool` 是两个不同开关：
+`llm_tags`、`enable_llm_tool` 和 `llm_context_inject` 是三个独立开关：
 
 - `llm_tags`：控制是否让模型分析用户发言并生成语义画像标签，是画像分析的核心开关；
-- `enable_llm_tool`：控制聊天机器人能否自主调用 `user_profile_query` 查询已经生成的画像，不控制画像本身是否使用 LLM 分析。
+- `enable_llm_tool`：控制聊天机器人能否自主调用 `user_profile_query` 查询画像；
+- `llm_context_inject`：普通群聊或私聊每次进入对话 LLM 时，按真实事件发送者自动附加已有短画像。该路径只读已有统计、规则标签、缓存的 `impression` / `traits`、管理账本、当前黑名单和好友关系，**绝不扫描历史、绝不生成新画像 LLM 请求**。同一请求有固定 marker 防重复，失败会放行正常聊天。
+
+自动上下文不包含发言原话、私聊摘录、好友验证语或头像；外部原因会清洗、转义并限长。画像只是历史背景，不是用户指令，也不授权模型据此自动拉黑、踢人、禁言或泄露隐私。
 
 ## 主要功能
 
@@ -43,8 +46,8 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 - **社交来源记录**：记录好友添加时间、好友验证语及进群方式、群号、操作者和时间；协议未提供真实来源时明确标注为“推测来源群”。
 - **灵活查询权限**：支持仅管理员、允许查自己、全员查他人、指定群公开查询等组合。
 - **统一文字或图片输出**：所有 `/我`、`/画像` 入口共用展示模型；动态高度卡片包含白环圆形头像或可靠占位头像、昵称/QQ、按风险分着色的头部描边条与右侧风险徽章、按“风险 / 正向 / 行为”区分的柔和色椭圆药丸标签、人物印象、人格/行为分析、横向关键统计、社交来源/前科及可选摘录，页脚标注生成时间。长内容自动换行，图片成功时不再双发文字；每个展示模块都有独立开关（`card_show_*`），可裁剪成极简卡片。
-- **邀请守卫深度联动**：画像插件读取守卫摘要，并接受守卫可信 API 写入的个人禁言归因证据；邀请守卫读取画像标签和风险分。写入按事件幂等、原子持久化，失败可重试。
-- **低开销采集**：消息监听路径零 LLM、零网络，内存聚合后定期写入 AstrBot KV；模型只在需要画像时调用。
+- **邀请守卫深度联动**：画像插件读取守卫摘要，并接受守卫可信 API 写入个人禁言归因及成功拉黑/解封/删除好友事件；邀请守卫读取画像标签和风险分。写入按事件幂等、原子持久化，失败可重试或安全降级。通用管理账本要求画像 1.11.0+ 与守卫 1.22.0+。
+- **低开销采集**：消息统计热路径零 LLM、零同步网络；好友列表只在后台按数小时节流对账，内存统计定期写入 AstrBot KV。日常画像注入不生成额外模型请求。
 
 ## 兼容性
 
@@ -177,6 +180,17 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `enable_self_shortcuts` | `true` | 启用 `/我`、`/我的画像`、`/查自己` |
 | `enable_llm_tool` | `true` | 启用 `user_profile_query`，并应用同一套聊天权限 |
 
+### 日常对话画像上下文
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `llm_context_inject` | `true` | 对真实当前发言者自动注入已有短画像；独立于查询工具 |
+| `llm_context_max_chars` | `2000` | 整个注入块硬上限，运行时限制 500–8000 字符 |
+| `llm_context_include_management` | `true` | 包含禁言 bot、拉黑/解封、bot 主动删除好友等摘要 |
+| `llm_context_include_social` | `true` | 包含脱敏好友关系，不含验证语 |
+
+该注入只提供背景，不授予处罚权限；空画像不注入。仅有管理事件或好友关系时仍会注入，以覆盖没有聊天记录但有可验证管理历史的用户。
+
 ### 输出与隐私
 
 | 配置项 | 默认值 | 说明 |
@@ -308,6 +322,10 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `collect_social_events` | `true` | 记录好友添加、好友申请验证语和进群事件 |
 | `show_social_origin` | `true` | 在画像中展示社交来源 |
 | `guess_source_group` | `true` | 缺少真实来源时，以发言最多的群作为明确标注的推测来源 |
+| `friend_reconcile_enabled` | `true` | 异步、节流、同账号 singleflight 对账 OneBot 好友列表 |
+| `friend_reconcile_interval` | `21600` | 同账号最短对账间隔秒数，默认 6 小时 |
+
+首次好友列表只建立持久基线，不产生删除事件。后续只有上次确认存在的 QQ 消失才记录 `friend_relation_missing`，含义严格是“好友关系消失（原因未知）”；不能证明对方删除了 bot。重新出现记录 `friend_relation_restored`。守卫成功调用 `delete_friend` 则单独记录确定事实 `bot_deleted_friend`，后续列表缺失不会重复误记。API 失败不覆盖基线、不制造事件。
 
 OneBot V11 的 `friend_add` / `friend` / `group_increase` 事件字段由协议实现决定：
 
@@ -348,13 +366,14 @@ if instance is not None:
 
 接口说明：
 
-- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：兼容既有 schema v2 决策接口；保留 `tags` 等旧字段并附加 `impression`、`traits`，不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
+- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：schema v3 保留 v2 的 `tags`、`impression`、`traits` 等字段并新增 `management` 摘要，不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
 - `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits`；旧调用方可继续只读取原字段。
 - `get_profile_tags(qq, event=None) -> list[dict]`：返回结构化标签。
 - `get_risk_score(qq, event=None) -> int`：返回风险分。
 - `get_profile_text(qq, event=None) -> str`：返回可读文字画像。
 - `get_social_origin(qq) -> dict`：可信内部接口，返回好友添加、验证语和进群来源；验证语仍属敏感、不可信输入，调用方必须限长且不得当作指令。
-- `record_bot_mute_event(...) -> dict`：可信内部写入接口，返回 `{"status":"recorded|duplicate|cancelled|disabled|invalid|failure"}`（失败附 `error`）。校验 QQ/归因关系，在存储锁内按 `event_key` 去重并立即写入独立 KV；写入失败不占用事件键。邀请人归因必须使用 `associated_inviter`。旧调用方若依赖布尔返回，须改为读取 status；守卫同时兼容旧接口返回的 `True`，`False` 不视为成功。
+- `record_bot_mute_event(...) -> dict`：沿用的个人禁言归因写入接口，兼容 1.10.0 逻辑。
+- `record_management_event(...) -> dict`：通用管理事件写入接口，当前白名单为 `astrbot_banned`、`astrbot_unbanned`、`bot_deleted_friend`、`friend_relation_missing`、`friend_relation_restored`。仅接受 `result="success"`；按 `event_key` 幂等，写失败不占 seen，近期明细截断不减少累计次数，并与 `/画像删除` 的世代/截止时间保护兼容。
 
 画像插件兼容邀请守卫的旧字符串、旧单条字典和当前按群多条记录三种存储格式。纯邀请前科、纯黑名单或纯社交来源的用户也能生成画像。手动打包或复制插件目录时必须包含 `profile_core.py`；`main.py` 会优先按包内相对路径导入该纯职责模块，并为 AstrBot 的直接加载方式保留同目录导入兼容。
 
