@@ -34,7 +34,18 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(cfg["store_quotes"])
         self.assertTrue(cfg["store_private_quotes"])
         self.assertTrue(cfg["llm_include_private_quotes"])
+        self.assertTrue(cfg["cross_scene_link_enabled"])
+        self.assertTrue(cfg["group_chat_use_linked_impression"])
         self.assertEqual(cfg["quote_retention_days"], 0)
+        self.assertTrue(cfg["profile_ranking_enabled"])
+        self.assertEqual(cfg["profile_ranking_page_size"], 10)
+        self.assertEqual(cfg["profile_ranking_min_score"], 0)
+        bounded = normalize_config({
+            "profile_ranking_page_size": 999,
+            "profile_ranking_min_score": -1,
+        })
+        self.assertEqual(bounded["profile_ranking_page_size"], 50)
+        self.assertEqual(bounded["profile_ranking_min_score"], 0)
 
     def test_llm_tags_are_allowlisted_and_sanitized(self):
         result = sanitize_llm_tags([
@@ -60,7 +71,7 @@ class CoreTests(unittest.TestCase):
             ],
         }
         result = sanitize_llm_analysis(raw)
-        self.assertEqual(LLM_SCHEMA_VERSION, 4)
+        self.assertEqual(LLM_SCHEMA_VERSION, 5)
         self.assertEqual([tag["tag"] for tag in result["tags"]], ["friendly"])
         self.assertNotIn("\x00", result["impression"])
         self.assertLessEqual(len(result["impression"]), 240)

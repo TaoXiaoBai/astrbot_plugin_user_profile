@@ -5,7 +5,45 @@ import re
 from typing import Any
 
 
-LLM_SCHEMA_VERSION = 4
+LLM_SCHEMA_VERSION = 5
+
+
+def quote_scene(item: dict) -> str:
+    scene = item.get("scene")
+    if scene in ("group", "private", "unknown"):
+        return scene
+    src = str(item.get("src") or "")
+    if src.startswith("群 ") or src.startswith("[群 "):
+        return "group"
+    if src == "私聊":
+        return "private"
+    return "unknown"
+
+
+def normalize_quote(item: dict) -> dict:
+    result = dict(item)
+    result["scene"] = quote_scene(item)
+    if result["scene"] == "group":
+        match = re.search(r"群\s+(\d+)", str(item.get("src") or ""))
+        result["group_id"] = str(item.get("group_id") or (match.group(1) if match else ""))
+    else:
+        result["group_id"] = ""
+    result["t"] = _bounded_int(item.get("t"), 0, 0, 2**63 - 1)
+    return result
+
+
+def quota_quotes(items: list, keep: int) -> list:
+    normalized = [normalize_quote(item) for item in items if isinstance(item, dict)]
+    counts = {}
+    result = []
+    for item in reversed(normalized):
+        scene = "private" if item["scene"] == "private" else "group"
+        counts[scene] = counts.get(scene, 0) + 1
+        if counts[scene] <= keep:
+            result.append(item)
+    return list(reversed(result))
+
+
 LLM_TAGS = frozenset({
     "spam_suspect", "ad_suspect", "troll", "friendly", "helpful",
     "nsfw_tendency", "political_sensitive", "scam_suspect", "repetitive",
@@ -17,6 +55,9 @@ _DEFAULTS = {
     "allow_other_query": False,
     "enable_self_shortcuts": True,
     "enable_llm_tool": True,
+    "profile_ranking_enabled": True,
+    "profile_ranking_page_size": 10,
+    "profile_ranking_min_score": 0,
     "llm_context_inject": True,
     "llm_context_max_chars": 2000,
     "llm_context_include_management": True,
@@ -32,6 +73,8 @@ _DEFAULTS = {
     "store_quotes": True,
     "store_private_quotes": True,
     "llm_include_private_quotes": True,
+    "cross_scene_link_enabled": True,
+    "group_chat_use_linked_impression": True,
     "quote_retention_days": 0,
     "quote_keep": 10,
     "quote_show": 5,
@@ -67,6 +110,8 @@ _DEFAULTS = {
 }
 
 _INT_RULES = {
+    "profile_ranking_page_size": (1, 50),
+    "profile_ranking_min_score": (0, 100),
     "quote_retention_days": (0, 3650),
     "quote_keep": (1, 100),
     "quote_show": (1, 50),
@@ -186,7 +231,7 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
             "tag": tag,
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
             "source": "llm",
-            "evidence": clean_text(item.get("reason"), 160),
+            "evidence": clean_text(item.get("reason", item.get("evidence")), 160),
         })
         if len(result) >= 5:
             break
@@ -250,7 +295,9 @@ def build_material_fingerprint(
         "provider": str(provider or ""),
         "schema": int(schema),
         "quotes": [
-            {"src": str(item.get("src") or ""), "text": str(item.get("text") or "")}
+            {"src": str(item.get("src") or ""), "text": str(item.get("text") or ""),
+             "scene": quote_scene(item), "group_id": str(item.get("group_id") or ""),
+             "t": str(item.get("t") or "0")}
             for item in quotes
             if isinstance(item, dict)
         ],

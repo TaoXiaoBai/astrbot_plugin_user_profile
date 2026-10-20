@@ -47,6 +47,48 @@
       }
     }
   },
+  "ranking": {
+    "description": "管理员风险排名",
+    "type": "object",
+    "items": {
+      "profile_ranking_enabled": {
+        "description": "启用画像排名",
+        "type": "bool",
+        "default": true,
+        "hint": "控制管理员命令 /画像排名（别名 /风险排名）。排名始终仅管理员可用，不继承公开查询他人的权限；关闭不影响单人画像。"
+      },
+      "profile_ranking_page_size": {
+        "description": "排名每页人数",
+        "type": "int",
+        "default": 10,
+        "hint": "每页展示人数，运行时限制 1-50。候选只来自已加载的统计、语义缓存、个人禁言账本、管理账本和当前黑名单；批量过程不逐人调用 LLM、扫描历史或请求昵称/头像网络接口。"
+      },
+      "profile_ranking_min_score": {
+        "description": "排名最低风险分",
+        "type": "int",
+        "default": 0,
+        "hint": "只展示风险分达到该值且确有记录材料的用户，运行时限制 0-100。无证据用户不会因默认基准分进入榜单；材料不足或语义尚未分析也不代表低风险。"
+      }
+    }
+  },
+  "scene_link": {
+    "description": "群私场景关联与隐私边界",
+    "type": "object",
+    "items": {
+      "cross_scene_link_enabled": {
+        "description": "关联群聊和私聊印象",
+        "type": "bool",
+        "default": true,
+        "hint": "同QQ分别分析群聊和私聊，再关联简短结论。受 llm_include_private_quotes 总策略控制；关闭后不使用融合缓存。旧混合缓存隔离，不作为群聊先验。"
+      },
+      "group_chat_use_linked_impression": {
+        "description": "日常群聊模型参考整体印象",
+        "type": "bool",
+        "default": true,
+        "hint": "默认启用：同时受关联与私聊使用总策略控制，日常群聊分别参考已有群聊、私聊和融合概括，缺失明确标注信息不足，不额外调用模型。不传原话或好友验证语，但概括可能包含私人事件残余，提示约束不是防泄露保证。关闭后群聊只读群聊印象。公开命令、图片、工具及排名始终不使用私聊派生文本。"
+      }
+    }
+  },
   "conversation_context": {
     "description": "日常对话画像上下文",
     "type": "object",
@@ -55,7 +97,7 @@
         "description": "自动注入当前用户画像",
         "type": "bool",
         "default": true,
-        "hint": "在普通群聊和私聊进入对话 LLM 前，按真实发送者 QQ 注入已有的短画像。此流程只读现有内存/KV，不扫描历史、不生成新画像，也不受 enable_llm_tool 控制；任何异常均放行正常回复。"
+        "hint": "按真实发送者注入已有短画像；允许关联时明确携带群/私/融合概括。动态关系按真实平台和 bot 匹配：群仅当前群，私聊仅发送者明确作为 inviter 的最多六条；超过一天称最近确认/待核实。marker 接管守卫关系但保留黑名单。不扫描历史、不调用新画像模型、不受 enable_llm_tool 控制；关闭注入不影响接收可信生命周期。异常放行正常回复。"
       },
       "llm_context_max_chars": {
         "description": "画像上下文字符上限",
@@ -181,7 +223,7 @@
         "description": "原话保存条数",
         "type": "int",
         "default": 10,
-        "hint": "每个 QQ 保留的最近发言原话数量，运行时限制为 1-100。"
+        "hint": "每个 QQ 的群聊和私聊各最多保留此数量，运行时限制 1-100，正常总容量最多原来的两倍；来源未知旧材料隔离但占非私聊配额，不挤掉私聊。已有历史数据不会因禁用采集而主动删除。"
       },
       "quote_retention_days": {
         "description": "摘录保留天数",
@@ -325,7 +367,7 @@
         "description": "LLM 可使用私聊摘录",
         "type": "bool",
         "default": true,
-        "hint": "关闭后语义分析只使用已保存的群聊摘录，不使用私聊或来源不明的历史摘录。"
+        "hint": "私聊使用总策略：关闭后立即停用旧 private/fused 派生缓存及 prior，不等待刷新间隔；只使用群聊材料，来源未知历史不参与语义分析。不会主动删除已有原话；若要停止新增采集/存储，还需设置 collect_private/store_private_quotes。"
       }
     }
   },
@@ -409,7 +451,7 @@
         "description": "启用好友列表对账",
         "type": "bool",
         "default": true,
-        "hint": "在拿到可用 OneBot 客户端后异步、单飞、节流读取好友列表。首次只建立基线；后续消失记为原因未知，恢复则记为关系恢复。失败不会覆盖基线。"
+        "hint": "在拿到可用 OneBot 客户端后异步、单飞、节流读取好友列表。首次只建立基线；后续消失按最近关系事件判定方向，恢复则记为关系恢复。失败不会覆盖基线，并按退避时间重试；画像删除会阻止旧的在途对账结果重建数据。"
       },
       "friend_reconcile_interval": {
         "description": "好友列表对账间隔",
