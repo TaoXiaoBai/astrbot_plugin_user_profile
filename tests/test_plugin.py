@@ -151,27 +151,27 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             }
         })
         weights = plugin._risk_weights()
-        self.assertEqual(weights["friendly"], -10)
-        self.assertEqual(weights["normal"], -15)
-        self.assertEqual(weights["scam_suspect"], 20)
+        self.assertEqual(weights["friendly"], 0)
+        self.assertEqual(weights["normal"], 0)
+        self.assertEqual(weights["scam_suspect"], 45)
         self.assertNotIn("unknown_tag", weights)
-        self.assertEqual(weights["helpful"], -20)
+        self.assertEqual(weights["helpful"], 0)
         score = plugin._calc_risk_score([
             {"tag": "helpful", "confidence": 1},
             {"tag": "friendly", "confidence": "nan"},
             {"tag": "normal", "confidence": "broken"},
             {"tag": "scam_suspect", "confidence": float("inf")},
         ])
-        self.assertEqual(score, 30)
+        self.assertEqual(score, 0)
 
     def test_invalid_json_risk_weights_fall_back_safely(self):
         plugin = self.make_plugin({
             "risk_weights": '{"friendly": NaN, "helpful": "bad"}'
         })
-        self.assertEqual(plugin._risk_weights()["friendly"], -10)
+        self.assertEqual(plugin._risk_weights()["friendly"], 0)
         self.assertEqual(plugin._calc_risk_score([
             {"tag": "friendly", "confidence": 1}
-        ]), 40)
+        ]), 0)
 
     def test_query_permission_defaults_to_self_only(self):
         plugin = self.make_plugin()
@@ -1027,8 +1027,12 @@ class RankingTests(unittest.IsolatedAsyncioTestCase):
             "profile_ranking_min_score": 50,
             "history_scan_enabled": True,
             "llm_tags": True,
+            "risk_weights": {
+                "scam_suspect": 60, "ban_history": 100, "astrbot_banned": 60,
+            },
         })
         await plugin._ensure_loaded()
+        from scene_profiles import policy
         for qq, group, links in (
             ("22222", "22222", 10),
             ("11111", "22222", 10),
@@ -1038,10 +1042,10 @@ class RankingTests(unittest.IsolatedAsyncioTestCase):
             plugin._stats[qq].update({
                 "g_count": 10, "groups": {group: 10}, "links": links,
             })
-        plugin._tags_cache["33333"] = {
-            "status": "success", "time": 100,
-            "tags": [{"tag": "scam_suspect", "confidence": 1, "reason": "索要转账"}],
-        }
+            plugin._tags_cache[qq] = {"slots": {"group": {
+                "status": "success", "time": 100, "policy": list(policy(plugin)),
+                "tags": [{"tag": "scam_suspect", "confidence": 1, "reason": "索要转账"}],
+            }}}
         plugin._management_events["44444"] = {
             "events": [{
                 "type": "astrbot_banned", "event_key": "x", "time": 1,
@@ -1075,7 +1079,8 @@ class RankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all_model["items"][0]["currently_banned"])
         empty = plugin._assemble_lightweight_snapshot("66666", {}, {}, [])
         self.assertFalse(empty["has_evidence"])
-        self.assertEqual(empty["score"], 50)
+        self.assertIsNone(empty["score"])
+        self.assertEqual(empty["risk_status"], "no_evidence")
 
     async def test_ranking_snapshot_and_single_profile_share_score(self):
         plugin = self.make_plugin({"history_scan_enabled": False, "llm_tags": False})
@@ -1122,7 +1127,7 @@ class RankingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(fallback, "_render_ranking_image", return_value=None):
             await fallback.profile_ranking_command(event)
         self.assertEqual(event.sent[0][0][0], "plain")
-        self.assertIn("已记录用户风险快照", event.sent[0][0][1])
+        self.assertIn("群聊公开证据风险快照", event.sent[0][0][1])
 
     def test_real_ranking_image_is_uuid_png(self):
         plugin = self.make_plugin()
@@ -1287,7 +1292,8 @@ class MuteEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "recorded")
         self.assertEqual((await plugin.record_bot_mute_event("22222", **kwargs))["status"], "duplicate")
         result = await plugin.get_profile_tags_with_score("22222")
-        self.assertEqual(result["score"], 85)
+        self.assertEqual(result["score"], 35)
+        self.assertEqual(result["risk_components"]["mute_operator"], 35)
         self.assertIn("bot_mute_operator", [tag["tag"] for tag in result["tags"]])
         model = await plugin._build_profile_model("22222", None)
         self.assertIn("亲自禁言 bot", " ".join(model["criminal"]))
@@ -1295,10 +1301,10 @@ class MuteEvidenceTests(unittest.IsolatedAsyncioTestCase):
         restarted = self.make_plugin({"history_scan_enabled": False, "llm_tags": False})
         restarted._kv = copy.deepcopy(plugin._kv)
         self.assertEqual((await restarted.record_bot_mute_event("22222", **kwargs))["status"], "duplicate")
-        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 85)
+        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 35)
         self.assertEqual((await restarted.record_bot_mute_event(
             "22222", **{**kwargs, "event_key": "stable:two"}))["status"], "recorded")
-        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 100)
+        self.assertEqual((await restarted.get_profile_tags_with_score("22222"))["score"], 70)
 
     async def test_associated_role_and_invalid_identity(self):
         plugin = self.make_plugin({"history_scan_enabled": False})
@@ -1384,9 +1390,9 @@ class MuteEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 "22222", event_key=f"stable:cap:{index}", group_id="30000",
                 event_time=index + 1, duration=1, operator_id="22222",
                 self_id="99999", risk_increment=35, risk_cap=70)
-        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 100)
+        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 70)
         cap["value"] = 10
-        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 60)
+        self.assertEqual((await plugin.get_profile_tags_with_score("22222"))["score"], 10)
 
     async def test_mute_load_failure_does_not_overwrite_persisted_evidence(self):
         plugin = self.make_plugin()

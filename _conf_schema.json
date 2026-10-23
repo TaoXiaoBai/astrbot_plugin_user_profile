@@ -67,7 +67,7 @@
         "description": "排名最低风险分",
         "type": "int",
         "default": 0,
-        "hint": "只展示风险分达到该值且确有记录材料的用户，运行时限制 0-100。无证据用户不会因默认基准分进入榜单；材料不足或语义尚未分析也不代表低风险。"
+        "hint": "只展示风险分达到该值且确有记录材料的用户，运行时限制 0-100。无标签且无禁言风险时分数为未知并排除；0 分表示已有材料但未命中正权重风险，不等于没有记录或绝对安全。"
       }
     }
   },
@@ -383,7 +383,9 @@
       "tag_link_threshold": {"description": "链接消息占比", "type": "float", "default": 0.3, "hint": "含链接次数占总消息比例达到此值时标记 link_spammer；范围建议 0-1，例如 0.3 表示 30%。"},
       "tag_mention_threshold": {"description": "@消息占比", "type": "float", "default": 0.3, "hint": "检测到 @ 的次数占总消息比例达到此值时标记 mention_heavy；范围建议 0-1。"},
       "tag_verbose_threshold": {"description": "平均消息长度", "type": "int", "default": 80, "hint": "平均每条消息字符数达到此值时标记 verbose，单位为字符。"},
-      "tag_night_threshold": {"description": "夜间发言占比", "type": "float", "default": 0.3, "hint": "本机时间 0:00-5:59 的消息占比达到此值时标记 night_active；范围建议 0-1。"}
+      "tag_night_threshold": {"description": "夜间发言占比", "type": "float", "default": 0.3, "hint": "本机时间 0:00-5:59 的消息占比达到此值时标记 night_active；范围建议 0-1。"},
+      "tag_behavior_min_samples": {"description": "行为标签最小样本数", "type": "int", "default": 10, "hint": "图片、链接、二维码、@、平均长度和夜间比例至少积累这么多实时采集消息后才打标，避免一条消息被当成长期行为；运行时限制 1-10000。"},
+      "tag_qr_min_count": {"description": "二维码标签最少次数", "type": "int", "default": 2, "hint": "达到行为最小样本数后，仍需检测到至少这么多次二维码相关内容才标记 qr_spammer；运行时限制 1-1000。"}
     }
   },
   "risk": {
@@ -394,8 +396,12 @@
         "description": "标签风险权重",
         "type": "string",
         "default": "",
-        "hint": "JSON 对象字符串，例如 {\"ban_history\":40,\"normal\":-15}。仅接受内置标签的有限数值；未知标签、非数值、NaN 和 Infinity 会忽略并回退对应内置权重。"
+        "hint": "JSON 对象字符串，例如 {\"ban_history\":40,\"scam_suspect\":45}。只接受内置标签的有限数值；负数按 0，不再支持负信任分。未知标签、非数值、NaN 和 Infinity 忽略该项并保留对应内置权重。"
       },
+      "risk_semantic_cap": {"description": "语义风险分上限", "type": "int", "default": 60, "hint": "诈骗、广告、刷屏、挑衅等 LLM 语义标签合计最多贡献的分数，运行时限制 0-100；避免同一材料通过多个相似标签无限叠加。"},
+      "risk_behavior_cap": {"description": "行为风险分上限", "type": "int", "default": 15, "hint": "二维码、链接、图片及其他被自定义为正值的弱行为标签合计最多贡献的分数，运行时限制 0-100。"},
+      "management_resolution_decay_days": {"description": "普通结清历史衰减天数", "type": "int", "default": 30, "hint": "普通解封、处罚到期或好友恢复后，结清快照内的历史拉黑/删好友/禁言风险线性衰减到 0 的天数；0 表示立即不计，较大值可长期保留。原始事件不会删除，快照外新事件会重新计分。"},
+      "management_appeal_clear_history": {"description": "申诉通过立即结清历史", "type": "bool", "default": true, "hint": "开启后，可信插件传入的申诉通过/误封结清会立即冲销快照内拉黑、bot 删除好友及禁言历史风险；原始管理事件仍保留展示。关闭后按普通结清衰减。"},
       "risk_level_low": {"description": "低到中分界", "type": "int", "default": 30, "hint": "风险分达到此值显示为“中”，范围建议 0-100，并应低于高风险分界。"},
       "risk_level_high": {"description": "中到高分界", "type": "int", "default": 60, "hint": "风险分达到此值显示为“高”，范围建议 0-100，并应位于低与极高分界之间。"},
       "risk_level_extreme": {"description": "高到极高分界", "type": "int", "default": 80, "hint": "风险分达到此值显示为“极高”，范围建议 0-100，并应高于高风险分界。"}

@@ -49,6 +49,21 @@ except ImportError:
     )
 
 try:
+    from .risk_scoring import (
+        calculate_mute_components,
+        calculate_tag_components,
+        merged_weights,
+        risk_level,
+    )
+except ImportError:
+    from risk_scoring import (
+        calculate_mute_components,
+        calculate_tag_components,
+        merged_weights,
+        risk_level,
+    )
+
+try:
     from astrbot.core import sp
 except Exception:  # 内部模块缺失时前科联动自动关闭
     sp = None
@@ -87,6 +102,10 @@ _MANAGEMENT_EVENT_TYPES = frozenset({
     "astrbot_banned", "astrbot_unbanned", "bot_deleted_friend",
     "friend_relation_missing", "friend_relation_restored",
 })
+_MANAGEMENT_RESOLUTIONS = frozenset({
+    "normal", "appeal_approved", "false_positive", "expired",
+})
+_MANAGEMENT_CLEAR_RESOLUTIONS = frozenset({"appeal_approved", "false_positive"})
 _LLM_CONTEXT_MARKER = "<!-- astrbot-user-profile-context -->"
 
 
@@ -120,7 +139,7 @@ _TAG_DISPLAY_NAMES = {
     "multi_group": "多群出现",
     "private_active": "私聊活跃",
     "ban_history": "黑名单记录",
-    "kick_history": "拉群前科",
+    "kick_history": "曾拉 bot 入群",
     "frequent_inviter": "频繁邀请",
     "inviter": "曾邀请进群",
     "invite_rejected": "邀请被拒",
@@ -148,35 +167,9 @@ _TAG_DISPLAY_NAMES = {
     "normal": "表现正常",
 }
 
-# 默认风险权重：正数为风险，负数为信任
-_RISK_WEIGHTS_DEFAULT = {
-    "ban_history": 40,
-    "invite_rejected": 25,
-    "kick_history": 25,
-    "frequent_inviter": 20,
-    "ad_suspect": 20,
-    "scam_suspect": 20,
-    "spam_suspect": 15,
-    "troll": 15,
-    "nsfw_tendency": 15,
-    "political_sensitive": 15,
-    "qr_spammer": 15,
-    "link_spammer": 10,
-    "image_spammer": 10,
-    "newcomer": 5,
-    "private_active": 5,
-    "night_active": 5,
-    "active_high": -5,
-    "active_medium": -5,
-    "helpful": -10,
-    "friendly": -10,
-    "normal": -15,
-}
-
-
 _POSITIVE_TAGS = frozenset({"friendly", "helpful", "normal"})
 _RISK_TAGS = frozenset({
-    "ban_history", "invite_rejected", "kick_history", "frequent_inviter",
+    "ban_history", "astrbot_banned", "bot_deleted_friend",
     "ad_suspect", "scam_suspect", "spam_suspect", "troll",
     "nsfw_tendency", "political_sensitive", "qr_spammer", "link_spammer",
     "image_spammer", "bot_mute_operator", "bot_mute_associated",
@@ -187,12 +180,17 @@ def _tag_display(tag: str) -> str:
     return _TAG_DISPLAY_NAMES.get(tag, tag)
 
 
-def _tag_visual_category(tag: str) -> str:
+def _tag_visual_category(tag: str, confidence: float = 1.0) -> str:
     if tag in _POSITIVE_TAGS:
         return "正向"
-    if tag in _RISK_TAGS:
+    if tag in _RISK_TAGS and confidence > 0:
         return "风险"
     return "行为"
+
+
+def _normalize_management_resolution(value: Any, default: str = "") -> str:
+    resolution = clean_text(value, 32).lower()
+    return resolution if resolution in _MANAGEMENT_RESOLUTIONS else default
 
 
 def _finite_float(value: Any, default: float | None = None) -> float | None:
@@ -205,27 +203,16 @@ def _finite_float(value: Any, default: float | None = None) -> float | None:
     return number if math.isfinite(number) else default
 
 
-def _risk_level(score: int, cfg: dict) -> str:
-    extreme = int(_finite_float(cfg.get("risk_level_extreme"), 80))
-    high = int(_finite_float(cfg.get("risk_level_high"), 60))
-    low = int(_finite_float(cfg.get("risk_level_low"), 30))
-    if score >= extreme:
-        return "极高"
-    if score >= high:
-        return "高"
-    if score >= low:
-        return "中"
-    return "低"
+def _risk_level(score: int | None, cfg: dict) -> str:
+    return risk_level(score, cfg)
 
 
-def _risk_color(score: int) -> str:
-    if score >= 80:
-        return "#d32f2f"
-    if score >= 60:
-        return "#f57c00"
-    if score >= 30:
-        return "#fbc02d"
-    return "#388e3c"
+def _risk_color(score: int, cfg: dict) -> str:
+    return {
+        "极高": "#d32f2f",
+        "高": "#f57c00",
+        "中": "#fbc02d",
+    }.get(_risk_level(score, cfg), "#388e3c")
 
 
 def _hex_rgb(value: str) -> tuple[int, int, int]:
@@ -378,8 +365,9 @@ class TagEngine:
             tags.append(self._tag("long_inactive", 0.75, "stats", f"最近发言 {_fmt_time(last_seen)}"))
 
         # 内容/行为信号只按插件自身完整采集样本计算比例；持久化历史
-        # 只补活跃度，不稀释实时采集的图片、链接、@、长度和夜间占比。
-        if observed_total > 0:
+        # 只补活跃度，不稀释实时采集比例。少量偶然消息不构成长期行为。
+        min_samples = self.config["tag_behavior_min_samples"]
+        if observed_total >= min_samples:
             images = int(st.get("images") or 0)
             links = int(st.get("links") or 0)
             qrs = int(st.get("qrs") or 0)
@@ -398,19 +386,20 @@ class TagEngine:
             mention_th = self.config["tag_mention_threshold"]
             verbose_th = self.config["tag_verbose_threshold"]
             night_th = self.config["tag_night_threshold"]
+            sample = f"（样本 {observed_total} 条）"
 
             if img_ratio >= img_th:
-                tags.append(self._tag("image_spammer", round(min(0.5 + img_ratio, 0.95), 2), "stats", f"图片消息占比 {img_ratio:.0%}"))
+                tags.append(self._tag("image_spammer", round(min(0.5 + img_ratio, 0.95), 2), "stats", f"图片消息占比 {img_ratio:.0%}{sample}"))
             if link_ratio >= link_th:
-                tags.append(self._tag("link_spammer", round(min(0.5 + link_ratio, 0.95), 2), "stats", f"含链接消息 {links} 条"))
-            if qrs > 0:
-                tags.append(self._tag("qr_spammer", 0.75, "stats", f"检测到二维码相关内容 {qrs} 次"))
+                tags.append(self._tag("link_spammer", round(min(0.5 + link_ratio, 0.95), 2), "stats", f"含链接消息 {links} 条{sample}"))
+            if qrs >= self.config["tag_qr_min_count"]:
+                tags.append(self._tag("qr_spammer", 0.75, "stats", f"检测到二维码相关内容 {qrs} 次{sample}"))
             if mention_ratio >= mention_th:
-                tags.append(self._tag("mention_heavy", round(min(0.5 + mention_ratio, 0.95), 2), "stats", f"含@消息 {mentions} 条"))
+                tags.append(self._tag("mention_heavy", round(min(0.5 + mention_ratio, 0.95), 2), "stats", f"含@消息 {mentions} 条{sample}"))
             if avg_len >= verbose_th:
-                tags.append(self._tag("verbose", 0.7, "stats", f"平均消息长度 {avg_len:.0f} 字"))
+                tags.append(self._tag("verbose", 0.7, "stats", f"平均消息长度 {avg_len:.0f} 字{sample}"))
             if night_ratio >= night_th:
-                tags.append(self._tag("night_active", round(min(0.5 + night_ratio, 0.9), 2), "stats", f"夜间发言 {night_count} 条"))
+                tags.append(self._tag("night_active", round(min(0.5 + night_ratio, 0.9), 2), "stats", f"夜间发言 {night_count} 条{sample}"))
 
         # 风险前科标签
         invite_records = guard_records.get("invite") or {}
@@ -655,7 +644,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.14.0",
+    "1.16.1",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -825,7 +814,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         analysis = cached_view(self, qq, event, injection=True)
         ban_lines = await self._load_ban_entry(qq)
         snapshot = self._assemble_lightweight_snapshot(
-            qq, st, {}, ban_lines, llm_tags=analysis["tags"]
+            qq, st, {}, ban_lines, llm_tags=analysis["tags"],
+            risk_scope=str(analysis.get("scene") or "group"),
         )
         tags = snapshot["tags"]
         seen = set()
@@ -847,7 +837,13 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 or scene_for(self, qq, event, injection=True) == "fused"):
             return ""
         score = snapshot["score"]
-        lines = [f"QQ：{qq}", f"风险：{score}/100（{snapshot['level']}）"]
+        scope = snapshot.get("risk_scope")
+        scope_text = "群私融合证据" if scope == "fused" else ("私聊证据" if scope == "private" else "群聊公开证据")
+        risk_text = (
+            f"风险：{score}/100（{snapshot['level']}，{scope_text}）"
+            if score is not None else "风险：未知（暂无足够风险证据，不等于安全）"
+        )
+        lines = [f"QQ：{qq}", risk_text]
         for label, value in conversation_sections(self, qq, event):
             lines.append(f"{label}：{clean_text(value, 240)}")
         if not relations:
@@ -1787,7 +1783,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 guard_by_user.get(qq, {"invite": {}, "join": {}, "mute": {}}),
                 ban_entries.get(qq, []) if isinstance(ban_entries, dict) else [],
             )
-            if snapshot.get("has_evidence") and snapshot["score"] >= min_score:
+            score = snapshot.get("score")
+            if snapshot.get("has_evidence") and score is not None and score >= min_score:
                 rows.append(snapshot)
         rows.sort(key=lambda item: (-item["score"], int(item["qq"])))
 
@@ -1830,7 +1827,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
 
     def _assemble_lightweight_snapshot(
         self, qq: str, st: dict, guard_records: dict, ban_lines: list,
-        llm_tags: list[dict] | None = None,
+        llm_tags: list[dict] | None = None, risk_scope: str = "group",
     ) -> dict:
         st = st if isinstance(st, dict) else {}
         cached = cached_view(self, qq, scene="group")
@@ -1847,7 +1844,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             if name not in unique or _finite_float(item.get("confidence"), 0) > _finite_float(unique[name].get("confidence"), 0):
                 unique[name] = item
         tags = sorted(unique.values(), key=lambda item: _finite_float(item.get("confidence"), 0), reverse=True)
-        score = self._score_tags(qq, tags)
+        assessment = self._risk_assessment(qq, tags, scope=risk_scope)
         total = _effective_group_count(st) + max(0, int(_finite_float(st.get("p_count"), 0)))
         has_social = bool(
             st.get("friend_add_time") or st.get("friend_request_comment")
@@ -1856,6 +1853,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         has_evidence = bool(
             total or tags or has_social or self._personal_mute_events(qq)
             or (self._management_account(qq).get("events") or []) or ban_lines
+            or assessment.get("score") is not None
         )
         weights = self._risk_weights()
         risk_tags = sorted(
@@ -1883,7 +1881,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             0,
         ))
         return {
-            "qq": qq, "score": score, "level": _risk_level(score, self.config),
+            "qq": qq, **assessment,
             "tags": tags, "evidence": evidence,
             "semantic_time": cache_time,
             "semantic_status": "已缓存" if semantic_ready else "尚未分析",
@@ -1896,9 +1894,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def _ranking_model_to_text(self, model: dict) -> str:
         scope = f"本群 {model.get('group_id')}（按已记录群关联）" if model.get("scope") == "本群" else "全部已记录用户"
         lines = [
-            "【已记录用户风险快照】",
+            "【群聊公开证据风险快照】",
             f"范围：{scope}｜第 {model.get('page', 1)}/{model.get('pages', 1)} 页｜共 {model.get('total', 0)} 人",
-            "仅供管理员排查，不是实时群成员榜，也不构成事实定罪。",
+            "仅供管理员排查；不纳入私聊语义，不是实时群成员榜或风险概率。",
         ]
         if model.get("out_of_range"):
             lines.append(f"页码超出范围；最大页码为 {model.get('pages', 1)}。")
@@ -1946,7 +1944,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             image = PILImage.new("RGB", (width, height), (246, 248, 252))
             draw = ImageDraw.Draw(image)
             draw.rounded_rectangle((24, 22, width - 24, height - 22), radius=18, fill="white", outline=(221, 227, 235))
-            draw.text((padding, 42), "管理员画像风险排名", fill=(31, 45, 61), font=title_font)
+            draw.text((padding, 42), "群聊公开证据风险排名", fill=(31, 45, 61), font=title_font)
             y = 92
             for row in rows[1:]:
                 draw.text((padding, y), row, fill=(54, 63, 73), font=body_font)
@@ -2082,16 +2080,25 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
 
         result = await self.get_profile_tags_with_score(qq, event)
         tags = result.get("tags") or []
-        if not tags:
+        if not tags and result.get("score") is None:
             return f"QQ {qq} 暂无画像记录。"
-        lines = [f"QQ {qq} 的综合风险分：{result['score']}（{result['level']}）"]
+        scope_label = {
+            "fused": "群私融合证据", "private": "私聊证据",
+        }.get(result.get("risk_scope"), "群聊公开证据")
+        score = result.get("score")
+        risk_text = (
+            f"风险关注分 {score}/100（{result['level']}，{scope_label}）"
+            if score is not None else f"风险未知（资料不足，不等于安全，{scope_label}）"
+        )
+        lines = [f"QQ {qq} 的{risk_text}"]
         impression = clean_text(result.get("impression"), 240)
         traits = [clean_text(value, 48) for value in result.get("traits", []) if clean_text(value, 48)]
         if impression:
             lines.append(f"人物印象：{impression}")
         if traits:
             lines.append("人格/行为分析：" + "、".join(traits[:5]))
-        lines.append("标签：")
+        if tags:
+            lines.append("标签：")
         for tag in tags:
             evidence = clean_text(tag.get("evidence"), 160)
             line = f"- {_tag_display(tag['tag'])}（置信度 {tag['confidence']}，来源 {tag['source']}）"
@@ -2159,20 +2166,26 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         tag_models = []
         for item in tags:
             tag = str(item.get("tag") or "")
-            category = _tag_visual_category(tag)
             confidence = max(0.0, min(1.0, _finite_float(item.get("confidence"), 0.0)))
+            category = _tag_visual_category(tag, confidence)
             tag_models.append({
                 "text": f"{category} · {_tag_display(tag)} {int(confidence * 100)}%",
                 "category": category,
             })
-        has_record = bool(tags or social_lines or criminal_lines or g_count or p_count or quotes)
+        has_record = bool(
+            tags or social_lines or criminal_lines or g_count or p_count or quotes
+            or result.get("score") is not None
+        )
         return {
             "qq": qq,
             "nickname": nickname,
             "avatar_bytes": avatar_bytes,
             "has_record": has_record,
-            "score": int(result.get("score") or 0) if tags else None,
-            "level": clean_text(result.get("level"), 10) if tags else "暂无",
+            "score": result.get("score"),
+            "level": clean_text(result.get("level"), 10) or "未知",
+            "risk_status": result.get("risk_status", "no_evidence"),
+            "risk_components": dict(result.get("risk_components") or {}),
+            "risk_scope": str(result.get("risk_scope") or result.get("scene") or "group"),
             "tags": tag_models,
             "impression": clean_text(result.get("impression"), 240),
             "sections": result.get("sections", {}),
@@ -2195,8 +2208,26 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if not model.get("has_record"):
             lines.append("暂无记录：未采集到该用户的发言，也没有前科或好友/进群记录。")
             return "\n".join(lines)
-        if model.get("score") is not None:
-            lines.append(f"综合风险：{model['score']} / 100（{model['level']}）")
+        score = model.get("score")
+        if score is not None:
+            scope_label = {
+                "fused": "综合风险（群私融合证据）",
+                "private": "私聊证据风险",
+            }.get(model.get("risk_scope"), "群聊公开证据风险")
+            lines.append(f"{scope_label}：{score} / 100（{model['level']}）")
+            component_labels = {
+                "verified": "管理证据", "semantic": "语义", "behavior": "行为",
+                "mute_operator": "直接禁言", "mute_associated": "关联禁言",
+            }
+            parts = [
+                f"{label} {int(model.get('risk_components', {}).get(key, 0))}"
+                for key, label in component_labels.items()
+                if int(model.get("risk_components", {}).get(key, 0) or 0) > 0
+            ]
+            if parts:
+                lines.append("风险构成：" + " · ".join(parts))
+        else:
+            lines.append("风险：未知（暂无足够风险证据，不等于安全）")
         if model.get("tags"):
             lines.append("画像标签：" + " | ".join(item["text"] for item in model["tags"]))
         lines.append(("整体印象：" if model.get("sections") else "人物印象：") + (model.get("impression") or "暂无足够语义材料"))
@@ -2246,7 +2277,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             measure = ImageDraw.Draw(scratch)
 
             score = model.get("score")
-            accent = _hex_rgb(_risk_color(score)) if isinstance(score, int) and not isinstance(score, bool) else (111, 139, 174)
+            accent = _hex_rgb(_risk_color(score, cfg)) if isinstance(score, int) and not isinstance(score, bool) else (111, 139, 174)
             text_width = content_width - 56
 
             # 第一遍：按开关预算每个模块的内容高度，模块为 (类型, 标题, 数据, 内容高度)。
@@ -2464,13 +2495,170 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
 
     @staticmethod
     def _new_management_account() -> dict:
-        return {"events": [], "seen": [], "counts": {}, "last_time": 0}
+        return {
+            "events": [], "seen": [], "counts": {}, "last_time": 0,
+            "event_seq": 0,
+            "last_ban_seq": 0, "last_ban_time": 0,
+            "last_unban_seq": 0, "last_unban_time": 0, "unban_resolution": "",
+            "last_friend_delete_seq": 0, "last_friend_delete_time": 0,
+            "last_friend_restore_seq": 0, "last_friend_restore_time": 0,
+            "appeal_seq": 0, "appeal_time": 0, "appeal_resolution": "",
+            "mute_resolution": {}, "appeal_mute_resolution": {},
+        }
 
     def _management_account(self, qq: str) -> dict:
         if not isinstance(self._management_events, dict):
             return self._new_management_account()
         value = self._management_events.get(str(qq))
         return value if isinstance(value, dict) else self._new_management_account()
+
+    @staticmethod
+    def _management_resolution_label(resolution: str) -> str:
+        return {
+            "normal": "普通解封",
+            "appeal_approved": "申诉通过",
+            "false_positive": "误封确认",
+            "expired": "处罚到期",
+        }.get(str(resolution or ""), "")
+
+    @staticmethod
+    def _normalize_mute_resolution(value: Any) -> dict:
+        if not isinstance(value, dict) or not value:
+            return {}
+        raw_effects = value.get("effects") if isinstance(value.get("effects"), dict) else {}
+        effects = {
+            role: max(0, int(_finite_float(raw_effects.get(role), 0)))
+            for role in ("mute_operator", "mute_associated")
+        }
+        keys = list(dict.fromkeys(
+            clean_text(item, 160)
+            for item in value.get("event_keys", [])
+            if isinstance(item, str) and clean_text(item, 160)
+        ))[:500] if isinstance(value.get("event_keys"), list) else []
+        return {
+            "time": max(0, int(_finite_float(value.get("time"), 0))),
+            "resolution": _normalize_management_resolution(
+                value.get("resolution"), "normal"
+            ),
+            "effects": effects,
+            "event_keys": keys,
+        }
+
+    def _capture_mute_resolution(self, qq: str, timestamp: int, resolution: str) -> dict:
+        effects = {"mute_operator": 0, "mute_associated": 0}
+        event_keys = []
+        for item in self._personal_mute_events(qq):
+            event_time = max(0, int(_finite_float(item.get("time"), 0)))
+            if timestamp and event_time > timestamp:
+                continue
+            role = "mute_operator" if item.get("attribution") == "operator" else "mute_associated"
+            effects[role] += max(0, min(100, int(_finite_float(item.get("risk_increment"), 0))))
+            event_key = clean_text(item.get("event_key"), 160)
+            if event_key:
+                event_keys.append(event_key)
+        return {
+            "time": timestamp, "resolution": resolution,
+            "effects": effects, "event_keys": event_keys[:500],
+        }
+
+    @staticmethod
+    def _apply_management_record_state(account: dict, record: dict) -> None:
+        event_type = str(record.get("type") or "")
+        seq = max(0, int(_finite_float(record.get("seq"), 0)))
+        timestamp = max(0, int(_finite_float(record.get("time"), 0)))
+        if seq > int(_finite_float(account.get("event_seq"), 0)):
+            account["event_seq"] = seq
+        if event_type == "astrbot_banned" and seq >= int(_finite_float(account.get("last_ban_seq"), 0)):
+            account["last_ban_seq"] = seq
+            account["last_ban_time"] = timestamp
+        elif event_type == "astrbot_unbanned" and seq >= int(_finite_float(account.get("last_unban_seq"), 0)):
+            account["last_unban_seq"] = seq
+            account["last_unban_time"] = timestamp
+            resolution = _normalize_management_resolution(record.get("resolution"), "normal")
+            account["unban_resolution"] = resolution
+            snapshot = UserProfilePlugin._normalize_mute_resolution(
+                record.get("mute_resolution")
+            ) or {
+                "time": timestamp, "resolution": resolution,
+                "effects": {"mute_operator": 0, "mute_associated": 0},
+                "event_keys": [],
+            }
+            account["mute_resolution"] = copy.deepcopy(snapshot)
+            if resolution in _MANAGEMENT_CLEAR_RESOLUTIONS:
+                account["appeal_seq"] = seq
+                account["appeal_time"] = timestamp
+                account["appeal_resolution"] = resolution
+                account["appeal_mute_resolution"] = copy.deepcopy(snapshot)
+        elif event_type == "bot_deleted_friend" and seq >= int(_finite_float(account.get("last_friend_delete_seq"), 0)):
+            account["last_friend_delete_seq"] = seq
+            account["last_friend_delete_time"] = timestamp
+        elif event_type == "friend_relation_restored" and seq >= int(_finite_float(account.get("last_friend_restore_seq"), 0)):
+            account["last_friend_restore_seq"] = seq
+            account["last_friend_restore_time"] = timestamp
+
+    def _management_history_factor(
+        self, qq: str, event_type: str, now: int | None = None
+    ) -> dict:
+        account = self._management_account(qq)
+        counts = account.get("counts") if isinstance(account.get("counts"), dict) else {}
+        count = max(0, int(_finite_float(counts.get(event_type), 0)))
+        if not count:
+            return {"factor": 0.0, "status": "none", "resolution": "", "resolved_at": 0}
+
+        appeal_seq = max(0, int(_finite_float(account.get("appeal_seq"), 0)))
+        appeal_resolution = _normalize_management_resolution(account.get("appeal_resolution"))
+        if event_type == "astrbot_banned":
+            offense_seq = max(0, int(_finite_float(account.get("last_ban_seq"), 0)))
+            resolution_seq = max(0, int(_finite_float(account.get("last_unban_seq"), 0)))
+            resolved_at = max(0, int(_finite_float(account.get("last_unban_time"), 0)))
+            resolution = _normalize_management_resolution(
+                account.get("unban_resolution"), "normal"
+            )
+        elif event_type == "bot_deleted_friend":
+            offense_seq = max(0, int(_finite_float(account.get("last_friend_delete_seq"), 0)))
+            resolution_seq = max(0, int(_finite_float(account.get("last_friend_restore_seq"), 0)))
+            resolved_at = max(0, int(_finite_float(account.get("last_friend_restore_time"), 0)))
+            resolution = "friend_restored"
+        else:
+            return {"factor": 0.0, "status": "none", "resolution": "", "resolved_at": 0}
+
+        if (
+            appeal_seq > offense_seq
+            and appeal_resolution in _MANAGEMENT_CLEAR_RESOLUTIONS
+        ):
+            if self.config.get("management_appeal_clear_history", True):
+                return {
+                    "factor": 0.0, "status": "appeal_cleared",
+                    "resolution": appeal_resolution,
+                    "resolved_at": max(0, int(_finite_float(account.get("appeal_time"), 0))),
+                }
+            if event_type == "bot_deleted_friend" and resolution_seq <= offense_seq:
+                # 关闭立即结清后，申诉/误封对删除好友历史也按普通衰减处理。
+                resolution_seq = appeal_seq
+                resolved_at = max(0, int(_finite_float(account.get("appeal_time"), 0)))
+                resolution = appeal_resolution or "normal"
+        # 明细截断后 offense_seq 可能不可见；可见结清事件仍可结清旧 count。
+        if resolution_seq <= offense_seq and offense_seq:
+            return {"factor": 1.0, "status": "unresolved", "resolution": "", "resolved_at": 0}
+        if not resolution_seq:
+            return {"factor": 1.0, "status": "unresolved", "resolution": "", "resolved_at": 0}
+
+        days = max(0, int(_finite_float(
+            self.config.get("management_resolution_decay_days"), 30
+        )))
+        if days <= 0:
+            factor = 0.0
+        else:
+            current = max(0, int(_finite_float(now, int(time.time()))))
+            elapsed = max(0, current - resolved_at)
+            factor = max(0.0, 1.0 - elapsed / (days * 86400))
+        factor = round(factor, 2)
+        return {
+            "factor": factor,
+            "status": "decaying" if factor > 0 else "resolved",
+            "resolution": resolution,
+            "resolved_at": resolved_at,
+        }
 
     def _has_management_type(self, qq: str, event_type: str) -> bool:
         return int((self._management_account(qq).get("counts") or {}).get(event_type) or 0) > 0
@@ -2488,7 +2676,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         for item in events[-limit:]:
             if not isinstance(item, dict):
                 continue
-            line = labels.get(str(item.get("type") or ""), "")
+            event_type = str(item.get("type") or "")
+            line = labels.get(event_type, "")
             if not line:
                 continue
             reason = clean_text(item.get("reason"), 160)
@@ -2498,6 +2687,25 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 details.append(f"群 {group_id}")
             if reason:
                 details.append(f"原因：{reason}")
+            if event_type == "astrbot_unbanned":
+                resolution_label = self._management_resolution_label(
+                    _normalize_management_resolution(item.get("resolution"), "normal")
+                )
+                if resolution_label:
+                    details.append(f"结清类型：{resolution_label}")
+                state = self._management_history_factor(qq, "astrbot_banned")
+                if state.get("status") == "appeal_cleared":
+                    details.append("历史风险已结清")
+                elif state.get("status") == "decaying":
+                    details.append(f"历史风险剩余 {float(state.get('factor') or 0):.0%}")
+                elif state.get("status") == "resolved":
+                    details.append("历史风险已归零")
+            elif event_type == "friend_relation_restored":
+                state = self._management_history_factor(qq, "bot_deleted_friend")
+                if state.get("status") == "decaying":
+                    details.append(f"删除好友历史风险剩余 {float(state.get('factor') or 0):.0%}")
+                elif state.get("status") in ("resolved", "appeal_cleared"):
+                    details.append("删除好友历史风险已结清")
             details.append(_fmt_time(item.get("time")))
             lines.append(line + "（" + "，".join(details) + "）")
         return lines
@@ -2513,20 +2721,63 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         tags = []
         for event_type, template in labels.items():
             count = max(0, int(_finite_float(counts.get(event_type), 0)))
-            if count:
-                tags.append({
-                    "tag": event_type, "confidence": 1.0,
-                    "source": "management_event",
-                    "evidence": template.format(count=count),
-                })
+            if not count:
+                continue
+            confidence = 1.0
+            state_text = ""
+            if event_type in ("astrbot_banned", "bot_deleted_friend"):
+                state = self._management_history_factor(qq, event_type)
+                confidence = float(state.get("factor") or 0)
+                status = state.get("status")
+                resolved_at = int(state.get("resolved_at") or 0)
+                if status == "appeal_cleared":
+                    label = self._management_resolution_label(state.get("resolution"))
+                    state_text = f"{label or '申诉/误封'}结清，历史风险已归零（{_fmt_time(resolved_at)}）"
+                elif status == "decaying":
+                    label = self._management_resolution_label(state.get("resolution")) or "好友恢复"
+                    state_text = f"{label}后历史风险剩余 {confidence:.0%}（{_fmt_time(resolved_at)}）"
+                elif status == "resolved":
+                    state_text = f"已结清，历史风险已归零（{_fmt_time(resolved_at)}）"
+                else:
+                    state_text = "尚未结清，按完整历史风险计"
+            tags.append({
+                "tag": event_type, "confidence": round(confidence, 2),
+                "source": "management_event",
+                "evidence": template.format(count=count) + (f"；{state_text}" if state_text else ""),
+            })
         return tags
+
+    async def get_management_state(self, qq: str) -> dict:
+        """可信只读 API：返回管理事件结清状态，不校验聊天权限。"""
+        qq = str(qq or "").strip()
+        if not self._enabled() or not re.fullmatch(r"\d{5,12}", qq):
+            return {}
+        await self._ensure_loaded()
+        account = self._management_account(qq)
+        counts = dict(account.get("counts") or {})
+        factors = {
+            event_type: self._management_history_factor(qq, event_type)
+            for event_type in ("astrbot_banned", "bot_deleted_friend")
+        }
+        return {
+            "counts": counts,
+            "last_ban_time": max(0, int(_finite_float(account.get("last_ban_time"), 0))),
+            "last_unban_time": max(0, int(_finite_float(account.get("last_unban_time"), 0))),
+            "unban_resolution": _normalize_management_resolution(account.get("unban_resolution")),
+            "last_friend_delete_time": max(0, int(_finite_float(account.get("last_friend_delete_time"), 0))),
+            "last_friend_restore_time": max(0, int(_finite_float(account.get("last_friend_restore_time"), 0))),
+            "appeal_time": max(0, int(_finite_float(account.get("appeal_time"), 0))),
+            "appeal_resolution": _normalize_management_resolution(account.get("appeal_resolution")),
+            "risk_factors": factors,
+            "mute_resolution": self._mute_resolution_for_scoring(qq),
+        }
 
     async def record_management_event(
         self, qq: str, *, event_key: str, event_type: str, source: str,
         event_time: int, group_id: str = "", reason: str = "",
         duration: int | None = None, result: str = "success",
         event_created_at_ms: int | None = None,
-        expected_generation: int | None = None,
+        expected_generation: int | None = None, resolution: str = "",
     ) -> dict:
         if not self._enabled():
             return {"status": "disabled"}
@@ -2535,12 +2786,17 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         event_type = clean_text(event_type, 48)
         source = clean_text(source, 64)
         result = clean_text(result, 24).lower()
+        resolution = clean_text(resolution, 32).lower()
         if (
             not re.fullmatch(r"\d{5,12}", qq) or not event_key
             or event_type not in _MANAGEMENT_EVENT_TYPES or not source
             or result != "success"
+            or (resolution and resolution not in _MANAGEMENT_RESOLUTIONS)
+            or (resolution and event_type != "astrbot_unbanned")
         ):
             return {"status": "invalid"}
+        if event_type == "astrbot_unbanned" and not resolution:
+            resolution = "normal"
         try:
             timestamp = max(0, int(event_time))
             created_at_ms = max(0, int(event_created_at_ms or 0))
@@ -2574,13 +2830,30 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             if len(seen) >= _MUTE_SEEN_LEDGER_LIMIT:
                 return {"status": "failure", "error": "seen_ledger_full"}
             previous = copy.deepcopy(account)
+            existing_events = account.get("events") if isinstance(account.get("events"), list) else []
+            max_record_seq = max(
+                [0] + [max(0, int(_finite_float(item.get("seq"), 0))) for item in existing_events if isinstance(item, dict)]
+            )
+            total_count = sum(
+                max(0, int(_finite_float(value, 0)))
+                for value in (account.get("counts") or {}).values()
+            ) if isinstance(account.get("counts"), dict) else 0
+            next_seq = max(
+                int(_finite_float(account.get("event_seq"), 0)), max_record_seq, total_count
+            ) + 1
             record = {
                 "event_key": event_key, "type": event_type, "source": source,
                 "time": timestamp, "group_id": clean_text(group_id, 32),
                 "reason": clean_text(reason, 200), "duration": seconds,
                 "result": "success", "created_at_ms": created_at_ms,
+                "resolution": resolution, "seq": next_seq,
             }
+            if event_type == "astrbot_unbanned":
+                record["mute_resolution"] = self._capture_mute_resolution(
+                    qq, timestamp, resolution
+                )
             account.setdefault("events", []).append(record)
+            self._apply_management_record_state(account, record)
             if len(account["events"]) > self.config["mute_event_keep"]:
                 del account["events"][:-self.config["mute_event_keep"]]
             seen.append(event_key)
@@ -2688,15 +2961,13 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 return {"status": "duplicate"}
             if len(seen) >= _MUTE_SEEN_LEDGER_LIMIT:
                 return {"status": "failure", "error": "seen_ledger_full"}
-            previous_account = {
-                "events": list(account.get("events") or []),
-                "seen": list(seen),
-                "risk_total": int(_finite_float(account.get("risk_total"), 0)),
-                "operator_count": int(_finite_float(account.get("operator_count"), 0)),
-                "associated_count": int(_finite_float(account.get("associated_count"), 0)),
-                "last_risk_cap": int(_finite_float(account.get("last_risk_cap"), 70)),
-                "last_time": int(_finite_float(account.get("last_time"), 0)),
-            }
+            previous_account = copy.deepcopy(account)
+            if int(_finite_float(account.get("risk_schema_version"), 1)) < 2:
+                account["risk_schema_version"] = 2
+                account["legacy_risk_total"] = max(0, int(_finite_float(account.get("risk_total"), 0)))
+                account["legacy_has_operator"] = int(_finite_float(account.get("operator_count"), 0)) > 0
+                account["operator_risk_total"] = 0
+                account["associated_risk_total"] = 0
             event_record = {
                 "event_key": event_key, "group_id": group_id, "time": timestamp,
                 "duration": seconds, "operator_id": operator_id,
@@ -2708,7 +2979,10 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             del events[:-self.config["mute_event_keep"]]
             seen.append(event_key)
             account["risk_total"] = max(0, int(account.get("risk_total") or 0)) + increment
-            count_key = "operator_count" if attribution == "operator" else "associated_count"
+            role = "operator" if attribution == "operator" else "associated"
+            risk_key = role + "_risk_total"
+            count_key = role + "_count"
+            account[risk_key] = max(0, int(_finite_float(account.get(risk_key), 0))) + increment
             account[count_key] = max(0, int(account.get(count_key) or 0)) + 1
             account["last_risk_cap"] = cap
             account["last_time"] = timestamp
@@ -2759,6 +3033,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def _new_mute_account() -> dict:
         return {
             "events": [], "seen": [], "risk_total": 0,
+            "risk_schema_version": 2,
+            "legacy_risk_total": 0, "legacy_has_operator": False,
+            "operator_risk_total": 0, "associated_risk_total": 0,
             "operator_count": 0, "associated_count": 0,
             "last_risk_cap": 70, "last_time": 0,
         }
@@ -2776,24 +3053,71 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             return []
         return [item for item in events if self._valid_persisted_mute_event(qq, item)]
 
-    def _mute_event_risk(self, qq: str) -> int:
+    def _mute_resolution_for_scoring(self, qq: str, now: int | None = None) -> dict:
+        account = self._management_account(qq)
+        appeal = self._normalize_mute_resolution(
+            account.get("appeal_mute_resolution")
+        )
+        use_appeal = bool(
+            appeal and self.config.get("management_appeal_clear_history", True)
+        )
+        snapshot = appeal if use_appeal else self._normalize_mute_resolution(
+            account.get("mute_resolution")
+        )
+        effects = snapshot.get("effects") if snapshot else {
+            "mute_operator": 0, "mute_associated": 0,
+        }
+        resolution = str(snapshot.get("resolution") or "") if snapshot else ""
+        resolved_at = int(snapshot.get("time") or 0) if snapshot else 0
+        if use_appeal:
+            factor = 0.0
+        elif not snapshot:
+            factor = 1.0
+        else:
+            days = max(0, int(_finite_float(
+                self.config.get("management_resolution_decay_days"), 30
+            )))
+            if days <= 0:
+                factor = 0.0
+            else:
+                current = max(0, int(_finite_float(now, int(time.time()))))
+                elapsed = max(0, current - resolved_at)
+                factor = max(0.0, 1.0 - elapsed / (days * 86400))
+        return {
+            "effects": effects,
+            "factor": round(max(0.0, min(1.0, factor)), 2),
+            "resolution": resolution,
+            "resolved_at": resolved_at,
+            "event_count": len(snapshot.get("event_keys") or []) if snapshot else 0,
+        }
+
+    def _mute_event_components(self, qq: str) -> dict[str, int]:
         account = self._personal_mute_account(qq)
-        total = max(0, int(_finite_float(account.get("risk_total"), 0)))
-        if not total:
-            return 0
-        cap = max(0, min(100, int(_finite_float(
+        operator_cap = max(0, min(100, int(_finite_float(
             account.get("last_risk_cap"), 70
         ))))
+        associated_cap = 20
         try:
             guard_md = self.context.get_registered_star(INVITE_GUARD_STAR_NAME)
             guard = getattr(guard_md, "star_cls", None) if guard_md else None
             if guard is not None and hasattr(guard, "_cfg"):
-                cap = max(0, min(100, int(_finite_float(
-                    guard._cfg("mute_revenge", "profile_mute_risk_cap", cap), cap
+                operator_cap = max(0, min(100, int(_finite_float(
+                    guard._cfg("mute_revenge", "profile_mute_risk_cap", operator_cap), operator_cap
+                ))))
+                associated_cap = max(0, min(100, int(_finite_float(
+                    guard._cfg("mute_revenge", "profile_mute_associated_risk_cap", 20), 20
                 ))))
         except Exception:
             pass
-        return min(cap, total)
+        resolution = self._mute_resolution_for_scoring(qq)
+        return calculate_mute_components(
+            account, operator_cap, associated_cap,
+            resolution_effects=resolution["effects"],
+            resolution_factor=resolution["factor"],
+        )
+
+    def _mute_event_risk(self, qq: str) -> int:
+        return sum(self._mute_event_components(str(qq)).values())
 
     def _format_personal_mute_events(self, qq: str) -> list[str]:
         lines = []
@@ -2832,27 +3156,57 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         account = self._personal_mute_account(qq)
         operator_count = max(0, int(_finite_float(account.get("operator_count"), 0)))
         associated_count = max(0, int(_finite_float(account.get("associated_count"), 0)))
+        resolution = self._mute_resolution_for_scoring(qq)
+        raw = calculate_mute_components(account, 100, 100)
+        adjusted = calculate_mute_components(
+            account, 100, 100,
+            resolution_effects=resolution["effects"],
+            resolution_factor=resolution["factor"],
+        )
+        resolution_label = self._management_resolution_label(
+            resolution.get("resolution")
+        )
         tags = []
-        if operator_count:
+        for role, count, tag, evidence in (
+            (
+                "mute_operator", operator_count, "bot_mute_operator",
+                f"有 {operator_count} 次可验证的亲自禁言 bot 记录",
+            ),
+            (
+                "mute_associated", associated_count, "bot_mute_associated",
+                f"有 {associated_count} 次所邀请群发生 bot 被禁言的关联责任记录",
+            ),
+        ):
+            if not count:
+                continue
+            confidence = (
+                round(adjusted[role] / raw[role], 2) if raw[role] > 0 else 1.0
+            )
+            effect = int(resolution["effects"].get(role) or 0)
+            if effect > 0 and resolution_label:
+                if resolution["factor"] <= 0:
+                    evidence += f"；{resolution_label}已冲销快照内旧风险，快照外/新事件仍计分"
+                else:
+                    evidence += (
+                        f"；{resolution_label}冲销 {resolution['factor']:.0%}，"
+                        "快照外/新事件仍计分"
+                    )
             tags.append({
-                "tag": "bot_mute_operator", "confidence": 1.0, "source": "mute_event",
-                "evidence": f"有 {operator_count} 次可验证的亲自禁言 bot 记录",
-            })
-        if associated_count:
-            tags.append({
-                "tag": "bot_mute_associated", "confidence": 1.0, "source": "mute_event",
-                "evidence": f"有 {associated_count} 次所邀请群发生 bot 被禁言的关联责任记录",
+                "tag": tag, "confidence": confidence, "source": "mute_event",
+                "evidence": evidence,
             })
         return tags
 
     async def get_profile_tags_with_score(
         self, qq: str, event=None, exclude_request_key: str = ""
     ) -> dict:
-        """可信插件内部只读 API：返回标签、风险分和等级，不校验聊天权限。"""
+        """可信只读 API：返回标签、非负风险分、分类构成和证据范围。"""
         tags = await self.get_profile_tags(qq, event, exclude_request_key)
-        score = self._score_tags(str(qq), tags)
         analysis = cached_view(self, str(qq), event)
-        return dict(analysis, score=score, level=_risk_level(score, self.config), tags=tags)
+        assessment = self._risk_assessment(
+            str(qq), tags, scope=str(analysis.get("scene") or "group")
+        )
+        return dict(analysis, **assessment, tags=tags)
 
     async def get_profile_tags(
         self, qq: str, event=None, exclude_request_key: str = ""
@@ -2911,7 +3265,10 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             or str(st.get("friend_request_comment") or "").strip()
             or (st.get("join_sources") or [])
         )
-        if not total and not quotes and not base_tags and not has_social:
+        if (
+            not total and not quotes and not base_tags and not has_social
+            and self._mute_event_risk(qq) <= 0
+        ):
             return []
 
         llm_tags = await self._get_or_make_llm_tags(qq, st, quotes, base_tags, event) if quotes else cached_view(self, qq, event)["tags"]
@@ -2947,8 +3304,13 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         management = {
             "counts": dict(self._management_account(qq).get("counts") or {}),
             "recent": copy.deepcopy((self._management_account(qq).get("events") or [])[-10:]),
+            "state": await self.get_management_state(qq),
         }
-        if not tags and not has_social and not management["recent"] and not result.get("impression") and not result.get("traits"):
+        if (
+            not tags and not has_social and not management["recent"]
+            and not result.get("impression") and not result.get("traits")
+            and result.get("score") is None
+        ):
             return {}
 
         first_values = [
@@ -2977,7 +3339,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if llm_status in ("error", "cached_error"):
             partial_errors.append("llm_analysis_failed")
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "provider": "astrbot_plugin_user_profile",
             "captured_at": captured_at,
             "data_freshness": {
@@ -2994,8 +3356,11 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "sources": result.get("sources", []),
             "sections": result.get("sections", {}),
             "qq": qq,
-            "score": int(result.get("score") or 0),
-            "level": str(result.get("level") or ""),
+            "score": result.get("score"),
+            "level": str(result.get("level") or "未知"),
+            "risk_status": str(result.get("risk_status") or "no_evidence"),
+            "risk_components": dict(result.get("risk_components") or {}),
+            "risk_scope": str(result.get("risk_scope") or result.get("scene") or "group"),
             "tags": tags,
             "impression": clean_text(result.get("impression"), 240),
             "traits": [clean_text(value, 48) for value in result.get("traits", []) if clean_text(value, 48)][:5],
@@ -3014,28 +3379,41 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         profile = await self._build_profile_text(qq, event)
         return "" if "暂无记录" in profile else profile
 
-    async def get_risk_score(self, qq: str, event=None) -> int:
-        """返回指定 QQ 的综合风险分（0-100）。"""
+    async def get_risk_score(self, qq: str, event=None) -> int | None:
+        """返回当前证据范围的风险关注分；无风险证据时返回 None。"""
         result = await self.get_profile_tags_with_score(qq, event)
-        return result.get("score", 0)
+        return result.get("score")
 
-    def _score_tags(self, qq: str, tags: list) -> int:
-        return max(0, min(
-            100, self._calc_risk_score(tags) + self._mute_event_risk(str(qq))
-        ))
+    def _risk_assessment(self, qq: str, tags: list, scope: str = "") -> dict:
+        components = calculate_tag_components(
+            tags, self._risk_weights(),
+            semantic_cap=self.config["risk_semantic_cap"],
+            behavior_cap=self.config["risk_behavior_cap"],
+        )
+        components.update(self._mute_event_components(str(qq)))
+        has_mute_risk = any(
+            components.get(key, 0) > 0 for key in ("mute_operator", "mute_associated")
+        )
+        has_evidence = bool(tags) or has_mute_risk
+        score = max(0, min(100, sum(components.values()))) if has_evidence else None
+        return {
+            "score": score,
+            "level": _risk_level(score, self.config),
+            "risk_status": "ready" if has_evidence else "no_evidence",
+            "risk_components": components,
+            "risk_scope": scope or "group",
+        }
+
+    def _score_tags(self, qq: str, tags: list) -> int | None:
+        return self._risk_assessment(str(qq), tags)["score"]
 
     def _calc_risk_score(self, tags: list) -> int:
-        weights = self._risk_weights()
-        score = 0.0
-        unique = {}
-        for item in tags if isinstance(tags, list) else []:
-            if not isinstance(item, dict):
-                continue
-            tag = str(item.get("tag") or "")
-            unique[tag] = max(unique.get(tag, 0.0), max(0.0, min(1.0, _finite_float(item.get("confidence"), 0.0))))
-        for tag, confidence in unique.items():
-            score += weights.get(tag, 0.0) * confidence
-        return max(0, min(100, int(50 + score)))
+        components = calculate_tag_components(
+            tags, self._risk_weights(),
+            semantic_cap=self.config["risk_semantic_cap"],
+            behavior_cap=self.config["risk_behavior_cap"],
+        )
+        return max(0, min(100, sum(components.values())))
 
     def _risk_weights(self) -> dict:
         raw = self.config.get("risk_weights", "")
@@ -3045,16 +3423,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             except Exception as exc:
                 logger.warning(f"user_profile: risk_weights parse failed: {exc}")
                 raw = None
-        merged = dict(_RISK_WEIGHTS_DEFAULT)
-        if not isinstance(raw, dict):
-            return merged
-        for tag, value in raw.items():
-            if tag not in _RISK_WEIGHTS_DEFAULT:
-                continue
-            number = _finite_float(value)
-            if number is not None:
-                merged[tag] = number
-        return merged
+        return merged_weights(raw)
 
     # ---------------- LLM 标签（材料指纹缓存） ----------------
 
@@ -3693,14 +4062,16 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                     account["seen"] = list(dict.fromkeys(
                         str(item["event_key"]) for item in valid
                     ))[:_MUTE_SEEN_LEDGER_LIMIT]
-                    account["risk_total"] = sum(
-                        max(0, min(100, int(_finite_float(item.get("risk_increment"), 0))))
-                        for item in valid
-                    )
-                    account["operator_count"] = sum(
-                        item.get("attribution") == "operator" for item in valid
-                    )
-                    account["associated_count"] = len(valid) - account["operator_count"]
+                    for role in ("operator", "associated"):
+                        attribution = "operator" if role == "operator" else "associated_inviter"
+                        account[role + "_risk_total"] = sum(
+                            max(0, min(100, int(_finite_float(item.get("risk_increment"), 0))))
+                            for item in valid if item.get("attribution") == attribution
+                        )
+                        account[role + "_count"] = sum(
+                            item.get("attribution") == attribution for item in valid
+                        )
+                    account["risk_total"] = account["operator_risk_total"] + account["associated_risk_total"]
                     if valid:
                         account["last_risk_cap"] = max(0, min(100, int(
                             _finite_float(valid[-1].get("risk_cap"), 70)
@@ -3729,6 +4100,20 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                     ))[:_MUTE_SEEN_LEDGER_LIMIT]
                     for field in ("risk_total", "operator_count", "associated_count", "last_time"):
                         account[field] = max(0, int(_finite_float(value.get(field), 0)))
+                    if int(_finite_float(value.get("risk_schema_version"), 1)) >= 2:
+                        for field in ("legacy_risk_total", "operator_risk_total", "associated_risk_total"):
+                            account[field] = max(0, int(_finite_float(value.get(field), 0)))
+                        account["legacy_has_operator"] = bool(value.get("legacy_has_operator"))
+                        account["risk_total"] = (
+                            account["legacy_risk_total"] + account["operator_risk_total"]
+                            + account["associated_risk_total"]
+                        )
+                    else:
+                        # v1 only has one aggregate. Keep it as one conservative
+                        # legacy component instead of inventing per-event attribution.
+                        account["legacy_risk_total"] = account["risk_total"]
+                        account["legacy_has_operator"] = account["operator_count"] > 0
+                        self._mute_events_dirty = True
                     account["last_risk_cap"] = max(0, min(100, int(_finite_float(
                         value.get("last_risk_cap"), 70
                     ))))
@@ -3742,13 +4127,18 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                     continue
                 raw_events = value.get("events") if isinstance(value.get("events"), list) else []
                 valid_events = []
-                for item in raw_events:
+                for index, item in enumerate(raw_events, 1):
                     if not isinstance(item, dict):
                         continue
                     event_type = str(item.get("type") or "")
                     event_key = clean_text(item.get("event_key"), 160)
                     if event_type not in _MANAGEMENT_EVENT_TYPES or not event_key:
                         continue
+                    resolution = ""
+                    if event_type == "astrbot_unbanned":
+                        resolution = _normalize_management_resolution(
+                            item.get("resolution"), "normal"
+                        )
                     valid_events.append({
                         "event_key": event_key, "type": event_type,
                         "source": clean_text(item.get("source"), 64),
@@ -3757,8 +4147,35 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                         "reason": clean_text(item.get("reason"), 200),
                         "duration": item.get("duration"), "result": "success",
                         "created_at_ms": max(0, int(_finite_float(item.get("created_at_ms"), 0))),
+                        "resolution": resolution,
+                        "mute_resolution": self._normalize_mute_resolution(
+                            item.get("mute_resolution")
+                        ) if event_type == "astrbot_unbanned" else {},
+                        "seq": max(0, int(_finite_float(item.get("seq"), index))),
                     })
                 account = self._new_management_account()
+                for field in (
+                    "event_seq", "last_ban_seq", "last_ban_time",
+                    "last_unban_seq", "last_unban_time",
+                    "last_friend_delete_seq", "last_friend_delete_time",
+                    "last_friend_restore_seq", "last_friend_restore_time",
+                    "appeal_seq", "appeal_time", "last_time",
+                ):
+                    account[field] = max(0, int(_finite_float(value.get(field), 0)))
+                account["unban_resolution"] = _normalize_management_resolution(
+                    value.get("unban_resolution")
+                )
+                account["appeal_resolution"] = _normalize_management_resolution(
+                    value.get("appeal_resolution")
+                )
+                account["mute_resolution"] = self._normalize_mute_resolution(
+                    value.get("mute_resolution")
+                )
+                account["appeal_mute_resolution"] = self._normalize_mute_resolution(
+                    value.get("appeal_mute_resolution")
+                )
+                for record in valid_events:
+                    self._apply_management_record_state(account, record)
                 account["events"] = valid_events[-keep:]
                 seen = value.get("seen") if isinstance(value.get("seen"), list) else []
                 account["seen"] = list(dict.fromkeys(
@@ -3776,7 +4193,17 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                         count = sum(item["type"] == kind for item in valid_events)
                         if count:
                             account["counts"][kind] = count
-                account["last_time"] = max(0, int(_finite_float(value.get("last_time"), 0)))
+                account["last_time"] = max(
+                    account["last_time"],
+                    max([0] + [int(item.get("time") or 0) for item in valid_events]),
+                )
+                account["event_seq"] = max(
+                    account["event_seq"],
+                    max([0] + [int(item.get("seq") or 0) for item in valid_events]),
+                    sum(account["counts"].values()),
+                )
+                if "event_seq" not in value:
+                    self._management_events_dirty = True
                 management_accounts[qq] = account
             normalized_snapshots = {}
             for account_id, value in friend_snapshots.items():

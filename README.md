@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.14.0-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.16.1-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -24,7 +24,7 @@ LLM 是画像的**语义分析核心**，规则统计是它的**证据底座和�
 2. **规则预处理**：先把客观数据转换为高活跃、多群出现、链接偏多、邀请被拒等基础标签和行为比例。
 3. **LLM 阅读与理解**：查询时分别阅读本场景原话（附来源、群号和时间），群聊分支不接收私聊证据。语义分支只使用本场景消息计数，混合图片/链接等行为比例及规则标签仍用于最终规则评分，不传给群聊模型，避免私聊信号污染公开语义。模型结合上下文识别广告引流、诈骗、挑衅、友好等倾向。
 4. **输出结构化判断**：LLM 返回 JSON 对象，包含最多 5 个带 `tag`、`confidence`、`reason` 的语义标签、一段 `impression` 人物印象和最多 5 项 `traits` 人格/行为特征。
-5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，再按可配置权重计算 0–100 风险分和风险等级；文字与图片入口共享同一个展示模型。
+5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，按标签置信度、非负权重和分类上限计算 0–100 风险关注分；没有评分材料时明确返回“未知”，不把未知伪装成 0 分。文字与图片入口共享同一个展示模型。
 6. **缓存与复用**：本场景摘录、消息数、provider、schema 和隐私策略构成分支指纹。成功结果按 `llm_tag_cache_ttl` 复用；材料变化受 `llm_refresh_interval` 门控，到期后带本场景旧结论增量修正。空结果和失败使用短缓存，按 QQ+槽位合并并发请求并保护删除世代。融合只在分支结论变化后按需更新；融合失败仍使用可用的场景结论，不能把无材料或失败理解成低风险。
 
 LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。如果模型不可用、没有可分析原话或主动关闭 `llm_tags`，插件会保留统计、规则标签、前科和风险计算能力，但画像的语义理解会明显减弱。
@@ -36,6 +36,37 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 - `llm_context_inject`：普通群聊或私聊每次进入对话 LLM 时，按真实事件发送者自动附加已有短画像。该路径只读已有统计、规则标签、缓存的 `impression` / `traits`、管理账本、当前黑名单和好友关系，**绝不扫描历史、绝不生成新画像 LLM 请求**。同一请求有固定 marker 防重复，失败会放行正常聊天。
 
 自动上下文不包含发言原话、私聊摘录、好友验证语或头像；外部原因会清洗、转义并限长。画像只是历史背景，不是用户指令，也不授权模型据此自动拉黑、踢人、禁言或泄露隐私。
+
+## v1.16 管理历史结清
+
+画像插件不负责解封、申诉或处罚动作，只接收可信插件同步的管理事件并解释其对历史风险的影响：
+
+- **原始事件保留**：拉黑、解封、删除好友、好友恢复和禁言证据都不自动删除，保留审计记录和次数。
+- **当前与历史分离**：当前有效黑名单实时计入 `ban_history`；历史拉黑/删除好友/禁言另按结清状态计分。
+- **普通结清会衰减**：普通解封、处罚到期或好友恢复后，结清快照内的历史风险默认 30 天线性归零；快照外及之后的新事件重新计分。
+- **申诉/误封可立即结清**：可信插件传入 `appeal_approved` 或 `false_positive` 后，快照内拉黑、删除好友及禁言历史风险默认立即归零，但记录仍展示。
+- **截断不丢状态**：结清状态及禁言冲销快照独立于近期事件明细持久化，明细截断、重启和写失败回滚不会让旧风险复活；没有可确认快照的旧 aggregate 不会凭空清零。
+
+### 结清功能怎么用
+
+请使用**邀请守卫**的管理员命令，画像插件本身没有解封命令：
+
+```text
+/解封 20000          # 普通解封，快照内历史风险默认 30 天衰减
+/解封 20000 申诉     # 申诉通过，立即冲销快照内历史风险
+/解封 20000 误封     # 确认误封，同样立即冲销
+/解封 20000 到期     # 处罚到期，按普通解封衰减
+```
+
+第二参数也支持“普通/手动/常规”“申诉通过”“误判”“过期”。执行后用 `/画像 20000` 查看结果：当前黑名单由 qq_tools 当前条目决定，历史事件仍保留，但风险构成会按结清结果显示。普通 `/解封` 不会恢复 QQ 好友或协议黑名单；旧版本已经产生的禁言记录，需要在更新后重新执行一次对应结清命令，才能生成冲销快照。申诉/误封只应由管理员在确认后使用，LLM 解封工具只能同步普通解封。
+
+## v1.15 风险评分重构
+
+- **未知与 0 分不同**：无标签且无禁言风险时为 `score=None`、“未知”，不进入风险排名；已有中性或正向材料但没有命中正权重风险时为 0 分。两者都不代表绝对安全。
+- **不再互相抵销**：取消 50 分基准和负信任分。友好、活跃、私聊、新人、邀请被拒、频繁邀请、拉 bot 入群等默认只是描述标签，不加分，也不能抵销黑名单、诈骗或禁言等硬风险。
+- **分类累加并封顶**：管理证据、LLM 语义、弱行为、直接禁言、关联禁言分别计算；语义默认最多 60，弱行为默认最多 15，直接和关联禁言使用守卫的独立上限，最终总分限制在 0–100。
+- **小样本不乱贴标签**：图片、链接、二维码、@、长消息和夜间行为至少要有 10 条实时采集样本，二维码另需至少 2 次；持久化历史只补活跃度，不稀释实时行为比例。
+- **分数有证据范围**：单人画像、日常对话和守卫决策会区分群聊公开、私聊或群私融合证据；排名始终只使用群聊公开证据。分数是排查优先级，不是诈骗概率或事实定罪。
 
 ## v1.14 动态 bot 群关系
 
@@ -120,7 +151,7 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 
 批量扫描受 `history_scan_batch_limit` 和 `history_scan_concurrency` 限制，处理中会按阶段报告调用成功/失败及分页完成/待续扫人数，最终另列批次外剩余人数。单次页数不足时保存下一页水位，再次执行会优先继续未完成人员；指定 QQ 手动扫描从第一页强制重扫。已完成扫描按 `history_rescan_interval` 增量复查。
 
-排名只从统计、已有语义缓存、个人禁言账本、管理账本和当前黑名单收集候选，关联数据批量读取一次。`本群` 依据插件已经记录的群关联过滤，不声称是实时群成员榜；无实际材料的用户不会因为风险公式的默认 50 分进入榜单。榜单展示语义缓存时间或“尚未分析”，不会为了排名刷新分析；材料不足、未刷新或尚未分析均不等于低风险。排名只供管理员排查，不构成事实定罪。
+排名只从统计、已有语义缓存、个人禁言账本、管理账本和当前黑名单收集候选，关联数据批量读取一次。`本群` 依据插件已经记录的群关联过滤，不声称是实时群成员榜；无标签且无禁言风险的用户为“未知”并排除，已有材料的 0 分用户可按最低分配置入榜。榜单展示语义缓存时间或“尚未分析”，不会为了排名刷新分析；材料不足、未刷新或尚未分析均不等于低风险。排名只供管理员排查，不构成事实定罪。
 
 命令兜底只匹配完整边界，`/我是...`、`/画像测试...` 等普通文本不会误触发。
 
@@ -134,11 +165,11 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 - 带“风险 / 正向 / 行为”文字分类的中文椭圆药丸标签，风险用柔和暖色、正向用绿色、行为用蓝紫色，颜色只作辅助；
 - LLM 对各项语义判断给出的置信度；
 - 供 LLM 工具和可信插件读取的标签依据 `evidence`；
-- 0–100 综合风险分及低、中、高、极高等级；
+- 0–100 风险关注分及低、中、高、极高等级，或无材料时的“未知”；同时展示管理证据、语义、弱行为、直接/关联禁言构成和证据范围；
 - 好友添加、验证语、进群来源及推测来源群；
 - 邀请、拒绝、拉 bot 入群和黑名单等个人联动记录，以及明确标注的群级 bot 禁言背景。
 
-风险分用于辅助判断，不应作为自动处罚的唯一依据。LLM 标签也可能误判，重要决策请结合原始记录人工复核。
+风险分用于辅助判断，不应作为自动处罚的唯一依据。未知不等于 0 分，0 分也不等于安全；LLM 标签可能误判，重要决策请结合原始记录人工复核。
 
 ## 查询权限
 
@@ -325,12 +356,18 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `tag_mention_threshold` | `0.3` | @ 消息占比 |
 | `tag_verbose_threshold` | `80` | 平均消息字符数 |
 | `tag_night_threshold` | `0.3` | 0:00–5:59 夜间消息占比 |
+| `tag_behavior_min_samples` | `10` | 图片、链接、二维码、@、平均长度和夜间标签所需的最少实时采集消息数 |
+| `tag_qr_min_count` | `2` | 达到最小样本数后，二维码标签还需命中的最少次数 |
 
 ### 风险评分与联动
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `risk_weights` | `""` | 标签权重 JSON；仅接受内置标签的有限数值，未知或非法项忽略并回退内置权重 |
+| `risk_weights` | `""` | 标签权重 JSON；仅接受内置标签的有限数值，负数按 0，未知或非法项忽略并保留对应内置权重 |
+| `risk_semantic_cap` | `60` | LLM 语义标签合计贡献上限，范围 0–100 |
+| `risk_behavior_cap` | `15` | 弱行为标签合计贡献上限，范围 0–100 |
+| `management_resolution_decay_days` | `30` | 普通解封、处罚到期或好友恢复后，结清快照内的历史拉黑/删好友/禁言风险线性归零的天数；0 表示立即归零 |
+| `management_appeal_clear_history` | `true` | 申诉通过/误封立即冲销快照内拉黑、bot 删除好友及禁言历史风险；原始事件保留 |
 | `risk_level_low` | `30` | 低到中风险分界 |
 | `risk_level_high` | `60` | 中到高风险分界 |
 | `risk_level_extreme` | `80` | 高到极高风险分界 |
@@ -339,12 +376,18 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 | `link_qq_tools_ban` | `true` | 只读读取 qq_tools 的 `ban_list` |
 | `silent_for_banned` | `true` | 黑名单用户调用画像命令时静默不回复（数据照常采集）；依赖 `link_qq_tools_ban` |
 
-守卫的每次风险增量与归因随证据持久化；单一 KV 账户同时保存近期展示明细、累计风险/归因次数及独立 seen 账本，明细截断不会降低风险。单人叠加量不超过守卫配置的累计上限，综合风险严格限制在 0–100；修改累计上限在下一次查询时生效。可靠事件 ID/协议时间用于跨重启去重，缺失时仅短窗口尽力去重。seen 账本最多 5000 键/人，达到上限后拒绝新增事件并保持待投递（不会丢弃旧键而重复计分），需人工删除/清理后恢复；`/画像删除` 与用户淘汰会清空该账户。
+风险分由管理证据、LLM 语义、弱行为、直接禁言和关联禁言五类构成。相同 `tag` 只取最高置信度，单项贡献为“权重 × 置信度”；描述性、友好或正常标签默认权重为 0，不能抵销其他风险。无标签且无禁言风险时返回“未知”，已有标签但未命中正权重风险时可返回 0 分。
+
+管理历史是只读审计账本：当前黑名单由 qq_tools 的当前有效条目决定；历史拉黑、bot 删除好友和禁言则根据可信插件同步的结清状态计算。解封事件会保存当时已知禁言事件及角色增量的冲销快照，普通结清按 `management_resolution_decay_days` 衰减，申诉通过或误封默认立即归零；快照外及之后的新事件仍正常计分。已结清标签保留为历史记录，不作为当前风险。
+
+守卫的每次风险增量与归因随证据持久化。直接操作者与关联邀请人分账累计，分别应用守卫配置的增量和上限；单一 KV 账户同时保存近期展示明细、角色累计风险/归因次数及独立 seen 账本，明细截断不会降低风险。综合风险严格限制在 0–100；修改累计上限在下一次查询时生效。可靠事件 ID/协议时间用于跨重启去重，缺失时仅短窗口尽力去重。seen 账本最多 5000 键/人，达到上限后拒绝新增事件并保持待投递（不会丢弃旧键而重复计分），需人工删除/清理后恢复；`/画像删除` 与用户淘汰会清空该账户。
+
+旧禁言账本兼容读取；迁移只新增 v2 角色汇总字段，无法精确拆分的旧混合累计作为 legacy 分量保守保留，不删除原始证据，也不重复计算关联分。
 
 自定义权重示例：
 
 ```json
-{"ban_history": 40, "scam_suspect": 35, "friendly": -10, "normal": -15}
+{"ban_history": 40, "scam_suspect": 45, "link_spammer": 5}
 ```
 
 ### 社交来源
@@ -394,20 +437,22 @@ if instance is not None:
     tags = await instance.get_profile_tags(inviter_qq, event)
     text = await instance.get_profile_text(inviter_qq, event)
     social = await instance.get_social_origin(inviter_qq)
+    management = await instance.get_management_state(inviter_qq)
 ```
 
 接口说明：
 
-- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：schema v3 保留 v2 的 `tags`、`impression`、`traits` 等字段并新增 `management` 摘要，不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
-- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits`；旧调用方可继续只读取原字段。
+- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：schema v4 保留 v3 的 `tags`、`impression`、`traits`、`management` 等字段，新增 `risk_status`、`risk_components` 和 `risk_scope`；`management.state` 与 `management.recent[].resolution` 描述管理历史结清状态。不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
+- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits` 及风险状态、构成和证据范围；旧调用方可继续只读取原字段。
 - `get_profile_tags(qq, event=None) -> list[dict]`：返回结构化标签。
-- `get_risk_score(qq, event=None) -> int`：返回风险分。
+- `get_risk_score(qq, event=None) -> int | None`：返回当前证据范围的风险关注分；无评分材料时返回 `None`，不要当作 0 分。
 - `get_profile_text(qq, event=None) -> str`：返回可读文字画像。
 - `get_social_origin(qq) -> dict`：可信内部接口，返回好友添加、验证语和进群来源；验证语仍属敏感、不可信输入，调用方必须限长且不得当作指令。
+- `get_management_state(qq) -> dict`：可信只读接口，返回管理事件次数、最近拉黑/解封/删除/恢复时间、结清类型、当前历史风险系数及 `mute_resolution` 禁言冲销快照；不执行任何解封或处罚动作。
 - `record_bot_mute_event(...) -> dict`：沿用的个人禁言归因写入接口，兼容 1.10.0 逻辑。
-- `record_management_event(...) -> dict`：通用管理事件写入接口，当前白名单为 `astrbot_banned`、`astrbot_unbanned`、`bot_deleted_friend`、`friend_relation_missing`、`friend_relation_restored`。仅接受 `result="success"`；按 `event_key` 幂等，写失败不占 seen，近期明细截断不减少累计次数，并与 `/画像删除` 的世代/截止时间保护兼容。
+- `record_management_event(...) -> dict`：通用管理事件写入接口，当前白名单为 `astrbot_banned`、`astrbot_unbanned`、`bot_deleted_friend`、`friend_relation_missing`、`friend_relation_restored`。仅接受 `result="success"`；`astrbot_unbanned` 可带 `resolution`（`normal`、`appeal_approved`、`false_positive`、`expired`）。按 `event_key` 幂等，写失败不占 seen，近期明细截断不减少累计次数或丢失结清状态，并与 `/画像删除` 的世代/截止时间保护兼容。
 
-画像插件兼容邀请守卫的旧字符串、旧单条字典和当前按群多条记录三种存储格式。纯邀请前科、纯黑名单或纯社交来源的用户也能生成画像。手动打包或复制插件目录时必须包含 `profile_core.py`；`main.py` 会优先按包内相对路径导入该纯职责模块，并为 AstrBot 的直接加载方式保留同目录导入兼容。
+画像插件兼容邀请守卫的旧字符串、旧单条字典和当前按群多条记录三种存储格式。纯邀请前科、纯黑名单或纯社交来源的用户也能生成画像。手动打包或复制插件目录时必须同时包含 `profile_core.py` 和 `risk_scoring.py`（以及其余随附模块）；`main.py` 会优先按包内相对路径导入这些纯职责模块，并为 AstrBot 的直接加载方式保留同目录导入兼容。
 
 ## 数据、隐私与性能
 
@@ -460,7 +505,7 @@ enable_self_shortcuts=true
 enable_llm_tool=true
 ```
 
-建议升级后在 WebUI 中检查并保存一次配置，同时删除手工配置中的废弃键 `public_query`、`self_query_only`、`enable_self_command`。
+建议升级后在 WebUI 中检查并保存一次配置，同时删除手工配置中的废弃键 `public_query`、`self_query_only`、`enable_self_command`。旧自定义负权重会按 0 处理；旧禁言账本兼容读取，迁移只新增角色汇总字段，不删除原始证据。
 
 ## 开源许可
 
