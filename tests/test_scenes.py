@@ -25,10 +25,13 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         async def branch(qq, st, quotes, *args, **kwargs):
             name = quote_scene(quotes[0])
             return {"tags": [{"tag": "friendly", "confidence": 0.9, "reason": name + "_EVIDENCE"}],
-                    "impression": name + "_IMPRESSION", "traits": [name + "_TRAIT"]}
+                    "impression": name + "_IMPRESSION", "traits": [name + "_TRAIT"],
+                    "long_term_traits": [{"trait": name + "_MEMORY", "confidence": 0.9, "reason": "stable"}],
+                    "_long_term_traits_present": True}
         plugin._tag_engine.generate_llm_tags = AsyncMock(side_effect=branch)
         plugin.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text=json.dumps({
             "tags": [], "impression": "FUSED_PRIVATE_DERIVED", "traits": ["FUSED_TRAIT"],
+            "long_term_traits": [{"trait": "FUSED_MEMORY", "confidence": 0.9, "reason": "stable"}],
             "common_traits": "COMMON", "differences": "DIFFERENCE", "confidence": "仅群侧或私侧不足时注明"})))
         return plugin
 
@@ -74,9 +77,11 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         other = await plugin.get_profile_tags_with_score("11111", Event({}, sender="33333", group=""))
         for value in (model, text, decision, ranking, tool, other):
             encoded = str(value)
-            for marker in ("PRIVATE_RAW", "private_IMPRESSION", "private_TRAIT", "private_EVIDENCE", "FUSED_PRIVATE_DERIVED", "FUSED_TRAIT"):
+            for marker in ("PRIVATE_RAW", "private_IMPRESSION", "private_TRAIT", "private_EVIDENCE", "private_MEMORY", "FUSED_PRIVATE_DERIVED", "FUSED_TRAIT", "FUSED_MEMORY"):
                 self.assertNotIn(marker, encoded)
         self.assertIn("group_IMPRESSION", text)
+        self.assertIn("group_MEMORY", text)
+        self.assertEqual(decision["long_term_traits"][0]["trait"], "group_MEMORY")
         self.assertEqual(model["sections"], {})
 
     async def test_policy_change_invalidates_without_refresh_wait_or_prior(self):
@@ -133,6 +138,102 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("私聊表现", result["sections"])
         self.assertEqual(len(plugin._tag_engine.generate_llm_tags.await_args_list), 1)
         self.assertEqual(await plugin.get_profile_tags("55555"), [])
+
+    async def test_llm_failure_and_empty_refresh_preserve_last_success_across_restart(self):
+        config = {
+            "cross_scene_link_enabled": False, "llm_tag_cache_ttl": 0,
+            "llm_failure_cache_ttl": 0, "llm_refresh_interval": 0,
+        }
+        plugin = self.make_plugin(config)
+        await plugin._ensure_loaded()
+        plugin._stats["11111"] = dict(_new_stat(), g_count=2)
+        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [{"tag": "friendly", "confidence": 0.9, "reason": "stable"}],
+            "impression": "LAST_GOOD", "traits": ["STABLE"],
+            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.9, "reason": "stable"}],
+            "_long_term_traits_present": True,
+        })
+        event = Event({}, group="22222")
+        self.assertEqual((await plugin.get_profile_tags_with_score("11111", event))["impression"], "LAST_GOOD")
+
+        plugin._tag_engine.generate_llm_tags = AsyncMock(side_effect=RuntimeError("offline"))
+        degraded = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(degraded["impression"], "LAST_GOOD")
+        self.assertEqual(degraded["long_term_traits"][0]["trait"], "LONG_MEMORY")
+        entry = plugin._tags_cache["11111"]["slots"]["group"]
+        self.assertEqual(entry["status"], "success")
+        self.assertEqual(entry["refresh_status"], "error")
+        decision = await plugin.get_decision_profile("11111", event)
+        self.assertIn("llm_analysis_failed", decision["partial_errors"])
+
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "", "traits": [], "long_term_traits": [],
+            "_long_term_traits_present": True,
+        })
+        empty = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(empty["impression"], "LAST_GOOD")
+        self.assertEqual(plugin._tags_cache["11111"]["slots"]["group"]["refresh_status"], "empty")
+
+        restarted = self.make_plugin(config)
+        restarted._kv = plugin._kv
+        await restarted._ensure_loaded()
+        self.assertEqual(cached_view(restarted, "11111", event)["impression"], "LAST_GOOD")
+        restarted._stats["11111"] = dict(_new_stat(), g_count=2)
+        restarted._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        restarted._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "RECOVERED", "traits": [],
+            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.95}],
+            "_long_term_traits_present": True,
+        })
+        recovered = await restarted.get_profile_tags_with_score("11111", event)
+        self.assertEqual(recovered["impression"], "RECOVERED")
+        self.assertNotIn("refresh_status", restarted._tags_cache["11111"]["slots"]["group"])
+
+    async def test_long_term_review_missing_field_and_disable_preserve_memory(self):
+        plugin = self.make_plugin({
+            "cross_scene_link_enabled": False, "llm_tag_cache_ttl": 0,
+            "llm_failure_cache_ttl": 0, "llm_refresh_interval": 0,
+        })
+        await plugin._ensure_loaded()
+        plugin._stats["11111"] = dict(_new_stat(), g_count=2)
+        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        event = Event({}, group="22222")
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "V1", "traits": [],
+            "long_term_traits": [
+                {"trait": "稳定偏好", "confidence": 0.7},
+                {"trait": "待删除特点", "confidence": 0.6},
+            ],
+            "_long_term_traits_present": True,
+        })
+        await plugin.get_profile_tags_with_score("11111", event)
+        first_seen = plugin._tags_cache["11111"]["slots"]["group"]["long_term_traits"][0]["first_seen"]
+
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "V2", "traits": [],
+            "long_term_traits": [{"trait": "稳定偏好", "confidence": 0.95, "reason": "再次确认"}],
+            "_long_term_traits_present": True,
+        })
+        reviewed = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(len(reviewed["long_term_traits"]), 1)
+        self.assertEqual(reviewed["long_term_traits"][0]["first_seen"], first_seen)
+        self.assertEqual(reviewed["long_term_traits"][0]["confidence"], 0.95)
+
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "V3", "traits": [],
+        })
+        missing_field = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(missing_field["long_term_traits"][0]["trait"], "稳定偏好")
+        plugin.config["llm_long_term_memory"] = False
+        self.assertEqual(cached_view(plugin, "11111", event)["long_term_traits"], [])
+        await plugin.get_profile_tags_with_score("11111", event)
+        stored = plugin._tags_cache["11111"]["slots"]["group"]["long_term_traits"]
+        self.assertEqual(stored[0]["trait"], "稳定偏好")
+        plugin.config["llm_long_term_memory"] = True
+        context = await plugin._build_conversation_profile_context("11111", event)
+        self.assertIn("长期特点", context)
+        self.assertIn("稳定偏好", context)
 
     async def test_history_private_policy_unknown_is_not_saved_or_used(self):
         for setting in ("collect_private", "store_private_quotes", "store_quotes"):

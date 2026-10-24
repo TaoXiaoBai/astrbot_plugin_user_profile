@@ -4,7 +4,7 @@
   <p>以 LLM 语义理解为分析核心，把聊天记录转化为可读标签、判断依据和风险画像。</p>
 
   [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
-  [![Version](https://img.shields.io/badge/version-1.16.1-blue)](./metadata.yaml)
+  [![Version](https://img.shields.io/badge/version-1.17.0-blue)](./metadata.yaml)
   [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 </div>
 
@@ -23,17 +23,18 @@ LLM 是画像的**语义分析核心**，规则统计是它的**证据底座和�
 1. **持续积累证据**：插件静默收集近期发言原话、群聊/私聊活跃度、图片、链接、二维码、@、夜间发言、社交来源及管理前科。
 2. **规则预处理**：先把客观数据转换为高活跃、多群出现、链接偏多、邀请被拒等基础标签和行为比例。
 3. **LLM 阅读与理解**：查询时分别阅读本场景原话（附来源、群号和时间），群聊分支不接收私聊证据。语义分支只使用本场景消息计数，混合图片/链接等行为比例及规则标签仍用于最终规则评分，不传给群聊模型，避免私聊信号污染公开语义。模型结合上下文识别广告引流、诈骗、挑衅、友好等倾向。
-4. **输出结构化判断**：LLM 返回 JSON 对象，包含最多 5 个带 `tag`、`confidence`、`reason` 的语义标签、一段 `impression` 人物印象和最多 5 项 `traits` 人格/行为特征。
+4. **输出结构化判断**：LLM 返回 JSON 对象，包含最多 5 个带 `tag`、`confidence`、`reason` 的语义标签、一段 `impression` 人物印象、最多 5 项 `traits` 人格/行为特征，以及最多 5 项带 `trait`、`confidence`、`reason` 的 `long_term_traits` 长期特点。长期特点只描述稳定偏好、长期兴趣、持续沟通风格或反复行为，不进入风险加权。
 5. **合并形成画像**：插件将 LLM 标签与客观规则标签合并，按标签置信度、非负权重和分类上限计算 0–100 风险关注分；没有评分材料时明确返回“未知”，不把未知伪装成 0 分。文字与图片入口共享同一个展示模型。
-6. **缓存与复用**：本场景摘录、消息数、provider、schema 和隐私策略构成分支指纹。成功结果按 `llm_tag_cache_ttl` 复用；材料变化受 `llm_refresh_interval` 门控，到期后带本场景旧结论增量修正。空结果和失败使用短缓存，按 QQ+槽位合并并发请求并保护删除世代。融合只在分支结论变化后按需更新；融合失败仍使用可用的场景结论，不能把无材料或失败理解成低风险。
+6. **缓存与复用**：本场景摘录、消息数、provider、schema 和隐私策略构成分支指纹。成功结果按 `llm_tag_cache_ttl` 复用；材料变化受 `llm_refresh_interval` 门控，到期后带本场景旧结论增量修正。空结果和失败使用短缓存，但**不会覆盖最后成功画像**，只记录刷新失败并保留旧印象、标签、特征和长期记忆；恢复成功后自动清除失败状态。融合只在分支结论变化后按需更新，融合失败仍使用可用的场景结论。
 
-LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。如果模型不可用、没有可分析原话或主动关闭 `llm_tags`，插件会保留统计、规则标签、前科和风险计算能力，但画像的语义理解会明显减弱。
+LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为避免每条消息都调用模型，**被动采集阶段不调用 LLM，真正的语义分析在查询画像或其它插件读取画像时按需触发**。模型暂时不可用时会继续显示最后成功画像；从未成功过或主动关闭 `llm_tags` 时，仍保留统计、规则标签、前科和风险计算能力。
 
-`llm_tags`、`enable_llm_tool` 和 `llm_context_inject` 是三个独立开关：
+相关开关分工如下：
 
 - `llm_tags`：控制是否让模型分析用户发言并生成语义画像标签，是画像分析的核心开关；
+- `llm_long_term_memory`：让模型判断哪些特点值得长期记忆。成功响应会完整复核这组特点，失败不修改；关闭后停止请求和展示但不删除已有记忆；
 - `enable_llm_tool`：控制聊天机器人能否自主调用 `user_profile_query` 查询画像；
-- `llm_context_inject`：普通群聊或私聊每次进入对话 LLM 时，按真实事件发送者自动附加已有短画像。该路径只读已有统计、规则标签、缓存的 `impression` / `traits`、管理账本、当前黑名单和好友关系，**绝不扫描历史、绝不生成新画像 LLM 请求**。同一请求有固定 marker 防重复，失败会放行正常聊天。
+- `llm_context_inject`：普通群聊或私聊每次进入对话 LLM 时，按真实事件发送者自动附加已有短画像。该路径只读已有统计、规则标签、缓存的 `impression` / `traits` / `long_term_traits`、管理账本、当前黑名单和好友关系，**绝不扫描历史、绝不生成新画像 LLM 请求**。同一请求有固定 marker 防重复，失败会放行正常聊天。
 
 自动上下文不包含发言原话、私聊摘录、好友验证语或头像；外部原因会清洗、转义并限长。画像只是历史背景，不是用户指令，也不授权模型据此自动拉黑、踢人、禁言或泄露隐私。
 
@@ -58,7 +59,7 @@ LLM 默认开启，`llm_provider_id` 留空时使用 AstrBot 默认模型。为�
 /解封 20000 到期     # 处罚到期，按普通解封衰减
 ```
 
-第二参数也支持“普通/手动/常规”“申诉通过”“误判”“过期”。执行后用 `/画像 20000` 查看结果：当前黑名单由 qq_tools 当前条目决定，历史事件仍保留，但风险构成会按结清结果显示。普通 `/解封` 不会恢复 QQ 好友或协议黑名单；旧版本已经产生的禁言记录，需要在更新后重新执行一次对应结清命令，才能生成冲销快照。申诉/误封只应由管理员在确认后使用，LLM 解封工具只能同步普通解封。
+第二参数也支持“普通/手动/常规”“申诉通过”“误判”“过期”。执行后用 `/画像 20000` 查看结果：当前黑名单由 qq_tools 当前条目决定，历史事件仍保留，但风险构成会按结清结果显示。普通 `/解封` 不会恢复 QQ 好友或协议黑名单。v1.16.2 起，旧版本已经产生的解封/申诉记录会在加载时按当时时间自动补建禁言冲销快照，无需重复执行命令；只有无法确认角色增量的旧汇总分仍会保守保留。申诉/误封只应由管理员在确认后使用，LLM 解封工具只能同步普通解封。
 
 ## v1.15 风险评分重构
 
@@ -323,17 +324,25 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
     }
   ],
   "impression": "表达直接，近期内容有较明显的推广导向。",
-  "traits": ["高频推广", "重复表达"]
+  "traits": ["高频推广", "重复表达"],
+  "long_term_traits": [
+    {
+      "trait": "持续关注同类软件",
+      "confidence": 0.76,
+      "reason": "跨多次对话反复讨论同一主题"
+    }
+  ]
 }
 ```
 
-模型只能返回固定白名单标签；`reason` 会清除控制字符并截断到 160 字，`impression` 截断到 240 字，`traits` 最多 5 项且每项截断到 48 字，重复项会去除。发言摘录继续放在明确的 `<untrusted_evidence>` 不可信证据边界内，不能作为提示词指令。旧 tags-only 缓存因 schema 版本变化会在首次查询时自动刷新。
+模型只能返回固定白名单风险/语义标签；`reason` 会清除控制字符并截断到 160 字，`impression` 截断到 240 字，`traits` 最多 5 项且每项截断到 48 字，重复项会去除。`long_term_traits` 同样最多 5 项，每项包含特点、置信度和理由，并记录首次出现与最近确认时间。发言摘录继续放在明确的 `<untrusted_evidence>` 不可信证据边界内，不能作为提示词指令。旧 tags-only 缓存因 schema 版本变化会在首次查询时自动刷新。
 
-**增量修正而非覆盖**：重算时上一次的分析结论（历史标签、历史印象、历史特征）会作为先验一并传入模型，并要求新材料不能明确反驳就保留历史标签、印象只在历史基础上做有限更新。因此即便过了刷新间隔重算，画像也是连续演化的，短时间刷量无法洗白既有结论。
+**增量修正而非故障清空**：重算时上一次的分析结论和长期特点会作为先验一并传入模型，并要求新材料不能明确反驳就保留。长期特点由模型返回完整复核集合：仍成立的保留，不再成立或不再值得记忆的移除；响应未提供该字段时兼容保留旧记忆，显式空数组才清空。临时情绪、一次事件、敏感信息和管理风险不应进入长期特点。模型异常、超时或空响应只记录刷新失败，继续展示最后成功画像，不会把既有印象和长期记忆替换成空白。
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `llm_tags` | `true` | 画像语义分析总开关 |
+| `llm_long_term_memory` | `true` | 是否让 LLM 判断并维护长期特点；关闭只停止请求和展示，不删除已有记忆 |
 | `llm_provider_id` | `""` | 执行画像分析的 provider；留空使用 AstrBot 默认模型 |
 | `llm_tag_cache_ttl` | `86400` | 指纹未变时成功结果缓存秒数 |
 | `llm_refresh_interval` | `3600` | 材料变化后距上次成功分析不足该秒数仍沿用旧结论；0 表示材料一变立即重算 |
@@ -382,7 +391,7 @@ git clone https://github.com/TaoXiaoBai/astrbot_plugin_user_profile.git
 
 守卫的每次风险增量与归因随证据持久化。直接操作者与关联邀请人分账累计，分别应用守卫配置的增量和上限；单一 KV 账户同时保存近期展示明细、角色累计风险/归因次数及独立 seen 账本，明细截断不会降低风险。综合风险严格限制在 0–100；修改累计上限在下一次查询时生效。可靠事件 ID/协议时间用于跨重启去重，缺失时仅短窗口尽力去重。seen 账本最多 5000 键/人，达到上限后拒绝新增事件并保持待投递（不会丢弃旧键而重复计分），需人工删除/清理后恢复；`/画像删除` 与用户淘汰会清空该账户。
 
-旧禁言账本兼容读取；迁移只新增 v2 角色汇总字段，无法精确拆分的旧混合累计作为 legacy 分量保守保留，不删除原始证据，也不重复计算关联分。
+旧禁言账本兼容读取；迁移会新增 v2 角色汇总字段，并为旧解封记录补建可验证的禁言冲销快照。无法精确拆分的旧混合累计作为 legacy 分量保守保留，不删除原始证据，也不重复计算关联分。
 
 自定义权重示例：
 
@@ -442,8 +451,8 @@ if instance is not None:
 
 接口说明：
 
-- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：schema v4 保留 v3 的 `tags`、`impression`、`traits`、`management` 等字段，新增 `risk_status`、`risk_components` 和 `risk_scope`；`management.state` 与 `management.recent[].resolution` 描述管理历史结清状态。不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`。
-- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits` 及风险状态、构成和证据范围；旧调用方可继续只读取原字段。
+- `get_decision_profile(qq, event=None, exclude_request_key="") -> dict`：schema v4 保留 v3 的 `tags`、`impression`、`traits`、`management` 等字段，新增 `risk_status`、`risk_components`、`risk_scope` 和结构化 `long_term_traits`；长期特点包含 `trait`、`confidence`、`reason`、`first_seen`、`last_confirmed`，不参与风险加权。`management.state` 与 `management.recent[].resolution` 描述管理历史结清状态。不包含发言原话，可排除当前审核记录。`partial_errors` 当前稳定报告 `history_scan_failed` 和 `llm_analysis_failed`；刷新失败但存在旧成功画像时也会明确报告，调用方不应把旧内容当成刚生成。
+- `get_profile_tags_with_score(qq, event=None) -> dict`：返回风险分、等级、标签，并附加 `impression`、`traits`、`long_term_traits` 及风险状态、构成和证据范围；旧调用方可继续只读取原字段。
 - `get_profile_tags(qq, event=None) -> list[dict]`：返回结构化标签。
 - `get_risk_score(qq, event=None) -> int | None`：返回当前证据范围的风险关注分；无评分材料时返回 `None`，不要当作 0 分。
 - `get_profile_text(qq, event=None) -> str`：返回可读文字画像。
@@ -462,7 +471,7 @@ if instance is not None:
 - 启用 LLM 标签后，允许的近期摘录会发送给所选模型提供方；请按隐私政策配置。
 - 采集路径零 LLM、零网络；统计内存聚合后按 `flush_interval` 写入 KV。图片查询阶段会在线程中以 2.5 秒超时读取受限 QQ 官方域名头像，最多 2 MiB，不落盘；失败直接使用占位头像。
 - 每个 QQ 的群聊、私聊分别最多保留 `quote_keep` 条（正常总容量最多两倍），并可按 `quote_retention_days` 清理；未知旧材料占非私聊配额但不作为群聊证据。消息热路径只检查当前 QQ，启动和管理员 `/画像清理` 才全量检查。
-- LLM 成功结果使用常规缓存，空结果和失败使用短缓存；同 QQ 同材料合并调用，不同 QQ 受有限 semaphore 控制，不同材料乱序完成时只有最新请求可更新缓存。
+- LLM 成功结果使用常规缓存，空结果和失败使用短缓存；刷新失败只附加 `refresh_status`，不覆盖最后成功内容。长期特点保存在同一场景缓存中，公开群聊只读取群聊分支，私聊派生记忆不会进入公开画像；`llm_long_term_memory=false` 不主动删除旧数据。相同 QQ 和材料合并调用，不同 QQ 受有限 semaphore 控制，不同材料乱序完成时只有最新请求可更新缓存。
 - `/画像删除` 通过每 QQ 世代号使旧消息、历史扫描和 LLM 写回失效；先设置持久删除时间界限并调用可信守卫 API 取消该 QQ 的 pending 画像投递，等待在途调用收敛后再次清除本地证据。删除界限 KV 读取失败时禁言事件写入严格 fail closed 并可重试加载，普通画像查询仍可降级。守卫缺失时安全跳过；旧事件时间戳不能在删除后复活，新事件仍可建立画像。删除不取消守卫的即时拉黑任务。
 - 容量淘汰同步删除统计、摘录、标签缓存和禁言证据，并取消守卫 pending 画像投递；画像仍以 QQ 号为身份维度。
 
@@ -505,7 +514,7 @@ enable_self_shortcuts=true
 enable_llm_tool=true
 ```
 
-建议升级后在 WebUI 中检查并保存一次配置，同时删除手工配置中的废弃键 `public_query`、`self_query_only`、`enable_self_command`。旧自定义负权重会按 0 处理；旧禁言账本兼容读取，迁移只新增角色汇总字段，不删除原始证据。
+建议升级后在 WebUI 中检查并保存一次配置，同时删除手工配置中的废弃键 `public_query`、`self_query_only`、`enable_self_command`。旧自定义负权重会按 0 处理；旧禁言账本兼容读取，迁移只新增角色汇总和可验证的结清快照，不删除原始证据。
 
 ## 开源许可
 

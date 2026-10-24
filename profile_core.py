@@ -5,7 +5,8 @@ import re
 from typing import Any
 
 
-LLM_SCHEMA_VERSION = 5
+LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
+LLM_PROMPT_VERSION = 6  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:
@@ -95,6 +96,7 @@ _DEFAULTS = {
     "llm_timeout_seconds": 45,
     "llm_max_concurrency": 3,
     "llm_material_max_chars": 6000,
+    "llm_long_term_memory": True,
     "tag_active_high_threshold": 100,
     "tag_active_med_threshold": 20,
     "tag_newcomer_days": 7,
@@ -249,9 +251,54 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
     return result
 
 
+def sanitize_long_term_traits(raw: Any) -> list[dict]:
+    if isinstance(raw, dict):
+        raw = raw.get("long_term_traits")
+    if not isinstance(raw, list):
+        return []
+    result = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        trait = clean_text(item.get("trait", item.get("name")), 48)
+        key = trait.casefold()
+        confidence = _finite_number(item.get("confidence"), -1)
+        if not trait or key in seen or confidence < 0:
+            continue
+        seen.add(key)
+        result.append({
+            "trait": trait,
+            "confidence": round(max(0.0, min(1.0, confidence)), 2),
+            "reason": clean_text(item.get("reason", item.get("evidence")), 160),
+            "first_seen": _bounded_int(item.get("first_seen"), 0, 0, 2**63 - 1),
+            "last_confirmed": _bounded_int(item.get("last_confirmed"), 0, 0, 2**63 - 1),
+        })
+        if len(result) >= 5:
+            break
+    return result
+
+
+def merge_long_term_traits(previous: Any, current: Any, now: int) -> list[dict]:
+    old = {
+        item["trait"].casefold(): item
+        for item in sanitize_long_term_traits(previous)
+    }
+    result = []
+    for item in sanitize_long_term_traits(current):
+        before = old.get(item["trait"].casefold(), {})
+        item["first_seen"] = before.get("first_seen") or now
+        item["last_confirmed"] = now
+        result.append(item)
+    return result
+
+
 def sanitize_llm_analysis(raw: Any) -> dict:
     if not isinstance(raw, dict):
-        return {"tags": sanitize_llm_tags(raw), "impression": "", "traits": []}
+        return {
+            "tags": sanitize_llm_tags(raw), "impression": "", "traits": [],
+            "long_term_traits": [],
+        }
     impression = clean_text(raw.get("impression", raw.get("summary")), 240)
     traits_raw = raw.get("traits")
     traits = []
@@ -272,6 +319,7 @@ def sanitize_llm_analysis(raw: Any) -> dict:
         "tags": sanitize_llm_tags(raw.get("tags")),
         "impression": impression,
         "traits": traits,
+        "long_term_traits": sanitize_long_term_traits(raw.get("long_term_traits")),
     }
 
 

@@ -215,6 +215,26 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     "11111", _new_stat(), [{"text": "hello"}], [], context, config
                 )
 
+    async def test_llm_prompt_requests_explicit_long_term_judgment(self):
+        config = self.make_plugin({
+            "llm_provider_id": "provider", "llm_long_term_memory": True,
+        }).config
+        engine = TagEngine(config)
+        context = types.SimpleNamespace(llm_generate=AsyncMock(return_value=types.SimpleNamespace(
+            completion_text='{"tags": [], "impression": "稳定", "traits": [], '
+                            '"long_term_traits": [{"trait": "浅色偏好", '
+                            '"confidence": 0.9, "reason": "多次提及"}]}'
+        )))
+        result = await engine.generate_llm_tags(
+            "11111", _new_stat(), [{"text": "hello"}], [], context, config
+        )
+        prompt = context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("long_term_traits", prompt)
+        self.assertIn("值得长期记忆", prompt)
+        self.assertIn("不记录临时情绪", prompt)
+        self.assertTrue(result["_long_term_traits_present"])
+        self.assertEqual(result["long_term_traits"][0]["trait"], "浅色偏好")
+
     async def test_social_event_prefers_raw_user_id(self):
         plugin = self.make_plugin()
         raw = {"post_type": "notice", "notice_type": "friend_add", "user_id": 33333, "time": 10}
@@ -734,7 +754,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("legacy", plugin._tags_cache["11111"])
         cached = plugin._tags_cache["11111"]["slots"]["group"]
-        self.assertEqual(cached["schema_version"], 5)
+        self.assertEqual(cached["schema_version"], 6)
         self.assertEqual(cached["impression"], "友好")
         self.assertEqual(cached["traits"], ["稳定"])
 

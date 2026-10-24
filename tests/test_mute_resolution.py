@@ -154,11 +154,106 @@ class MuteResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["status"], "failure")
         self.assertEqual(restarted._management_account("11111"), before)
 
+    @staticmethod
+    def without_mute_snapshots(plugin, truncate_management=False, empty_snapshots=False):
+        legacy = copy.deepcopy(plugin._kv)
+        account = legacy["up_management_events"]["11111"]
+        account.pop("mute_resolution", None)
+        account.pop("appeal_mute_resolution", None)
+        for item in account["events"]:
+            item.pop("mute_resolution", None)
+            if empty_snapshots and item["type"] == "astrbot_unbanned":
+                item["mute_resolution"] = {
+                    "time": item["time"], "resolution": item["resolution"],
+                    "effects": {"mute_operator": 0, "mute_associated": 0},
+                    "event_keys": [],
+                }
+        if empty_snapshots:
+            for field, time_key, resolution_key in (
+                ("mute_resolution", "last_unban_time", "unban_resolution"),
+                ("appeal_mute_resolution", "appeal_time", "appeal_resolution"),
+            ):
+                if account.get(time_key):
+                    account[field] = {
+                        "time": account[time_key], "resolution": account[resolution_key],
+                        "effects": {"mute_operator": 0, "mute_associated": 0},
+                        "event_keys": [],
+                    }
+        if truncate_management:
+            account["events"] = []
+        return legacy
+
+    async def test_old_unban_backfills_only_mutes_already_existing_then(self):
+        now = int(time.time())
+        plugin = self.make_plugin({"management_resolution_decay_days": 30})
+        await self.mute(plugin, "old", now - 20 * 86400, 80)
+        await self.management(
+            plugin, "normal", "astrbot_unbanned", now - 15 * 86400,
+            resolution="normal",
+        )
+        await self.mute(plugin, "new", now - 10 * 86400, 35)
+
+        restarted = self.make_plugin({"management_resolution_decay_days": 30})
+        restarted._kv = self.without_mute_snapshots(plugin)
+        result = await restarted.get_profile_tags_with_score("11111")
+        self.assertEqual(result["score"], 75)
+        snapshot = restarted._management_account("11111")["mute_resolution"]
+        self.assertEqual(snapshot["effects"]["mute_operator"], 80)
+        self.assertEqual(snapshot["event_keys"], ["old"])
+        self.assertTrue(restarted._management_events_dirty)
+
+        await restarted._flush()
+        self.assertFalse(restarted._management_events_dirty)
+        third = self.make_plugin({"management_resolution_decay_days": 30})
+        third._kv = copy.deepcopy(restarted._kv)
+        self.assertEqual((await third.get_profile_tags_with_score("11111"))["score"], 75)
+        self.assertFalse(third._management_events_dirty)
+
+    async def test_v1161_empty_placeholder_is_rebuilt_once(self):
+        now = int(time.time())
+        plugin = self.make_plugin()
+        await self.mute(plugin, "old", now - 100, 80)
+        await self.management(
+            plugin, "appeal", "astrbot_unbanned", now - 50,
+            resolution="appeal_approved",
+        )
+        restarted = self.make_plugin()
+        restarted._kv = self.without_mute_snapshots(plugin, empty_snapshots=True)
+        self.assertEqual((await restarted.get_profile_tags_with_score("11111"))["score"], 0)
+        snapshot = restarted._management_account("11111")["appeal_mute_resolution"]
+        self.assertEqual(snapshot["effects"]["mute_operator"], 80)
+        self.assertEqual(snapshot["event_keys"], ["old"])
+
+        await restarted._flush()
+        third = self.make_plugin()
+        third._kv = copy.deepcopy(restarted._kv)
+        self.assertEqual((await third.get_profile_tags_with_score("11111"))["score"], 0)
+        self.assertFalse(third._management_events_dirty)
+
+    async def test_truncated_old_management_events_backfill_top_level_appeal(self):
+        now = int(time.time())
+        plugin = self.make_plugin()
+        await self.mute(plugin, "old", now - 100, 80)
+        await self.management(plugin, "delete", "bot_deleted_friend", now - 90)
+        await self.management(
+            plugin, "appeal", "astrbot_unbanned", now - 50,
+            resolution="appeal_approved",
+        )
+
+        restarted = self.make_plugin()
+        restarted._kv = self.without_mute_snapshots(plugin, truncate_management=True)
+        result = await restarted.get_profile_tags_with_score("11111")
+        self.assertEqual(result["score"], 0)
+        state = await restarted.get_management_state("11111")
+        self.assertEqual(state["mute_resolution"]["event_count"], 1)
+        self.assertEqual(state["mute_resolution"]["factor"], 0)
+        self.assertEqual(restarted._personal_mute_account("11111")["risk_total"], 80)
+
     async def test_legacy_aggregate_without_snapshot_stays_conservative(self):
         now = int(time.time())
         plugin = self.make_plugin()
         await plugin._ensure_loaded()
-        plugin._mute_events["11111"] = {
+        legacy_mute = {
             "events": [], "seen": [], "risk_total": 80,
             "risk_schema_version": 2, "legacy_risk_total": 80,
             "legacy_has_operator": True,
@@ -166,6 +261,8 @@ class MuteResolutionTests(unittest.IsolatedAsyncioTestCase):
             "operator_count": 1, "associated_count": 0,
             "last_risk_cap": 100, "last_time": now - 100,
         }
+        plugin._mute_events["11111"] = copy.deepcopy(legacy_mute)
+        plugin._kv.setdefault("up_bot_mute_events", {})["11111"] = copy.deepcopy(legacy_mute)
         await self.management(
             plugin, "appeal", "astrbot_unbanned", now - 50,
             resolution="appeal_approved",
@@ -174,6 +271,10 @@ class MuteResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["score"], 80)
         snapshot = plugin._management_account("11111")["appeal_mute_resolution"]
         self.assertEqual(snapshot["effects"]["mute_operator"], 0)
+
+        restarted = self.make_plugin()
+        restarted._kv = self.without_mute_snapshots(plugin)
+        self.assertEqual((await restarted.get_profile_tags_with_score("11111"))["score"], 80)
 
 
 if __name__ == "__main__":

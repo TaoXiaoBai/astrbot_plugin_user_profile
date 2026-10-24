@@ -6,6 +6,7 @@ from profile_core import (
     LLM_TAGS,
     build_material_fingerprint,
     normalize_config,
+    merge_long_term_traits,
     sanitize_llm_analysis,
     sanitize_llm_tags,
     speaker_lines,
@@ -69,6 +70,11 @@ class CoreTests(unittest.TestCase):
             "traits": [
                 {"name": "友善"}, "友善", "x" * 80, "稳定", "耐心", "活跃", "多余",
             ],
+            "long_term_traits": [
+                {"trait": "浅色界面偏好\x00", "confidence": 1.5, "reason": "多次提及"},
+                {"trait": "浅色界面偏好\x00", "confidence": 0.5},
+                {"trait": "缺配置"}, "不是对象",
+            ],
         }
         result = sanitize_llm_analysis(raw)
         self.assertEqual(LLM_SCHEMA_VERSION, 5)
@@ -77,6 +83,18 @@ class CoreTests(unittest.TestCase):
         self.assertLessEqual(len(result["impression"]), 240)
         self.assertEqual(len(result["traits"]), 5)
         self.assertTrue(all(len(value) <= 48 for value in result["traits"]))
+        self.assertEqual(len(result["long_term_traits"]), 1)
+        self.assertEqual(result["long_term_traits"][0]["confidence"], 1.0)
+        self.assertNotIn("\x00", result["long_term_traits"][0]["trait"])
+
+    def test_long_term_merge_preserves_first_seen_and_replaces_reviewed_set(self):
+        previous = [{"trait": "稳定偏好", "confidence": 0.7, "first_seen": 100}]
+        current = [{"trait": "稳定偏好", "confidence": 0.9, "reason": "再次确认"}]
+        merged = merge_long_term_traits(previous, current, 200)
+        self.assertEqual(merged[0]["first_seen"], 100)
+        self.assertEqual(merged[0]["last_confirmed"], 200)
+        self.assertEqual(merged[0]["confidence"], 0.9)
+        self.assertEqual(merge_long_term_traits(previous, [], 300), [])
 
     def test_fingerprint_changes_with_all_prompt_inputs(self):
         quotes = [{"text": "a"}]
