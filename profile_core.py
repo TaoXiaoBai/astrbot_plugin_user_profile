@@ -6,7 +6,7 @@ from typing import Any
 
 
 LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
-LLM_PROMPT_VERSION = 6  # 只触发刷新，不让旧成功画像在升级后消失
+LLM_PROMPT_VERSION = 7  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:
@@ -108,6 +108,7 @@ _DEFAULTS = {
     "tag_night_threshold": 0.3,
     "tag_behavior_min_samples": 10,
     "tag_qr_min_count": 2,
+    "risk_review_level": "中等",
     "risk_semantic_cap": 60,
     "risk_behavior_cap": 15,
     "management_resolution_decay_days": 30,
@@ -203,6 +204,8 @@ def normalize_config(config: dict | None) -> dict:
         value = _finite_number(flattened.get(key), _DEFAULTS[key])
         flattened[key] = max(low, min(high, value))
 
+    if flattened.get("risk_review_level") not in ("低敏感", "中等", "高敏感"):
+        flattened["risk_review_level"] = "中等"
     medium = flattened["tag_active_med_threshold"]
     flattened["tag_active_high_threshold"] = max(
         medium, flattened["tag_active_high_threshold"]
@@ -246,6 +249,9 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
             "source": "llm",
             "evidence": clean_text(item.get("reason", item.get("evidence")), 160),
         })
+        if tag == "nsfw_tendency":
+            severity = item.get("severity")
+            result[-1]["severity"] = severity if severity in ("mild", "clear", "severe") else "clear"
         if len(result) >= 5:
             break
     return result

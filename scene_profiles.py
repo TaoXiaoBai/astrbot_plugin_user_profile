@@ -74,6 +74,15 @@ def cached_view(plugin, qq, event=None, injection=False, scene=None):
     result.update(scene=selected, visibility="public" if selected == "group" else "private_derived",
                   sources=[name for name in ("group", "private") if valid(name)] if selected == "fused" else [selected],
                   status=entry.get("status", "not_requested"), time=entry.get("time", 0))
+    review_level = plugin.config.get("risk_review_level", "中等")
+    reviewed_entries = [entry] + ([valid(name) for name in ("group", "private")] if selected == "fused" else [])
+    reviewed_entries = [value for value in reviewed_entries if value]
+    result["review_level"] = review_level
+    result["review_pending"] = not reviewed_entries or any(
+        value.get("review_level") != review_level or value.get("refresh_status")
+        or value.get("schema_version") != LLM_PROMPT_VERSION
+        or value.get("status") != "success" for value in reviewed_entries
+    )
     result["sections"] = {}
     if selected == "fused":
         for name, label in (("group", "群聊表现"), ("private", "私聊表现")):
@@ -117,8 +126,10 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
         return
     provider = plugin.config.get("llm_provider_id") or plugin._tag_engine._default_provider_id(plugin.context)
     memory_enabled = bool(plugin.config.get("llm_long_term_memory", True))
+    review_level = plugin.config.get("risk_review_level", "中等")
+    request_config = dict(plugin.config, risk_review_level=review_level)
     fingerprint = build_material_fingerprint(
-        material, str(provider) + str(captured_policy) + scene + str(memory_enabled),
+        material, str(provider) + str(captured_policy) + scene + str(memory_enabled) + review_level,
         LLM_PROMPT_VERSION, stats=st, base_tags=tags,
     )
     root = plugin._tags_cache.get(qq) or {}
@@ -144,6 +155,8 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
         if (
             scene != "fused" and entry.get("status") == "success"
             and not refresh_status
+            and entry.get("review_level") == review_level
+            and entry.get("schema_version") == LLM_PROMPT_VERSION
             and now - entry.get("time", 0) < plugin.config["llm_refresh_interval"]
         ):
             plugin._llm_status[qq] = "cached_stale"
@@ -182,7 +195,13 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                             memory_present = memory_enabled and "long_term_traits" in raw
                             extra = {k: str(raw.get(k) or "")[:240] for k in ("common_traits", "differences", "confidence")}
                         else:
-                            raw = await plugin._tag_engine.generate_llm_tags(qq, st, material, tags, plugin.context, plugin.config, prior=entry if valid else None)
+                            prior = entry if valid else None
+                            if prior and prior.get("review_level") != review_level:
+                                # 切档重新审核风险，不让旧风险结论锚定；稳定特点仍需复核。
+                                prior = dict(prior, tags=[], impression="")
+                            raw = await plugin._tag_engine.generate_llm_tags(
+                                qq, st, material, tags, plugin.context, request_config, prior=prior,
+                            )
                             if isinstance(raw, dict):
                                 memory_present = bool(raw.get("_long_term_traits_present"))
                         analysis = sanitize_llm_analysis(raw)
@@ -191,7 +210,11 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                     status = "error"
                 try:
                     async with plugin._store_lock:
-                        if generation != plugin._user_generation(qq) or captured_policy != policy(plugin) or plugin._tag_request_versions.get(version_key) != version:
+                        if (
+                            generation != plugin._user_generation(qq) or captured_policy != policy(plugin)
+                            or plugin._tag_request_versions.get(version_key) != version
+                            or review_level != plugin.config.get("risk_review_level", "中等")
+                        ):
                             return
                         root = plugin._tags_cache.setdefault(qq, {"slots": {}})
                         slots = root.setdefault("slots", {})
@@ -223,7 +246,7 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                             value = dict(
                                 analysis, **extra, policy=list(captured_policy),
                                 fingerprint=fingerprint, status=status, time=int(time.time()),
-                                schema_version=LLM_PROMPT_VERSION,
+                                schema_version=LLM_PROMPT_VERSION, review_level=review_level,
                             )
                         if (
                             status == "success" and scene != "fused"

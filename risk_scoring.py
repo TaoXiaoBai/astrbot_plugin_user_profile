@@ -42,7 +42,7 @@ DEFAULT_WEIGHTS = {
     "ad_suspect": 25.0,
     "spam_suspect": 20.0,
     "troll": 15.0,
-    "nsfw_tendency": 15.0,
+    "nsfw_tendency": 40.0,
     "political_sensitive": 10.0,
     "qr_spammer": 10.0,
     "link_spammer": 5.0,
@@ -80,8 +80,13 @@ def bounded_int(value: Any, default: int, low: int = 0, high: int = 100) -> int:
     return max(low, min(high, int(finite_number(value, default))))
 
 
-def merged_weights(custom: Any = None) -> dict[str, float]:
+REVIEW_LEVELS = {"低敏感": 20.0, "中等": 40.0, "高敏感": 75.0}
+SEVERITY_FACTORS = {"mild": 0.5, "clear": 1.0, "severe": 1.5}
+
+
+def merged_weights(custom: Any = None, review_level: str = "中等") -> dict[str, float]:
     result = dict(DEFAULT_WEIGHTS)
+    result["nsfw_tendency"] = REVIEW_LEVELS.get(review_level, REVIEW_LEVELS["中等"])
     if not isinstance(custom, dict):
         return result
     for tag, value in custom.items():
@@ -98,7 +103,7 @@ def merged_weights(custom: Any = None) -> dict[str, float]:
     return result
 
 
-def unique_confidences(tags: Any) -> dict[str, float]:
+def unique_evidence_strengths(tags: Any) -> dict[str, float]:
     unique: dict[str, float] = {}
     for item in tags if isinstance(tags, list) else []:
         if not isinstance(item, dict):
@@ -107,6 +112,8 @@ def unique_confidences(tags: Any) -> dict[str, float]:
         if not tag:
             continue
         confidence = max(0.0, min(1.0, finite_number(item.get("confidence"), 0.0)))
+        if tag == "nsfw_tendency":
+            confidence *= SEVERITY_FACTORS.get(str(item.get("severity") or "clear"), 1.0)
         unique[tag] = max(unique.get(tag, 0.0), confidence)
     return unique
 
@@ -123,7 +130,7 @@ def calculate_tag_components(
         "behavior": bounded_int(behavior_cap, 15),
     }
     raw = {"verified": 0.0, "semantic": 0.0, "behavior": 0.0}
-    for tag, confidence in unique_confidences(tags).items():
+    for tag, confidence in unique_evidence_strengths(tags).items():
         category = TAG_CATEGORIES.get(tag)
         if category is None:
             continue
