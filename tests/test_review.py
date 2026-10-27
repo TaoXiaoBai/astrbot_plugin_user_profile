@@ -139,26 +139,25 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 score = calculate_tag_components(parsed["tags"], merged_weights(review_level=level))["semantic"]
                 self.assertEqual(score, {"低敏感": 18, "中等": 36, "高敏感": 60}[level] if tags else 0)
 
-    async def test_text_image_model_tool_and_context_explain_review(self):
+    async def test_ordinary_model_tool_and_context_hide_review(self):
         plugin = await self.prepared()
         plugin._fetch_stranger_info = AsyncMock(return_value={})
         event = Event({})
         model = await plugin._build_profile_model("11111", event)
-        self.assertEqual(model["review_level"], "中等")
-        lines = plugin._review_lines(model)
-        self.assertIn("已按本档审查", lines[0])
-        self.assertIn("明确", lines[1])
-        self.assertIn("主动索取", lines[1])
+        self.assertFalse(model["audit_details"])
+        self.assertNotIn("review_level", model)
+        self.assertEqual(plugin._review_lines(model), [])
         text = plugin._profile_model_to_text(model)
-        self.assertIn("审查：中等", text)
-        self.assertIn("内容关注", text)
+        self.assertNotIn("审查：", text)
+        self.assertNotIn("内容关注", text)
         tool = await plugin.user_profile_query(event, "11111")
-        self.assertIn("已按本档审查", tool)
+        self.assertNotIn("已按本档审查", tool)
+        self.assertNotIn("审查：", tool)
         context = await plugin._build_conversation_profile_context("11111", event)
-        self.assertIn("审查：中等", context)
+        self.assertNotIn("审查：", context)
         plugin.config["risk_review_level"] = "高敏感"
         context = await plugin._build_conversation_profile_context("11111", event)
-        self.assertIn("待复核", context)
+        self.assertNotIn("待复核", context)
 
     async def test_empty_switch_preserves_good_cache_and_memory_prior(self):
         plugin = await self.prepared()
@@ -174,7 +173,7 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prior["tags"], [])
         self.assertEqual(prior["long_term_traits"][0]["trait"], "稳定兴趣")
 
-    async def test_real_image_render_with_review_reopens_and_toggle_collapses(self):
+    async def test_public_image_render_reopens_and_tag_toggle_collapses(self):
         from PIL import Image
         plugin = await self.prepared()
         plugin._fetch_stranger_info = AsyncMock(return_value={})

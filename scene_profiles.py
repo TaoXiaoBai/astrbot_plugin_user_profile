@@ -185,7 +185,8 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                                       "只输出JSON: tags(空数组), impression(整体印象), traits(共通特征数组), "
                                       "common_traits, differences, confidence(均为短字符串)" + memory_prompt
                                       + "。缺一侧明确资料不足；场景差异不等于虚伪或恶意。"
-                                      "不得包含原话、好友验证语或具体私人事件。\n"
+                                      "不得包含原话、好友验证语或具体私人事件。"
+                                      "印象及特点只描述用户，不得复述后台配置、审查档位、缓存或复核状态。\n"
                                       + json.dumps(material, ensure_ascii=False))
                             response = await asyncio.wait_for(plugin.context.llm_generate(chat_provider_id=provider, prompt=prompt), plugin.config["llm_timeout_seconds"])
                             text = response.completion_text.strip()

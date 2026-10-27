@@ -95,8 +95,12 @@ class ManagementResolutionTests(unittest.IsolatedAsyncioTestCase):
         model = await plugin._build_profile_model("11111", None)
         self.assertTrue(model["has_record"])
         text = plugin._profile_model_to_text(model)
-        self.assertIn("申诉通过", text)
-        self.assertIn("历史风险已结清", text)
+        self.assertIn("解除 bot 黑名单", text)
+        self.assertNotIn("结清类型", text)
+        self.assertNotIn("历史风险已结清", text)
+        details = "\n".join(plugin._format_management_events("11111", include_details=True))
+        self.assertIn("申诉通过", details)
+        self.assertIn("历史风险已结清", details)
 
     async def test_repeat_ban_after_appeal_scores_full_again(self):
         now = int(time.time())

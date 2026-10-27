@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 import test_plugin
-from test_plugin import _new_stat
+from test_plugin import Event, _new_stat
 from risk_scoring import (
     DEFAULT_WEIGHTS,
     calculate_mute_components,
@@ -248,7 +248,15 @@ class RiskIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin._fetch_stranger_info = AsyncMock(return_value={})
         model = await plugin._build_profile_model("66666", None)
         self.assertTrue(model["has_record"])
-        self.assertIn("关联禁言 15", plugin._profile_model_to_text(model))
+        self.assertEqual(model["score"], 15)
+        public_text = plugin._profile_model_to_text(model)
+        self.assertIn("15 / 100", public_text)
+        self.assertNotIn("关联禁言 15", public_text)
+        admin = Event({"message_type": "private"}, group="")
+        admin.is_admin = lambda: True
+        admin_model = await plugin._build_profile_model("66666", admin)
+        self.assertEqual(admin_model["score"], 15)
+        self.assertIn("关联禁言 15", plugin._profile_model_to_text(admin_model))
 
     async def test_role_totals_survive_display_truncation_and_restart(self):
         plugin = self.risk_plugin({"mute_event_keep": 1})
