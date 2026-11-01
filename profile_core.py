@@ -4,9 +4,18 @@ import math
 import re
 from typing import Any
 
+try:
+    from .risk_dimensions import sanitize_events, sanitize_concerns
+    from .tag_catalog import LLM_TAGS, MAX_LLM_TAGS, select_profile_tags
+    from .tag_quality import consolidate_tags, safe_tag_refs
+except ImportError:
+    from risk_dimensions import sanitize_events, sanitize_concerns
+    from tag_catalog import LLM_TAGS, MAX_LLM_TAGS, select_profile_tags
+    from tag_quality import consolidate_tags, safe_tag_refs
+
 
 LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
-LLM_PROMPT_VERSION = 7  # 只触发刷新，不让旧成功画像在升级后消失
+LLM_PROMPT_VERSION = 11  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:
@@ -44,12 +53,6 @@ def quota_quotes(items: list, keep: int) -> list:
             result.append(item)
     return list(reversed(result))
 
-
-LLM_TAGS = frozenset({
-    "spam_suspect", "ad_suspect", "troll", "friendly", "helpful",
-    "nsfw_tendency", "political_sensitive", "scam_suspect", "repetitive",
-    "normal",
-})
 
 _DEFAULTS = {
     "allow_self_query": True,
@@ -97,6 +100,16 @@ _DEFAULTS = {
     "llm_max_concurrency": 3,
     "llm_material_max_chars": 6000,
     "llm_long_term_memory": True,
+    "age_protection_enabled": True,
+    "age_protection_use_qq_age": True,
+    "age_protection_qq_age_weight": 85,
+    "age_protection_provider_id": "",
+    "age_protection_max_chars": 24000,
+    "age_protection_cache_ttl": 300,
+    "age_protection_timeout_seconds": 180,
+    "age_protection_retry_count": 2,
+    "age_protection_retry_delay": 2,
+    "risk_dimension_mode": True,
     "tag_active_high_threshold": 100,
     "tag_active_med_threshold": 20,
     "tag_newcomer_days": 7,
@@ -142,6 +155,12 @@ _INT_RULES = {
     "llm_timeout_seconds": (1, 300),
     "llm_max_concurrency": (1, 20),
     "llm_material_max_chars": (500, 20000),
+    "age_protection_qq_age_weight": (0, 100),
+    "age_protection_max_chars": (500, 64000),
+    "age_protection_cache_ttl": (5, 3600),
+    "age_protection_timeout_seconds": (1, 600),
+    "age_protection_retry_count": (0, 4),
+    "age_protection_retry_delay": (0, 30),
     "tag_active_high_threshold": (1, 1000000),
     "tag_active_med_threshold": (1, 1000000),
     "tag_newcomer_days": (0, 3650),
@@ -232,29 +251,30 @@ def sanitize_llm_tags(raw: Any) -> list[dict]:
     if not isinstance(raw, list):
         return []
     result = []
-    seen = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
         tag = clean_text(item.get("tag"), 64).lower()
-        if tag not in LLM_TAGS or tag in seen:
+        if tag not in LLM_TAGS or isinstance(item.get("confidence"), bool):
             continue
         confidence = _finite_number(item.get("confidence"), -1)
         if confidence < 0:
             continue
-        seen.add(tag)
         result.append({
             "tag": tag,
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
             "source": "llm",
             "evidence": clean_text(item.get("reason", item.get("evidence")), 160),
         })
+        evidence_refs = safe_tag_refs(item.get("evidence_refs"))
+        if evidence_refs:
+            result[-1]["evidence_refs"] = evidence_refs
+        if item.get("support_kind") in ("explicit_preference", "observed_behavior"):
+            result[-1]["support_kind"] = item["support_kind"]
         if tag == "nsfw_tendency":
             severity = item.get("severity")
             result[-1]["severity"] = severity if severity in ("mild", "clear", "severe") else "clear"
-        if len(result) >= 5:
-            break
-    return result
+    return select_profile_tags(consolidate_tags(result))
 
 
 def sanitize_long_term_traits(raw: Any) -> list[dict]:
@@ -270,6 +290,9 @@ def sanitize_long_term_traits(raw: Any) -> list[dict]:
         trait = clean_text(item.get("trait", item.get("name")), 48)
         key = trait.casefold()
         confidence = _finite_number(item.get("confidence"), -1)
+        sensitive = trait + clean_text(item.get("reason", item.get("evidence")), 160)
+        if re.search(r"性经历|性行为|性侵|强奸|自慰|色情|私密|创伤|自杀|自残|未成年|年龄|生日|出生|疾病|病史|诊断|抑郁|性取向|性癖|受虐|受害", sensitive):
+            continue
         if not trait or key in seen or confidence < 0:
             continue
         seen.add(key)
@@ -326,6 +349,8 @@ def sanitize_llm_analysis(raw: Any) -> dict:
         "impression": impression,
         "traits": traits,
         "long_term_traits": sanitize_long_term_traits(raw.get("long_term_traits")),
+        **({"risk_events": sanitize_events(raw.get("risk_events"))} if "risk_events" in raw else {}),
+        **({"safety_concerns": sanitize_concerns(raw.get("safety_concerns"))} if "safety_concerns" in raw else {}),
     }
 
 

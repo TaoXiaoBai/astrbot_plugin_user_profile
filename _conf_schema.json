@@ -1,4 +1,20 @@
 {
+  "age_protection": {
+    "description": "年龄保护内部评估（不执行处罚）",
+    "type": "object",
+    "items": {
+      "age_protection_enabled": {"description": "启用年龄保护评估 API", "type": "bool", "default": true},
+      "age_protection_use_qq_age": {"description": "参考QQ资料年龄", "type": "bool", "default": true, "hint": "只在年龄评估查询阶段调用OneBot get_stranger_info并短时缓存；采集热路径不请求网络。仅校验归属的结构化age字段，0/缺失/非法/失败不当未成年；QQ资料可自行修改，不是实名核验。"},
+      "age_protection_qq_age_weight": {"description": "QQ资料年龄线索权重", "type": "int", "default": 85, "hint": "范围0-100，默认85为高优先级，交给LLM结合历史/当前材料综合判断；不是置信度百分比，不强制把模型置信度改成85%。0停止使用该线索。资料低于18岁强烈提示未成年，18岁以上是成年反证；与明确自述或生日冲突时不自动限制，仍遵守守卫独立门槛。"},
+      "age_protection_provider_id": {"description": "年龄评估模型（留空复用画像模型）", "type": "string", "default": ""},
+      "age_protection_max_chars": {"description": "年龄材料字符预算（500-64000，不是token）", "type": "int", "default": 24000, "hint": "仅控制送模型的材料字符数；单段最多min(8000,配置值)字符，不扩大历史扫描范围。"},
+      "age_protection_cache_ttl": {"description": "相同年龄材料缓存秒数（5-3600）", "type": "int", "default": 300},
+      "age_protection_timeout_seconds": {"description": "年龄评估总超时秒数（1-600，含排队与历史检索）", "type": "int", "default": 180, "hint": "provider自身timeout可能仍更短，需在模型提供商配置中另行确认。包含全部重试和退避等待，不按每次重试重新计时。"},
+      "age_protection_retry_count": {"description": "模型调用额外重试次数", "type": "int", "default": 2, "hint": "0-4，默认2表示插件层最多调用3次（底层SDK可能另有重试）。只重试短时429限流、5xx、连接错误、超时和空响应；额度耗尽、鉴权失败、上下文超限不重试同一提供方。合法unknown/成年/阴性结论不重试，不以重试改变审查结果。"},
+      "age_protection_retry_delay": {"description": "插件重试基础退避秒数", "type": "int", "default": 2, "hint": "0-30，默认2；指数退避加小幅随机抖动，单次最多30秒。尊重提供方数字Retry-After；要求等待超过单次上限或剩余总预算时停止，不提前重发。所有等待仍受年龄评估总超时限制。"},
+      "risk_dimension_mode": {"description": "启用证据维度升级评分", "type": "bool", "default": true, "hint": "score为有效分：semantic取max(原semantic,dimension_score)，管理/行为/禁言分不变，总和封顶100。compat_score保留原算法分。画像、日常上下文、榜单及可信API统一生效；关闭恢复原算法。尊重risk_semantic_cap和相关自定义权重，显式0不绕过。"}
+    }
+  },
   "basic": {
     "description": "基础开关",
     "type": "object",
@@ -319,7 +335,7 @@
         "description": "启用 LLM 画像分析",
         "type": "bool",
         "default": true,
-        "hint": "画像分析的核心开关，默认开启。LLM 会结合近期真实发言、基础统计标签和图片/链接/@/夜间发言等行为比例，返回严格清洗的结构化 JSON：最多 5 个白名单标签、人物印象和最多 5 项人格/行为特征。关闭后只保留规则标签与风险分，不影响 user_profile_query 工具是否可用。"
+        "hint": "画像分析核心开关，默认开启。从120种、10个维度的候选中，每场景最多生成24个标签，另含人物印象及最多5项人格/行为特征；规则与管理标签不占名额。新标签须引用本次实际送入的本人材料，普通描述置信自评至少0.6，风险标签不套用该描述门槛。兴趣需明确偏好或不同文本的多条讨论，不为凑数打标。群私分别分析，获准融合时合并不同标签并清理冗余；证据格式失败保留旧成功画像。关闭后不再调用画像分析模型，保留规则画像及已有缓存，不影响user_profile_query工具开关。"
       },
       "llm_long_term_memory": {
         "description": "启用长期特点记忆",
@@ -331,13 +347,13 @@
         "description": "画像分析模型",
         "type": "string",
         "default": "",
-        "hint": "执行用户画像语义分析的 AstrBot provider ID；留空自动读取 AstrBot 默认聊天模型（兼容 4.28 的 agent_runner.config.model.provider_id）。填写不存在或不可用的 ID 时自动降级为仅规则画像并写入日志。"
+        "hint": "执行用户画像语义分析的 AstrBot provider ID；留空读取默认聊天模型（兼容4.28的agent_runner.config.model.provider_id）。模型不可用时不自动切换其它提供方：已有成功画像继续保留并标记待复核，首次分析失败则主要依靠规则画像；按失败短缓存控制重试。"
       },
       "llm_tag_cache_ttl": {
         "description": "LLM 分析缓存时间",
         "type": "int",
         "default": 86400,
-        "hint": "LLM 成功画像的缓存秒数；0 表示关闭成功缓存。材料、历史消息数、provider 或 schema 变化会立即失效。"
+        "hint": "群聊/私聊成功分析按相同材料指纹复用的秒数；0停止TTL复用，但llm_refresh_interval最短刷新间隔仍生效。材料或provider变化会改变指纹，不保证立即重算；隐私策略、提示版本和审查档位变化可按需立即复核。融合结果按分支结论指纹复用。"
       },
       "llm_failure_cache_ttl": {
         "description": "LLM 空结果/失败短缓存",
@@ -434,7 +450,7 @@
         "description": "联动 QQ 黑名单",
         "type": "bool",
         "default": true,
-        "hint": "只读获取 astrbot_plugin_qq_tools 的 ban_list 以生成 ban_history；插件未安装或读取失败时自动跳过，不执行拉黑或其他写操作。"
+        "hint": "只读QQ Tools活动黑名单生成ban_history；过期/无效条目及owned年龄保护临时限制不计处罚分，旧无duration条目兼容永久。命令静默仍识别所有活动限制。插件未安装或读取失败自动跳过，不执行写操作。"
       },
       "silent_for_banned": {
         "description": "黑名单用户命令静默",

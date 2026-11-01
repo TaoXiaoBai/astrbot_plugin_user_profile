@@ -127,9 +127,11 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["review_level"], "高敏感")
 
     async def test_prompt_and_parse_chain_for_reasonable_and_improper_discussion(self):
+        from risk_dimensions import material_refs
         plugin = await self.prepared()
+        refs = list(material_refs("11111", plugin._quotes["11111"]))
         for level in ("低敏感", "中等", "高敏感"):
-            for tags in ([], [{"tag": "nsfw_tendency", "confidence": 0.9, "severity": "clear", "reason": "主动不当请求"}]):
+            for tags in ([], [{"tag": "nsfw_tendency", "confidence": 0.9, "severity": "clear", "reason": "主动不当请求", "subject": "self", "evidence_refs": refs}]):
                 plugin.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text=json.dumps({"tags": tags, "impression": "语境判断", "traits": []})))
                 parsed = await TagEngine(plugin.config).generate_llm_tags("11111", {}, plugin._quotes["11111"], [], plugin.context, dict(plugin.config, llm_provider_id="mock", risk_review_level=level))
                 prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]

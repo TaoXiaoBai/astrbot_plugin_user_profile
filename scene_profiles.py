@@ -4,6 +4,13 @@ import json
 import time
 
 try:
+    from .risk_dimensions import merge_events
+    from .tag_quality import consolidate_tags, tag_strength
+except ImportError:
+    from risk_dimensions import merge_events
+    from tag_quality import consolidate_tags, tag_strength
+
+try:
     from .profile_core import (
         LLM_PROMPT_VERSION, LLM_SCHEMA_VERSION, build_material_fingerprint,
         merge_long_term_traits, quote_scene, sanitize_llm_analysis,
@@ -68,9 +75,9 @@ def cached_view(plugin, qq, event=None, injection=False, scene=None):
         for name in ("group", "private"):
             for item in sanitize_llm_analysis(valid(name))["tags"]:
                 tag = item["tag"]
-                if tag not in unique or item["confidence"] > unique[tag]["confidence"]:
+                if tag not in unique or tag_strength(item) > tag_strength(unique[tag]):
                     unique[tag] = item
-        result["tags"] = list(unique.values())
+        result["tags"] = consolidate_tags(list(unique.values()))
     result.update(scene=selected, visibility="public" if selected == "group" else "private_derived",
                   sources=[name for name in ("group", "private") if valid(name)] if selected == "fused" else [selected],
                   status=entry.get("status", "not_requested"), time=entry.get("time", 0))
@@ -134,7 +141,8 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
     )
     root = plugin._tags_cache.get(qq) or {}
     if not isinstance(root, dict) or not isinstance(root.get("slots"), dict):
-        root = {"legacy": copy.deepcopy(root), "slots": {}}
+        retained = {key: root[key] for key in ("age_protection", "age_protection_attempt", "risk_evidence") if isinstance(root, dict) and key in root}
+        root = {"legacy": copy.deepcopy(root), "slots": {}, **retained}
         plugin._tags_cache[qq] = root
     entry = root["slots"].get(scene) or {}
     valid = entry.get("policy") == list(captured_policy)
@@ -256,6 +264,13 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                             slots.pop("fused", None)
                             fused_key = qq + ":fused"
                             plugin._tag_request_versions[fused_key] = plugin._tag_request_versions.get(fused_key, 0) + 1
+                        if status == "success" and scene != "fused":
+                            evidence = root.setdefault("risk_evidence", {})
+                            before = evidence.get(scene) or {}
+                            evidence[scene] = dict(
+                                policy=list(captured_policy),
+                                events=merge_events(before.get("events", []) if before.get("policy") == list(captured_policy) else [], analysis.get("risk_events", []), int(time.time())),
+                            )
                         slots[scene] = value
                         plugin._llm_status[qq] = status
                         plugin._tags_dirty = True

@@ -19,10 +19,21 @@ from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections
+    from .age_protection import assess as assess_age
+    from .risk_dimensions import material_refs, sanitize_events, score_dimensions
+    from .tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
+    from .tag_quality import ground_generated_tags, quote_tag_ref, tag_strength
+except ImportError:
+    from age_protection import assess as assess_age
+    from risk_dimensions import material_refs, sanitize_events, score_dimensions
+    from tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
+    from tag_quality import ground_generated_tags, quote_tag_ref, tag_strength
+
+try:
+    from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
     from .group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER, merge_guard_fallback
 except ImportError:
-    from scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections
+    from scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
     from group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER, merge_guard_fallback
 
 try:
@@ -167,7 +178,8 @@ _TAG_DISPLAY_NAMES = {
     "normal": "表现正常",
 }
 
-_POSITIVE_TAGS = frozenset({"friendly", "helpful", "normal"})
+_TAG_DISPLAY_NAMES.update({tag: item[0] for tag, item in TAG_CATALOG.items()})
+_POSITIVE_TAGS = POSITIVE_TAGS
 _RISK_TAGS = frozenset({
     "ban_history", "astrbot_banned", "bot_deleted_friend",
     "ad_suspect", "scam_suspect", "spam_suspect", "troll",
@@ -468,18 +480,25 @@ class TagEngine:
         limit = int(config.get("llm_material_max_chars", 6000))
         material_lines = []
         used = 0
-        for quote in quotes[-20:]:
+        refs = {}
+        tag_materials = {}
+        for quote in reversed(quotes[-20:]):
             if not isinstance(quote, dict):
                 continue
             text = clean_text(quote.get("text"), _QUOTE_MAX_LEN)
             if not text:
                 continue
-            line = f"- [来源={quote_scene(quote)}; 群={clean_text(quote.get('group_id'), 24)}; 时间={quote.get('t', 0)}] {text}"
+            normalized = dict(quote, text=text, scene=quote_scene(quote))
+            quote_refs = material_refs(qq, [normalized])
+            ref = quote_tag_ref(qq, normalized, quote_refs)
+            line = f"- [ref={ref}; 来源={quote_scene(quote)}; 群={clean_text(quote.get('group_id'), 24)}; 时间={quote.get('t', 0)}] {text}"
             if used + len(line) + 1 > limit:
-                break
+                continue
+            refs.update(quote_refs)
+            tag_materials[ref] = normalized
             material_lines.append(line)
             used += len(line) + 1
-        material = "\n".join(material_lines)
+        material = "\n".join(reversed(material_lines))
         if not material:
             return empty
         st = st if isinstance(st, dict) else {}
@@ -532,10 +551,11 @@ class TagEngine:
                         for item in prior_memory
                     ))
                 lines.append(
-                    "修正规则：历史标签是既有结论，新材料不能明确反驳就保留"
-                    "（confidence 可按新材料调整）；impression 输出的是在历史"
-                    "印象基础上的修正版，只依据新材料做有限更新，不得整段抛弃"
-                    "历史印象。长期特点同样需要复核，不应因措辞变化重复堆叠。"
+                    "修正规则：历史标签是待复核结论，不是新的发言证据，不能因为上次打过就无限保留。"
+                    "本次tags只能引用当前真实材料ref；近期没提及不等于反证，稳定偏好和长期特点应结合"
+                    "历史在long_term_traits中复核，不要把临时行为强行永久化。"
+                    "impression在历史印象基础上有限更新，不因几句新话整段推翻；"
+                    "当前表现与历史不同应注明语境差异，不直接推断伪装或人格改变。"
                 )
                 prior_block = "\n".join(lines) + "\n"
         memory_prompt = (
@@ -564,11 +584,34 @@ class TagEngine:
             f"行为信号：{'；'.join(signals) if signals else '无额外信号'}\n"
             f"{prior_block}"
             f"<untrusted_evidence>\n{material}\n</untrusted_evidence>\n"
-            f"只输出 JSON 对象，字段严格为 tags、impression、traits{memory_prompt}。tags 从 "
-            "spam_suspect, ad_suspect, troll, friendly, helpful, nsfw_tendency, "
-            "political_sensitive, scam_suspect, repetitive, normal 中选择 0-5 个，"
-            "每项包含 tag、0 到 1 的 confidence、最多一句 reason；impression 是不超过"
-            "120 个汉字的一段人物印象；traits 是 0-5 个不超过 24 个汉字的人格或行为短语。"
+            "额外输出risk_events数组，每项dimension(content_boundary/harassment/fraud)、severity(mild/clear/severe/critical)、"
+            "confidence(数字0到1)、subject(self/third_party/uncertain)、evidence_refs(仅引用上文真实ref)、episode_id(选证据ref)。"
+            "只记录明确本人主动行为，不因弱行为推断人格风险。同一事件不能重复；模型不得自造ref、时间或事件。"
+            "危险自述、受害经历、身份不明和未成年均不计处罚分，只放safety_concerns数组kind(dangerous_self_report/identity_uncertain)。"
+            "敏感性经历、年龄、具体私密事件不得写入长期特点，不保存具体私人原话作为风险理由。"
+            f"只输出 JSON 对象，字段为risk_events、safety_concerns、tags、impression、traits{memory_prompt}。\n"
+            f"标签候选目录：\n{tag_prompt_catalog()}\n"
+            f"tags 从上述目录选择 0-{MAX_LLM_TAGS} 个不同标签，材料充分时综合表达方式、兴趣话题、协作、互动、学习方式、"
+            "决策习惯、边界与分歧、反馈习惯和社群参与，不局限于风险或笼统的normal。"
+            "先选最能区分此人的具体特征，避免一串近义词或全是兴趣词；并非每个维度都必须有标签。"
+            "数量是上限不是任务，不为凑数编造；每个标签必须有可追溯的行为依据。"
+            "偏好不是能力评级，关注成本不代表经济状况，讨论原理不代表学历，冲突处理不代表心理诊断。"
+            "边界与分歧、社群参与须有实际互动证据，没有机会观察时保持未知；"
+            "不能因没有正向标签反推不尊重边界、不会合作或存在风险。"
+            "兴趣须有本人主动讨论或反复表达的偏好，单次提及、引用第三人、求助遭遇不代表兴趣或稳定人格。"
+            "不推断职业、经济状况、健康、宗教、性取向等敏感身份，不以兴趣或表达习惯推导风险。"
+            "相同含义不要重复选；brief_answer_preference和step_by_step_preference等不同偏好只有语境依据充分时才能并存。"
+            "normal仅在有足够材料且无更具体描述、无内容风险时作为兜底，不挤占具体标签。"
+            "内容关注证据优先返回，不因正向标签抵消风险；群聊/私聊结论只使用当前获准材料。"
+            "每项包含tag、数字confidence(0到1)、最多一句不含私密原话的reason、subject(self/third_party/uncertain)、"
+            "evidence_refs(当前实际材料ref数组，1-8个)、support_kind(explicit_preference/observed_behavior)。"
+            "只给本人行为打标，第三人/角色扮演/归属不明不进入本人标签。"
+            "普通描述标签confidence低于0.6不输出；该值是模型可靠性自评，不是校准概率，也不是风险严重度。"
+            "兴趣须为本人明确偏好(explicit_preference)，或至少两条内容不同的实际讨论(observed_behavior)，"
+            "同一句重复发送不算多次证据；不要把临时求助自动视为长期爱好。"
+            "r_引用含真实时间；t_引用缺时间，只可描述该材料中的行为，不得制造日期或用于risk_events计时。"
+            "已有宽泛标签被同一材料的具体标签覆盖时优先具体描述，但不同语境的偏好不强行互斥。"
+            "impression是不超过120个汉字的一段人物印象；traits是0-5个不超过24个汉字的人格或行为短语。"
         )
         resp = await asyncio.wait_for(
             context.llm_generate(chat_provider_id=provider_id, prompt=prompt),
@@ -578,6 +621,16 @@ class TagEngine:
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S).strip()
         decoded = json.loads(text)
+        if not isinstance(decoded, dict):
+            raise ValueError("profile_analysis_must_be_object")
+        raw_tags = decoded.get("tags", [])
+        if not isinstance(raw_tags, list):
+            raise ValueError("profile_tags_must_be_array")
+        decoded["tags"] = ground_generated_tags(raw_tags, tag_materials)
+        if raw_tags and not decoded["tags"]:
+            # 模型漏返回依据是格式/证据失败，不把最后成功画像清空。
+            raise ValueError("profile_tags_without_grounded_evidence")
+        decoded["risk_events"] = sanitize_events(decoded.get("risk_events"), refs)
         analysis = sanitize_llm_analysis(decoded)
         analysis["_long_term_traits_present"] = bool(
             memory_enabled and isinstance(decoded, dict) and "long_term_traits" in decoded
@@ -686,7 +739,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.18.1",
+    "1.22.0",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -725,6 +778,25 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         self._scan_semaphore = asyncio.Semaphore(self.config["history_scan_concurrency"])
         self._llm_status: dict[str, str] = {}
         self._tag_engine = TagEngine(self.config)
+        self._age_flights = {}
+        self._age_versions = {}
+        self._age_semaphore = self._llm_semaphore
+
+    async def assess_age_protection(self, qq: str, event, force: bool = False) -> dict:
+        """可信内部 API：只评估本人年龄保护状态，不执行动作或计处罚分。"""
+        return await assess_age(self, qq, _unwrap_event(event), force=force)
+
+    async def review_age_protection(self, qq: str, event, force: bool = True) -> dict:
+        """真实管理员私聊的明确目标审查；仅评估，动作由调用方负责。"""
+        return await assess_age(self, qq, _unwrap_event(event), force=force, admin_review=True)
+
+    def _can_review_age_protection(self, event) -> bool:
+        if not self._can_show_audit_details(event):
+            return False
+        try:
+            return str(self._field(self._raw_event(event), "message_type")).lower() == "private"
+        except Exception:
+            return False
 
     def _enabled(self) -> bool:
         return bool(self.config.get("enable", True))
@@ -774,10 +846,10 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         value = copy.deepcopy(result)
         value["audit_details"] = self._can_show_audit_details(event)
         if not value["audit_details"]:
-            for key in ("review_level", "review_pending", "risk_components", "llm_status", "partial_errors", "sources", "source", "evidence"):
+            for key in ("review_level", "review_pending", "risk_components", "llm_status", "partial_errors", "sources", "source", "evidence", "risk_events", "risk_evidence", "risk_dimensions", "dimension_score", "dimension_status", "compat_score", "safety_concerns", "age_protection", "age_protection_attempt", "age_protection_review", "age_protection_review_attempt", "diagnostics"):
                 value.pop(key, None)
             for tag in value.get("tags") or []:
-                for key in ("source", "evidence", "reason", "severity", "content_risk"):
+                for key in ("source", "evidence", "reason", "severity", "content_risk", "evidence_refs", "support_kind"):
                     tag.pop(key, None)
         return value
 
@@ -906,7 +978,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         relations = self._conversation_relation_lines(qq, event)
         if not (has_activity or labels or analysis["impression"] or analysis["traits"]
                 or analysis["long_term_traits"] or management or mute_lines or social
-                or ban_lines or relations
+                or ban_lines or relations or snapshot.get("score") is not None
                 or scene_for(self, qq, event, injection=True) == "fused"):
             return ""
         score = snapshot["score"]
@@ -1805,7 +1877,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         model["audit_details"] = self._can_show_audit_details(event)
         if not model["audit_details"]:
             for item in model.get("items") or []:
-                for key in ("evidence", "tag_sources", "semantic_status", "semantic_time", "risk_components"):
+                for key in ("evidence", "tag_sources", "semantic_status", "semantic_time", "risk_components", "compat_score", "dimension_score", "risk_dimensions", "dimension_status"):
                     item.pop(key, None)
         text_output = self._ranking_model_to_text(model)
         path = None
@@ -1923,7 +1995,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         unique = {}
         for item in base_tags + mute_tags + management_tags + semantic_tags:
             name = item.get("tag")
-            if name not in unique or _finite_float(item.get("confidence"), 0) > _finite_float(unique[name].get("confidence"), 0):
+            if name not in unique or tag_strength(item) > tag_strength(unique[name]):
                 unique[name] = item
         tags = sorted(unique.values(), key=lambda item: _finite_float(item.get("confidence"), 0), reverse=True)
         assessment = self._risk_assessment(qq, tags, scope=risk_scope)
@@ -2001,6 +2073,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 f"   主要依据：{evidence}\n"
                 f"   标签来源：{sources}｜历史管理事件：{item['management_count']}｜当前黑名单：{'是' if item['currently_banned'] else '否'}｜语义：{semantic}"
             )
+            if "compat_score" in item:
+                lines.append(f"   原算法兼容分：{item['compat_score']}｜行为维度语义候选：{item.get('dimension_score')}（与原语义分取高）")
         if model["page"] < model["pages"]:
             lines.append(f"下一页：/画像排名 {model['scope']} {model['page'] + 1}")
         lines.append("提示：快照不会主动刷新语义分析；材料不足或尚未分析不等于低风险。")
@@ -2310,6 +2384,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "nickname": nickname,
             "avatar_bytes": avatar_bytes,
             "has_record": has_record,
+            "compat_score": result.get("compat_score"),
+            "dimension_score": result.get("dimension_score"),
+            "risk_dimensions": copy.deepcopy(result.get("risk_dimensions") or {}),
             "score": result.get("score"),
             "level": clean_text(result.get("level"), 10) or "未知",
             "risk_status": result.get("risk_status", "no_evidence"),
@@ -2340,6 +2417,14 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             return []
         state = "沿用历史结果/待复核（或尚未生成）" if model.get("review_pending", True) else "已按本档审查"
         lines = [f"审查：{model.get('review_level', '中等')} · {state}"]
+        if "compat_score" in model:
+            lines.append(f"原算法兼容分：{model['compat_score'] if model['compat_score'] is not None else '未知'}")
+        if model.get("dimension_score") is not None:
+            lines.append(f"行为维度语义候选：{model['dimension_score']}（与原语义分取高，不相加）")
+            labels = {"content_boundary": "内容边界", "harassment": "骚扰", "fraud": "欺诈"}
+            for key, value in (model.get("risk_dimensions") or {}).items():
+                if key in labels and isinstance(value, dict):
+                    lines.append(f"{labels[key]}：{value.get('score', 0)}；独立事件 {value.get('episodes', 0)}；持续系数 {value.get('persistence', 1)}")
         for item in model.get("tags") or []:
             if item.get("content_risk"):
                 lines.append(f"内容关注（{item.get('severity', '明确')}）：{item.get('evidence') or '历史标签未附理由'}")
@@ -2965,6 +3050,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             not re.fullmatch(r"\d{5,12}", qq) or not event_key
             or event_type not in _MANAGEMENT_EVENT_TYPES or not source
             or result != "success"
+            or (source == "age_protection" and event_type in ("astrbot_banned", "astrbot_unbanned"))
             or (resolution and resolution not in _MANAGEMENT_RESOLUTIONS)
             or (resolution and event_type != "astrbot_unbanned")
         ):
@@ -3452,7 +3538,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         unique = {}
         for item in base_tags + llm_tags:
             name = item.get("tag")
-            if name not in unique or item.get("confidence", 0) > unique[name].get("confidence", 0):
+            if name not in unique or tag_strength(item) > tag_strength(unique[name]):
                 unique[name] = item
         return sorted(unique.values(), key=lambda x: x["confidence"], reverse=True)
 
@@ -3532,6 +3618,11 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "visibility": result.get("visibility"),
             "sources": result.get("sources", []),
             "sections": result.get("sections", {}),
+            "compat_score": result.get("compat_score", result.get("score")),
+            "dimension_score": result.get("dimension_score"),
+            "risk_dimensions": copy.deepcopy(result.get("risk_dimensions") or {}),
+            "dimension_status": result.get("dimension_status", "disabled"),
+            "safety_concerns": copy.deepcopy(result.get("safety_concerns") or []),
             "qq": qq,
             "score": result.get("score"),
             "level": str(result.get("level") or "未知"),
@@ -3575,9 +3666,28 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             components.get(key, 0) > 0 for key in ("mute_operator", "mute_associated")
         )
         has_evidence = bool(tags) or has_mute_risk
+        compat_score = max(0, min(100, sum(components.values()))) if has_evidence else None
+        dimensions = {"dimension_score": None, "risk_dimensions": {}, "dimension_status": "disabled"}
+        if self.config.get("risk_dimension_mode", True):
+            root = (self._tags_cache or {}).get(str(qq)) or {}
+            evidence = root.get("risk_evidence") if isinstance(root, dict) else {}
+            evidence = evidence if isinstance(evidence, dict) else {}
+            expected = list(scene_policy(self))
+            selected = scope or "group"
+            names = ("group", "private") if selected == "fused" and expected[1:] == [True, True] else (selected,)
+            events = []
+            for name in names:
+                if name == "private" and not expected[1]:
+                    continue
+                entry = evidence.get(name) or {}
+                if isinstance(entry, dict) and entry.get("policy") == expected:
+                    events.extend(entry.get("events") or [])
+            dimensions = score_dimensions(events, int(time.time()), self.config)
+            components["semantic"] = max(components.get("semantic", 0), dimensions["dimension_score"])
+            has_evidence = has_evidence or dimensions["dimension_status"] == "evidence"
         score = max(0, min(100, sum(components.values()))) if has_evidence else None
         return {
-            "score": score,
+            "score": score, "compat_score": compat_score, **dimensions,
             "level": _risk_level(score, self.config),
             "risk_status": "ready" if has_evidence else "no_evidence",
             "risk_components": components,
@@ -3777,12 +3887,33 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if not sender or not re.fullmatch(r"\d{5,12}", str(sender)):
             return False
         try:
-            return bool(await self._load_ban_entry(str(sender)))
+            return bool(await self._load_ban_entry(str(sender), include_safety=True))
         except Exception as exc:
             logger.warning(f"user_profile: ban silence check failed: {exc}")
             return False
 
-    async def _load_all_ban_entries(self) -> dict[str, list[str]]:
+    @staticmethod
+    def _active_ban(item: dict, now: float) -> bool:
+        try:
+            if item.get("temporary_safety_ban") is True and item.get("expires_at", 0) != 0:
+                expiry = item.get("expires_at")
+                return type(expiry) in (int, float) and math.isfinite(expiry) and expiry > now
+            duration = item.get("duration", -1)
+            if isinstance(duration, bool):
+                return False
+            duration = float(duration)
+            if duration == -1:
+                return True
+            start = item.get("ban_time", 0)
+            if isinstance(start, bool):
+                return False
+            start = float(start)
+            expiry = start + duration
+            return duration > 0 and start >= 0 and all(map(math.isfinite, (start, duration, expiry))) and expiry > now
+        except (ValueError, TypeError, OverflowError):
+            return False
+
+    async def _load_all_ban_entries(self, include_safety: bool = False) -> dict[str, list[str]]:
         if not self.config.get("link_qq_tools_ban", True):
             return {}
         try:
@@ -3802,8 +3933,11 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if not isinstance(ban_list, list):
             return {}
         result: dict[str, list[str]] = {}
+        now = time.time()
         for item in ban_list:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or not self._active_ban(item, now):
+                continue
+            if not include_safety and item.get("temporary_safety_ban") is True and item.get("source") == "age_protection":
                 continue
             qq = str(item.get("user_id") or "").strip()
             if not re.fullmatch(r"\d{5,12}", qq):
@@ -3814,9 +3948,10 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             )
         return result
 
-    async def _load_ban_entry(self, qq: str) -> list:
-        """读取 qq_tools 黑名单中此 QQ 的条目；未装 qq_tools 或读取失败返回空。"""
-        return (await self._load_all_ban_entries()).get(str(qq), [])
+    async def _load_ban_entry(self, qq: str, include_safety: bool = False) -> list:
+        """读取活动黑名单；默认只供处罚评分，静默访问检查额外包含保护限制。"""
+        entries = await self._load_all_ban_entries(include_safety=True) if include_safety else await self._load_all_ban_entries()
+        return entries.get(str(qq), [])
 
     # ---------------- 会话历史扫描与回填 ----------------
 
@@ -4541,6 +4676,12 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 self._friend_snapshots_dirty = False
 
     async def terminate(self):
+        age_tasks = [task for task in self._age_flights.values() if not task.done()]
+        for task in age_tasks:
+            task.cancel()
+        if age_tasks:
+            await asyncio.gather(*age_tasks, return_exceptions=True)
+        self._age_flights.clear()
         reconcile_tasks = [
             task for task in self._friend_reconcile_flights.values() if not task.done()
         ]
@@ -4633,9 +4774,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
     # ---------------- 工具 ----------------
 
     async def _fetch_stranger_info(self, qq: str, event) -> dict | None:
-        """取昵称等信息（OneBot get_stranger_info）；非 OneBot 平台或失败返回 None。"""
+        """读取结构化QQ资料；失败只返回固定状态码，不带异常或原始回包。"""
         bot = getattr(event, "bot", None)
-        if bot is None:
+        if bot is None or not any(callable(getattr(bot, name, None)) for name in ("get_stranger_info", "call_action", "call_api")):
             return None
         try:
             info = await asyncio.wait_for(
@@ -4644,10 +4785,11 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 ),
                 timeout=3,
             )
-        except Exception as exc:
-            logger.warning(f"user_profile: get_stranger_info {qq} failed: {exc}")
-            return None
-        return info if isinstance(info, dict) else None
+        except asyncio.TimeoutError:
+            return {"_age_fetch_status": "timeout"}
+        except Exception:
+            return {"_age_fetch_status": "error"}
+        return info if isinstance(info, dict) else {"_age_fetch_status": "unavailable"}
 
     async def _prepare_avatar_bytes(self, qq: str, stranger: dict) -> bytes | None:
         candidates = []

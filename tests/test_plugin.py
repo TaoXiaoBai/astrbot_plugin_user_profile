@@ -754,7 +754,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("legacy", plugin._tags_cache["11111"])
         cached = plugin._tags_cache["11111"]["slots"]["group"]
-        self.assertEqual(cached["schema_version"], 7)
+        from profile_core import LLM_PROMPT_VERSION
+        self.assertEqual(cached["schema_version"], LLM_PROMPT_VERSION)
         self.assertEqual(cached["impression"], "友好")
         self.assertEqual(cached["traits"], ["稳定"])
 
