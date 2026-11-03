@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 
 try:
     from .tag_catalog import TAG_CATALOG, SEMANTIC_RISK_TAGS
@@ -84,9 +85,19 @@ def ground_generated_tags(raw, materials: dict) -> list[dict]:
         if not isinstance(item, dict) or not isinstance(item.get("tag"), str) or item["tag"] not in TAG_CATALOG:
             continue
         confidence = item.get("confidence")
-        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
             continue
-        if item.get("subject") != "self" or not isinstance(item.get("reason"), str) or not item["reason"].strip():
+        try:
+            confidence = float(confidence)
+        except (ValueError, OverflowError):
+            continue
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            continue
+        reason = item.get("reason")
+        if item.get("subject") != "self" or not isinstance(reason, str):
+            continue
+        reason = " ".join("".join(ch for ch in reason if not unicodedata.category(ch).startswith("C")).split())[:160]
+        if not reason:
             continue
         requested = item.get("evidence_refs")
         if not isinstance(requested, list) or not requested or len(requested) > 8:
@@ -103,9 +114,31 @@ def ground_generated_tags(raw, materials: dict) -> list[dict]:
         if support not in ("explicit_preference", "observed_behavior"):
             continue
         if TAG_CATALOG[tag][1] == "兴趣话题" and support != "explicit_preference":
-            # 同句重复、拆份引用或同一消息多个ref不算反复兴趣。
-            texts = {materials[ref]["text"].strip() for ref in refs}
+            # 标点、空白、大小写或全半角变体不算新的独立讨论。
+            texts = {evidence_text_key(materials[ref]["text"]) for ref in refs}
+            texts.discard("")
             if len(texts) < 2:
                 continue
-        result.append(dict(item, evidence_refs=refs, support_kind=support))
+        result.append(dict(item, confidence=confidence, reason=reason, evidence_refs=refs, support_kind=support))
+    return result
+
+
+def evidence_text_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(ch for ch in normalized
+                   if not ch.isspace() and unicodedata.category(ch)[0] not in ("P", "C"))
+
+
+def validate_generated_tags(raw: list, materials: dict) -> list[dict]:
+    """结构或风险证据不完整时整次失败，避免正向有效项掩盖错误风险项。"""
+    if len(raw) > 240:
+        raise ValueError("profile_tags_exceed_candidate_budget")
+    result = []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("tag"), str) or item["tag"] not in TAG_CATALOG:
+            raise ValueError("profile_unknown_or_malformed_tag")
+        accepted = ground_generated_tags([item], materials)
+        if item["tag"] in SEMANTIC_RISK_TAGS and not accepted:
+            raise ValueError("profile_risk_tag_without_grounded_evidence")
+        result.extend(accepted)
     return result

@@ -15,7 +15,7 @@ except ImportError:
 
 
 LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
-LLM_PROMPT_VERSION = 11  # 只触发刷新，不让旧成功画像在升级后消失
+LLM_PROMPT_VERSION = 12  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:

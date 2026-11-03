@@ -22,12 +22,12 @@ try:
     from .age_protection import assess as assess_age
     from .risk_dimensions import material_refs, sanitize_events, score_dimensions
     from .tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
-    from .tag_quality import ground_generated_tags, quote_tag_ref, tag_strength
+    from .tag_quality import validate_generated_tags, quote_tag_ref, tag_strength
 except ImportError:
     from age_protection import assess as assess_age
     from risk_dimensions import material_refs, sanitize_events, score_dimensions
     from tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
-    from tag_quality import ground_generated_tags, quote_tag_ref, tag_strength
+    from tag_quality import validate_generated_tags, quote_tag_ref, tag_strength
 
 try:
     from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
@@ -608,7 +608,7 @@ class TagEngine:
             "只给本人行为打标，第三人/角色扮演/归属不明不进入本人标签。"
             "普通描述标签confidence低于0.6不输出；该值是模型可靠性自评，不是校准概率，也不是风险严重度。"
             "兴趣须为本人明确偏好(explicit_preference)，或至少两条内容不同的实际讨论(observed_behavior)，"
-            "同一句重复发送不算多次证据；不要把临时求助自动视为长期爱好。"
+            "同一句重复发送、仅改标点/空白/大小写/全半角不算多次证据；不要把临时求助自动视为长期爱好。"
             "r_引用含真实时间；t_引用缺时间，只可描述该材料中的行为，不得制造日期或用于risk_events计时。"
             "已有宽泛标签被同一材料的具体标签覆盖时优先具体描述，但不同语境的偏好不强行互斥。"
             "impression是不超过120个汉字的一段人物印象；traits是0-5个不超过24个汉字的人格或行为短语。"
@@ -626,7 +626,7 @@ class TagEngine:
         raw_tags = decoded.get("tags", [])
         if not isinstance(raw_tags, list):
             raise ValueError("profile_tags_must_be_array")
-        decoded["tags"] = ground_generated_tags(raw_tags, tag_materials)
+        decoded["tags"] = validate_generated_tags(raw_tags, tag_materials)
         if raw_tags and not decoded["tags"]:
             # 模型漏返回依据是格式/证据失败，不把最后成功画像清空。
             raise ValueError("profile_tags_without_grounded_evidence")
@@ -739,7 +739,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.22.0",
+    "1.22.1",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):

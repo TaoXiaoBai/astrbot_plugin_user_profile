@@ -123,8 +123,8 @@ class TagQualityIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 {"tag": "troll", "confidence": 1, "reason": "未选材料", "subject": "self", "evidence_refs": [old_ref]},
             ]}))
         plugin.context.llm_generate = AsyncMock(side_effect=respond)
-        result = await plugin._tag_engine.generate_llm_tags("11111", {}, quotes, [], plugin.context, plugin.config)
-        self.assertEqual([item["tag"] for item in result["tags"]], ["friendly"])
+        with self.assertRaisesRegex(ValueError, "profile_risk_tag_without_grounded_evidence"):
+            await plugin._tag_engine.generate_llm_tags("11111", {}, quotes, [], plugin.context, plugin.config)
 
     async def test_unverifiable_response_preserves_successful_cache(self):
         plugin = self.make_plugin({"llm_provider_id": "mock", "history_scan_enabled": False,
