@@ -436,6 +436,42 @@
       "risk_level_extreme": {"description": "高到极高分界", "type": "int", "default": 80, "hint": "风险分达到此值显示为“极高”，范围建议 0-100，并应高于高风险分界。"}
     }
   },
+  "tease_guard": {
+    "description": "趣味自检拦截",
+    "type": "object",
+    "items": {
+      "tease_guard_enabled": {
+        "description": "启用趣味自检拦截",
+        "type": "bool",
+        "default": true,
+        "hint": "纯娱乐功能：普通用户在时间窗内多次用 /我、/我的画像 或 /画像 自己 查看本人画像，且已有画像缓存显示其带有不低于阈值的不友善/挑衅语义标签时，取消本次画像发送，并回复一句趣味提示。只读缓存、零 LLM 零网络；管理员、查询他人、LLM 查询工具和黑名单静默逻辑不受影响。计数仅存内存，重启清零。"
+      },
+      "tease_guard_window_seconds": {
+        "description": "计数时间窗（秒）",
+        "type": "int",
+        "default": 600,
+        "hint": "自检查询计数的滑动窗口秒数，范围 60-86400。窗口内本人查询次数达到阈值才会进入风险判断。"
+      },
+      "tease_guard_min_queries": {
+        "description": "触发所需查询次数",
+        "type": "int",
+        "default": 3,
+        "hint": "窗口内本人查询画像的最少次数，范围 2-50。达到次数后才检查不友善标签。"
+      },
+      "tease_guard_min_confidence": {
+        "description": "不友善标签置信阈值",
+        "type": "float",
+        "default": 0.6,
+        "hint": "已有语义缓存中抬杠/钓鱼、不适宜内容、诈骗、刷屏、广告或敏感倾向标签的置信度达到此值（0-1）才触发拦截；低于阈值照常发送。"
+      },
+      "tease_guard_message": {
+        "description": "自定义拦截提示语",
+        "type": "string",
+        "default": "",
+        "hint": "拦截时发送的固定文案，最长 200 字符；留空使用内置趣味提示随机一句。"
+      }
+    }
+  },
   "link": {
     "description": "插件联动",
     "type": "object",

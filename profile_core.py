@@ -129,6 +129,11 @@ _DEFAULTS = {
     "risk_level_low": 30,
     "risk_level_high": 60,
     "risk_level_extreme": 80,
+    "tease_guard_enabled": True,
+    "tease_guard_window_seconds": 600,
+    "tease_guard_min_queries": 3,
+    "tease_guard_min_confidence": 0.6,
+    "tease_guard_message": "",
 }
 
 _INT_RULES = {
@@ -174,6 +179,8 @@ _INT_RULES = {
     "risk_level_low": (0, 100),
     "risk_level_high": (0, 100),
     "risk_level_extreme": (0, 100),
+    "tease_guard_window_seconds": (60, 86400),
+    "tease_guard_min_queries": (2, 50),
 }
 
 _FLOAT_RULES = {
@@ -181,6 +188,7 @@ _FLOAT_RULES = {
     "tag_link_threshold": (0.0, 1.0),
     "tag_mention_threshold": (0.0, 1.0),
     "tag_night_threshold": (0.0, 1.0),
+    "tease_guard_min_confidence": (0.0, 1.0),
 }
 
 

@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import time
 import urllib.request
@@ -21,12 +22,12 @@ from astrbot.api.star import Context, Star, register
 try:
     from .age_protection import assess as assess_age
     from .risk_dimensions import material_refs, sanitize_events, score_dimensions
-    from .tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
+    from .tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, SEMANTIC_RISK_TAGS, tag_prompt_catalog
     from .tag_quality import validate_generated_tags, quote_tag_ref, tag_strength
 except ImportError:
     from age_protection import assess as assess_age
     from risk_dimensions import material_refs, sanitize_events, score_dimensions
-    from tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, tag_prompt_catalog
+    from tag_catalog import TAG_CATALOG, MAX_LLM_TAGS, POSITIVE_TAGS, SEMANTIC_RISK_TAGS, tag_prompt_catalog
     from tag_quality import validate_generated_tags, quote_tag_ref, tag_strength
 
 try:
@@ -180,6 +181,14 @@ _TAG_DISPLAY_NAMES = {
 
 _TAG_DISPLAY_NAMES.update({tag: item[0] for tag, item in TAG_CATALOG.items()})
 _POSITIVE_TAGS = POSITIVE_TAGS
+# 趣味自检拦截只认语义层不友善标签，管理/行为前科标签不参与。
+_TEASE_RISK_TAGS = SEMANTIC_RISK_TAGS
+_TEASE_GUARD_LINES = (
+    "画像暂时拒绝对你展出：检测到近期互动不太友善，缓一缓再来查吧。",
+    "本次画像已对你隐身。停止抬杠、攒回友善值之后再来看。",
+    "连续围观自己也改变不了印象，先冷静一下再来查。",
+    "画像拒绝服务中：挑衅冷却尚未结束，过段时间再来。",
+)
 _RISK_TAGS = frozenset({
     "ban_history", "astrbot_banned", "bot_deleted_friend",
     "ad_suspect", "scam_suspect", "spam_suspect", "troll",
@@ -739,7 +748,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.22.1",
+    "1.23.0",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -781,6 +790,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         self._age_flights = {}
         self._age_versions = {}
         self._age_semaphore = self._llm_semaphore
+        # 趣味自检拦截的滑动窗口计数，仅内存、不落盘，重启即清零。
+        self._self_query_log: dict[str, list[float]] = {}
 
     async def assess_age_protection(self, qq: str, event, force: bool = False) -> dict:
         """可信内部 API：只评估本人年龄保护状态，不执行动作或计处罚分。"""
@@ -2127,7 +2138,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         shortcut: bool = False,
     ):
         """所有聊天查询入口共用的目标解析、权限判断、日志和发送逻辑。"""
-        sender, group_id, _ = self._event_identity(event)
+        sender, group_id, admin = self._event_identity(event)
         if await self._sender_silenced_by_ban(sender):
             event.stop_event()
             return
@@ -2166,7 +2177,68 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if not allowed:
             await event.send(MessageChain(chain=[Plain(reason)]))
             return
+        if await self._tease_guard_block(qq, event, sender, admin):
+            return
         await self._send_profile(qq, event)
+
+    def _tease_risk_confidence(self, qq: str) -> float:
+        """只读已有语义缓存，返回不友善/挑衅标签的最高置信度；不触发 LLM。"""
+        try:
+            root = (self._tags_cache or {}).get(str(qq)) or {}
+            slots = root.get("slots") if isinstance(root, dict) else None
+            best = 0.0
+            if isinstance(slots, dict):
+                for slot in slots.values():
+                    if not isinstance(slot, dict):
+                        continue
+                    for item in slot.get("tags") or []:
+                        if not isinstance(item, dict) or item.get("tag") not in _TEASE_RISK_TAGS:
+                            continue
+                        confidence = _finite_float(item.get("confidence"), 0.0)
+                        if confidence is not None:
+                            best = max(best, confidence)
+            return best
+        except Exception as exc:
+            logger.warning(f"user_profile: tease risk check failed: {exc}")
+            return 0.0
+
+    async def _tease_guard_block(self, qq: str, event, sender: str, admin: bool) -> bool:
+        """趣味拦截：不友善用户在高频查看自己画像时，取消本次发送。
+
+        只影响“本人查自己”的聊天命令；管理员、查他人、LLM 查询工具不受限制。
+        计数保存在内存滑动窗口中，不持久化，重启即清零。
+        """
+        try:
+            if not self.config.get("tease_guard_enabled", True):
+                return False
+            if not sender or qq != sender or admin:
+                return False
+            window = int(self.config.get("tease_guard_window_seconds", 600))
+            need = int(self.config.get("tease_guard_min_queries", 3))
+            threshold = float(self.config.get("tease_guard_min_confidence", 0.6))
+            log = self._self_query_log
+            if len(log) > 5000:
+                log.clear()
+            now = time.time()
+            times = log.setdefault(qq, [])
+            times[:] = [stamp for stamp in times if now - stamp <= window]
+            times.append(now)
+            if len(times) < need:
+                return False
+            if self._tease_risk_confidence(qq) < threshold:
+                return False
+            custom = clean_text(self.config.get("tease_guard_message"), 200)
+            line = custom or random.choice(_TEASE_GUARD_LINES)
+            logger.info(f"user_profile: tease guard blocked self query qq={qq!r}")
+            await event.send(MessageChain(chain=[Plain(line)]))
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logger.warning(f"user_profile: tease guard check failed: {exc}")
+            return False
 
     async def _send_self_profile(self, event: AstrMessageEvent):
         """兼容旧调用方；按快捷命令入口查询发送者自己的画像。"""

@@ -58,7 +58,12 @@ class RealAstrBotSchemaTests(unittest.TestCase):
                 [sys.executable, "-c", script], cwd=workdir, env=env,
                 capture_output=True, text=True, check=True,
             )
-        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        # AstrBot 的日志与 print 共用 stdout 时顺序不保证，直接定位 JSON 负载行。
+        payload_line = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith('{"schema"')
+        )
+        payload = json.loads(payload_line)
         schema = payload["schema"]
         self.assertEqual(schema["properties"]["qq"]["type"], "string")
         self.assertTrue(payload["signature_required"])
