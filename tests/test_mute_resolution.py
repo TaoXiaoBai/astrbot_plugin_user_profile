@@ -122,6 +122,101 @@ class MuteResolutionTests(unittest.IsolatedAsyncioTestCase):
         result = await plugin.get_profile_tags_with_score("11111")
         self.assertEqual(result["risk_components"]["mute_operator"], 35)
 
+    @staticmethod
+    def _legacy_mute_fixture(now):
+        events = [
+            {"event_key": "stable:a", "group_id": "767776223", "time": now - 2000000,
+             "duration": 600, "operator_id": "11111", "inviter_id": "11111",
+             "attribution": "operator", "risk_increment": 80, "risk_cap": 100},
+            {"event_key": "stable:b", "group_id": "219425449", "time": now - 1999000,
+             "duration": 60, "operator_id": "11111", "inviter_id": "",
+             "attribution": "operator", "risk_increment": 80, "risk_cap": 100},
+            {"event_key": "stable:c", "group_id": "767776223", "time": now - 1998000,
+             "duration": 2591940, "operator_id": "85988209", "inviter_id": "11111",
+             "attribution": "associated_inviter", "risk_increment": 80, "risk_cap": 100},
+        ]
+        mute_resolution = {
+            "time": now - 1000000, "resolution": "appeal_approved",
+            "effects": {"mute_operator": 160, "mute_associated": 80},
+            "event_keys": ["stable:a", "stable:b", "stable:c"],
+        }
+        mute_account = {
+            "events": events,
+            "seen": [item["event_key"] for item in events],
+            "risk_total": 240,
+            "risk_schema_version": 2,
+            "legacy_risk_total": 240,
+            "legacy_has_operator": True,
+            "operator_risk_total": 0,
+            "associated_risk_total": 0,
+            "operator_count": 2,
+            "associated_count": 1,
+            "last_risk_cap": 100,
+            "last_time": events[-1]["time"],
+        }
+        management_account = {
+            "events": [{
+                "event_key": "guard:unban:11111", "type": "astrbot_unbanned",
+                "source": "astrbot_plugin_group_invite_guard",
+                "time": now - 1000000, "group_id": "", "reason": "申诉通过",
+                "result": "success", "created_at_ms": (now - 1000000) * 1000,
+                "resolution": "appeal_approved",
+                "mute_resolution": copy.deepcopy(mute_resolution), "seq": 1,
+            }],
+            "seen": ["guard:unban:11111"],
+            "counts": {"astrbot_unbanned": 1},
+            "last_time": now - 1000000,
+            "event_seq": 1,
+            "last_ban_seq": 0, "last_ban_time": 0,
+            "last_unban_seq": 1, "last_unban_time": now - 1000000,
+            "unban_resolution": "appeal_approved",
+            "appeal_seq": 1, "appeal_time": now - 1000000,
+            "appeal_resolution": "appeal_approved",
+            "mute_resolution": copy.deepcopy(mute_resolution),
+            "appeal_mute_resolution": copy.deepcopy(mute_resolution),
+        }
+        return mute_account, management_account
+
+    async def test_v1_legacy_aggregate_is_reattributed_and_appeal_clears_fully(self):
+        """复现线上形态：v1 迁移残留 legacy=240 压给 operator，申诉只能冲销 160，残留 80。"""
+        now = int(time.time())
+        plugin = self.make_plugin()
+        mute_account, management_account = self._legacy_mute_fixture(now)
+        plugin._kv["up_bot_mute_events"] = {"11111": mute_account}
+        plugin._kv["up_management_events"] = {"11111": management_account}
+        await plugin._ensure_loaded()
+
+        account = plugin._personal_mute_account("11111")
+        self.assertEqual(account["operator_risk_total"], 160)
+        self.assertEqual(account["associated_risk_total"], 80)
+        self.assertEqual(account["legacy_risk_total"], 0)
+
+        result = await plugin.get_profile_tags_with_score("11111")
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(result["risk_components"]["mute_operator"], 0)
+        self.assertEqual(result["risk_components"]["mute_associated"], 0)
+        self.assertEqual(result.get("compat_score"), 0)
+
+    async def test_v1_aggregate_load_path_splits_roles_and_keeps_unattributed_remainder(self):
+        now = int(time.time())
+        plugin = self.make_plugin()
+        mute_account, _ = self._legacy_mute_fixture(now)
+        # 模拟 v1 存储：只有混合总量，无角色分；明细只剩 1 条 operator。
+        mute_account.pop("risk_schema_version")
+        mute_account["events"] = mute_account["events"][:1]
+        mute_account["seen"] = ["stable:a"]
+        plugin._kv["up_bot_mute_events"] = {"11111": mute_account}
+        await plugin._ensure_loaded()
+
+        account = plugin._personal_mute_account("11111")
+        self.assertEqual(account["operator_risk_total"], 80)
+        self.assertEqual(account["associated_risk_total"], 0)
+        # 被截断明细无法归因的 160 保留为保守 legacy，不凭空消失。
+        self.assertEqual(account["legacy_risk_total"], 160)
+        components = plugin._mute_event_components("11111")
+        self.assertEqual(components["mute_operator"], 100)  # 80 + 160，按 cap 100 封顶
+        self.assertEqual(components["mute_associated"], 0)
+
     async def test_snapshot_survives_management_truncation_restart_and_failed_write(self):
         now = int(time.time())
         plugin = self.make_plugin({"mute_event_keep": 1})

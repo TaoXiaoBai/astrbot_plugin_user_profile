@@ -748,7 +748,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.23.0",
+    "1.23.1",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -2868,6 +2868,27 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "effects": effects, "event_keys": event_keys[:500],
         }
 
+    @staticmethod
+    def _split_mute_aggregate(account: dict) -> tuple[int, int, int]:
+        """把 v1 混合总量拆成可归因的角色分与不可归因保守余量。
+
+        明细全部带 attribution 时余额为 0；明细被截断时，剩余部分保留为
+        legacy 总额，仍按保守规则整体记给 operator，不猜测归因。
+        """
+        aggregate = max(0, int(_finite_float(account.get("risk_total"), 0)))
+        operator_sum = 0
+        associated_sum = 0
+        for item in account.get("events") or []:
+            if not isinstance(item, dict):
+                continue
+            increment = max(0, min(100, int(_finite_float(item.get("risk_increment"), 0))))
+            if item.get("attribution") == "operator":
+                operator_sum += increment
+            elif item.get("attribution") == "associated_inviter":
+                associated_sum += increment
+        remainder = max(0, aggregate - operator_sum - associated_sum)
+        return operator_sum, associated_sum, remainder
+
     @classmethod
     def _migrate_mute_resolution(
         cls, current: dict, events: list[dict], timestamp: int, resolution: str
@@ -3296,10 +3317,11 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             previous_account = copy.deepcopy(account)
             if int(_finite_float(account.get("risk_schema_version"), 1)) < 2:
                 account["risk_schema_version"] = 2
-                account["legacy_risk_total"] = max(0, int(_finite_float(account.get("risk_total"), 0)))
+                operator_sum, associated_sum, remainder = self._split_mute_aggregate(account)
+                account["legacy_risk_total"] = remainder
                 account["legacy_has_operator"] = int(_finite_float(account.get("operator_count"), 0)) > 0
-                account["operator_risk_total"] = 0
-                account["associated_risk_total"] = 0
+                account["operator_risk_total"] = operator_sum
+                account["associated_risk_total"] = associated_sum
             event_record = {
                 "event_key": event_key, "group_id": group_id, "time": timestamp,
                 "duration": seconds, "operator_id": operator_id,
@@ -4495,10 +4517,29 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                             account["legacy_risk_total"] + account["operator_risk_total"]
                             + account["associated_risk_total"]
                         )
+                        if (
+                            account["legacy_risk_total"] > 0
+                            and not account["operator_risk_total"]
+                            and not account["associated_risk_total"]
+                        ):
+                            # 早期 v1→v2 迁移把混合总量整体记为 legacy 并清零角色分，
+                            # 而结清快照按明细归因：legacy 全压给 operator 后只能被
+                            # operator 侧 effects 部分冲销。用仍可验证的明细重建角色分，
+                            # 只保留无法归因的余额作为保守 legacy。
+                            operator_sum, associated_sum, remainder = self._split_mute_aggregate(account)
+                            if operator_sum or associated_sum:
+                                account["operator_risk_total"] = operator_sum
+                                account["associated_risk_total"] = associated_sum
+                                account["legacy_risk_total"] = remainder
+                                account["risk_total"] = remainder + operator_sum + associated_sum
+                                self._mute_events_dirty = True
                     else:
-                        # v1 only has one aggregate. Keep it as one conservative
-                        # legacy component instead of inventing per-event attribution.
-                        account["legacy_risk_total"] = account["risk_total"]
+                        # v1 只有一个混合总量：用仍可验证的明细重建角色分，
+                        # 只有无法归因的余额保留为保守 legacy，而不是全部压给 operator。
+                        operator_sum, associated_sum, remainder = self._split_mute_aggregate(account)
+                        account["operator_risk_total"] = operator_sum
+                        account["associated_risk_total"] = associated_sum
+                        account["legacy_risk_total"] = remainder
                         account["legacy_has_operator"] = account["operator_count"] > 0
                         self._mute_events_dirty = True
                     account["last_risk_cap"] = max(0, min(100, int(_finite_float(
