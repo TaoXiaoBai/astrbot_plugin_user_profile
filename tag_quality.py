@@ -35,10 +35,11 @@ def quote_tag_ref(qq: str, quote: dict, timed_refs: dict) -> str:
     return "t_" + hashlib.sha256(encoded).hexdigest()[:24]
 
 
-def safe_tag_refs(raw) -> list[str]:
+def safe_tag_refs(raw, limit: int = 8) -> list[str]:
     if not isinstance(raw, list):
         return []
-    return sorted({ref for ref in raw if isinstance(ref, str) and TAG_REF_PATTERN.fullmatch(ref)})[:8]
+    limit = max(1, min(16, int(limit)))
+    return sorted({ref for ref in raw if isinstance(ref, str) and TAG_REF_PATTERN.fullmatch(ref)})[:limit]
 
 
 def tag_strength(item: dict) -> float:

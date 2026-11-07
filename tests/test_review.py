@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -54,9 +55,15 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_plugin({"history_scan_enabled": False, "friend_reconcile_enabled": False})
         await plugin._ensure_loaded()
         plugin._stats["11111"] = dict(_new_stat(), g_count=2)
-        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "ANONYMOUS_MATERIAL"})]
+        from risk_dimensions import material_refs
+        now = int(time.time())
+        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": now, "text": "ANONYMOUS_MATERIAL"})]
+        refs = list(material_refs("11111", plugin._quotes["11111"]))
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
-            "tags": [{"tag": "nsfw_tendency", "confidence": 0.9, "severity": "clear", "reason": "主动索取不适宜内容"}],
+            "tags": [{"tag": "nsfw_tendency", "confidence": 0.9, "severity": "clear", "reason": "主动索取不适宜内容",
+                      "subject": "self", "evidence_refs": refs}],
+            "risk_events": [{"dimension": "content_boundary", "severity": "clear", "confidence": 0.9,
+                             "subject": "self", "evidence_refs": refs, "observed_at": now}],
             "impression": "LAST_GOOD", "traits": [],
         })
         return plugin
@@ -65,7 +72,8 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         plugin = await self.prepared()
         event = Event({})
         first = await plugin.get_profile_tags_with_score("11111", event)
-        self.assertEqual(first["score"], 36)
+        self.assertEqual(first["score"], 54)
+        self.assertEqual(first["semantic_source"], "risk_events")
         self.assertFalse(first["review_pending"])
         await plugin.get_profile_tags_with_score("11111", event)
         self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, 1)
@@ -132,7 +140,11 @@ class ReviewIntegrationTests(unittest.IsolatedAsyncioTestCase):
         refs = list(material_refs("11111", plugin._quotes["11111"]))
         for level in ("低敏感", "中等", "高敏感"):
             for tags in ([], [{"tag": "nsfw_tendency", "confidence": 0.9, "severity": "clear", "reason": "主动不当请求", "subject": "self", "evidence_refs": refs}]):
-                plugin.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text=json.dumps({"tags": tags, "impression": "语境判断", "traits": []})))
+                events = [{"dimension": "content_boundary", "severity": "clear", "confidence": 0.9,
+                           "subject": "self", "evidence_refs": refs,
+                           "observed_at": plugin._quotes["11111"][0]["t"]}] if tags else []
+                plugin.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text=json.dumps({
+                    "tags": tags, "risk_events": events, "impression": "语境判断", "traits": []})))
                 parsed = await TagEngine(plugin.config).generate_llm_tags("11111", {}, plugin._quotes["11111"], [], plugin.context, dict(plugin.config, llm_provider_id="mock", risk_review_level=level))
                 prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]
                 for text in (level, "合理医学", "引用反驳", "不得把bot回答", "证据可靠性", "severity"):

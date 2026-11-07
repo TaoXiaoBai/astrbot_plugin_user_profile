@@ -32,7 +32,13 @@ class OutputVisibilityTests(unittest.IsolatedAsyncioTestCase):
             "risk_components": {"semantic": 36},
             "tags": [{"tag": "nsfw_tendency", "confidence": 0.9, "source": "INTERNAL_SOURCE",
                       "severity": "clear", "evidence": "INTERNAL_EVIDENCE"}],
-            "impression": "表达稳定", "traits": ["热心"], "long_term_traits": [], "sections": {},
+            "impression": "表达稳定", "traits": ["热心"],
+            "long_term_traits": [{
+                "trait": "稳定偏好", "confidence": 0.9, "reason": "INTERNAL_LONG_REASON",
+                "stability": "established", "evidence_refs": ["r_INTERNAL_SECRET"],
+                "evidence_days": [1], "scenes": ["private"], "first_evidence_at": 1,
+            }],
+            "sections": {},
         }
         plugin.get_profile_tags_with_score = AsyncMock(return_value=result)
         return plugin, result
@@ -47,6 +53,9 @@ class OutputVisibilityTests(unittest.IsolatedAsyncioTestCase):
         for tag in result.get("tags", []):
             for key in ("source", "evidence", "severity", "content_risk"):
                 self.assertNotIn(key, tag)
+        for trait in result.get("long_term_traits", []):
+            for key in ("evidence_refs", "evidence_days", "scenes", "first_evidence_at", "last_evidence_at"):
+                self.assertNotIn(key, trait)
         self.assertEqual(result["score"], 36)
 
     async def test_projection_audience_matrix_and_original_not_mutated(self):

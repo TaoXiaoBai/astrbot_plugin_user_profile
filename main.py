@@ -44,6 +44,7 @@ try:
         normalize_quote,
         quota_quotes,
         quote_scene,
+        safe_timestamp,
         sanitize_llm_analysis,
         sanitize_llm_tags,
         speaker_lines,
@@ -55,6 +56,7 @@ except ImportError:
         normalize_quote,
         quota_quotes,
         quote_scene,
+        safe_timestamp,
         sanitize_llm_analysis,
         sanitize_llm_tags,
         speaker_lines,
@@ -143,9 +145,9 @@ def _normalize_guard_invite_records(records: Any) -> dict[str, list[dict]]:
 
 # 标签人类可读名（对 LLM 和人类都友好）
 _TAG_DISPLAY_NAMES = {
-    "active_high": "高活跃",
-    "active_medium": "较活跃",
-    "active_low": "低活跃",
+    "active_high": "累计发言较多",
+    "active_medium": "累计发言中等",
+    "active_low": "累计发言较少",
     "newcomer": "新人",
     "long_inactive": "长期沉寂",
     "multi_group": "多群出现",
@@ -161,11 +163,11 @@ _TAG_DISPLAY_NAMES = {
     "bot_deleted_friend": "曾被 bot 主动删除好友",
     "friend_relation_missing": "好友关系曾消失",
     "friend_relation_restored": "好友关系已恢复",
-    "image_spammer": "图片刷屏",
-    "link_spammer": "链接刷屏",
-    "qr_spammer": "二维码刷屏",
+    "image_spammer": "图片消息偏多",
+    "link_spammer": "链接消息较多",
+    "qr_spammer": "二维码内容较多",
     "mention_heavy": "频繁@人",
-    "verbose": "话痨",
+    "verbose": "长消息较多",
     "night_active": "夜间活跃",
     "spam_suspect": "刷屏嫌疑",
     "ad_suspect": "广告嫌疑",
@@ -204,7 +206,8 @@ def _tag_display(tag: str) -> str:
 def _long_term_display(items: Any, include_reason: bool = False) -> list[str]:
     result = []
     for item in sanitize_llm_analysis({"long_term_traits": items})["long_term_traits"]:
-        text = f"{item['trait']}（{item['confidence']:.0%}）"
+        stability = "跨日确认" if item.get("stability") == "established" else "初步观察"
+        text = f"{item['trait']}（{item['confidence']:.0%} · {stability}）"
         if include_reason and item["reason"]:
             text += f"：{item['reason']}"
         result.append(text)
@@ -561,18 +564,20 @@ class TagEngine:
                     ))
                 lines.append(
                     "修正规则：历史标签是待复核结论，不是新的发言证据，不能因为上次打过就无限保留。"
-                    "本次tags只能引用当前真实材料ref；近期没提及不等于反证，稳定偏好和长期特点应结合"
-                    "历史在long_term_traits中复核，不要把临时行为强行永久化。"
+                    "本次tags只能引用当前真实材料ref；近期没提及不等于反证。长期特点没有新证据时"
+                    "原样保留且不要伪造ref，只有当前材料明确推翻时才列入retired_long_term_traits。"
                     "impression在历史印象基础上有限更新，不因几句新话整段推翻；"
                     "当前表现与历史不同应注明语境差异，不直接推断伪装或人格改变。"
                 )
                 prior_block = "\n".join(lines) + "\n"
         memory_prompt = (
-            "、long_term_traits。long_term_traits 是 0-5 个值得长期记忆的特点，"
-            "每项包含 trait、0 到 1 的 confidence、最多一句 reason；只保留稳定偏好、"
+            "、long_term_traits、retired_long_term_traits。long_term_traits 是 0-5 个值得长期记忆的特点，"
+            "每项包含 trait、0 到 1 的 confidence、最多一句 reason、evidence_refs；只描述稳定偏好、"
             "长期兴趣、持续沟通风格或反复出现的行为特点，不记录临时情绪、一次性事件、"
-            "敏感信息、管理前科或风险结论。完整返回本次复核后的集合并保留仍成立项，"
-            "没有值得长期记忆或已不再成立时返回空数组"
+            "敏感信息、管理前科或风险结论。新特点必须引用当前真实且有时间的r_材料；"
+            "已有特点只有获得当前材料支持时才再次填写refs进行确认，无新证据时保留原项且refs留空。"
+            "近期没提及或返回空数组不会删除旧特点；只有当前材料明确反驳旧特点时，才把含trait和当前"
+            "evidence_refs的项放入retired_long_term_traits。程序会累积证据日期并判断稳定程度"
             if memory_enabled else ""
         )
         prompt = (
@@ -640,10 +645,35 @@ class TagEngine:
             # 模型漏返回依据是格式/证据失败，不把最后成功画像清空。
             raise ValueError("profile_tags_without_grounded_evidence")
         decoded["risk_events"] = sanitize_events(decoded.get("risk_events"), refs)
+        event_dimensions = {
+            "nsfw_tendency": "content_boundary",
+            "troll": "harassment", "spam_suspect": "harassment",
+            "scam_suspect": "fraud", "ad_suspect": "fraud",
+        }
+        for item in decoded["tags"]:
+            dimension = event_dimensions.get(item["tag"])
+            if not dimension:
+                continue
+            timed_refs = {ref for ref in item.get("evidence_refs", []) if ref.startswith("r_")}
+            if not timed_refs:
+                continue
+            if not any(
+                event.get("dimension") == dimension
+                and event.get("subject") == "self"
+                and timed_refs.intersection(event.get("evidence_refs") or [])
+                for event in decoded["risk_events"]
+            ):
+                raise ValueError("profile_risk_tag_without_matching_event")
         analysis = sanitize_llm_analysis(decoded)
         analysis["_long_term_traits_present"] = bool(
-            memory_enabled and isinstance(decoded, dict) and "long_term_traits" in decoded
+            memory_enabled and isinstance(decoded, dict) and (
+                "long_term_traits" in decoded or "retired_long_term_traits" in decoded
+            )
         )
+        retired = decoded.get("retired_long_term_traits")
+        analysis["_retired_long_term_traits"] = retired[:5] if isinstance(retired, list) else []
+        # 仅用于写入前校验，不进入画像缓存或插件间快照。
+        analysis["_evidence_materials"] = tag_materials
         return analysis
 
     @staticmethod
@@ -747,8 +777,8 @@ class SocialEventFilter(filter.CustomFilter):
 @register(
     "astrbot_plugin_user_profile",
     "Kimi",
-    "QQ 用户画像 / 自动标签引擎：隐私可控地采集行为、管理事件与摘录，输出结构化风险画像",
-    "1.23.1",
+    "LLM 用户画像：关联群聊与私聊，生成有证据的印象、标签和长期特点，辅助对话与邀请守卫",
+    "1.24.0",
 )
 class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -857,11 +887,15 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         value = copy.deepcopy(result)
         value["audit_details"] = self._can_show_audit_details(event)
         if not value["audit_details"]:
-            for key in ("review_level", "review_pending", "risk_components", "llm_status", "partial_errors", "sources", "source", "evidence", "risk_events", "risk_evidence", "risk_dimensions", "dimension_score", "dimension_status", "compat_score", "safety_concerns", "age_protection", "age_protection_attempt", "age_protection_review", "age_protection_review_attempt", "diagnostics"):
+            for key in ("review_level", "review_pending", "risk_components", "llm_status", "partial_errors", "sources", "source", "evidence", "risk_events", "risk_evidence", "risk_dimensions", "dimension_score", "dimension_status", "compat_score", "semantic_source", "semantic_status", "semantic_time", "safety_concerns", "age_protection", "age_protection_attempt", "age_protection_review", "age_protection_review_attempt", "diagnostics"):
                 value.pop(key, None)
             for tag in value.get("tags") or []:
                 for key in ("source", "evidence", "reason", "severity", "content_risk", "evidence_refs", "support_kind"):
                     tag.pop(key, None)
+            for trait in value.get("long_term_traits") or []:
+                if isinstance(trait, dict):
+                    for key in ("evidence_refs", "evidence_days", "scenes", "first_evidence_at", "last_evidence_at"):
+                        trait.pop(key, None)
         return value
 
     @staticmethod
@@ -973,9 +1007,17 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             risk_scope=str(analysis.get("scene") or "group"),
         )
         tags = snapshot["tags"]
+        ordered_tags = sorted(tags, key=lambda value: _finite_float(value.get("confidence"), 0), reverse=True)
+        risk_tags = [
+            item for item in ordered_tags
+            if item.get("tag") in _RISK_TAGS and _finite_float(item.get("confidence"), 0) > 0
+        ]
+        descriptive_tags = [item for item in ordered_tags if item not in risk_tags]
+        # 风险信号不会被大量兴趣词挤掉，同时至少保留人物描述的位置。
+        ordered_tags = risk_tags + (descriptive_tags[:6] if risk_tags else descriptive_tags)
         seen = set()
         labels = []
-        for item in sorted(tags, key=lambda value: _finite_float(value.get("confidence"), 0), reverse=True):
+        for item in ordered_tags:
             tag = clean_text(item.get("tag"), 64)
             if tag and tag not in seen:
                 seen.add(tag)
@@ -995,10 +1037,17 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         score = snapshot["score"]
         scope = snapshot.get("risk_scope")
         scope_text = "群私融合证据" if scope == "fused" else ("私聊证据" if scope == "private" else "群聊公开证据")
-        risk_text = (
-            f"风险：{score}/100（{snapshot['level']}，{scope_text}）"
-            if score is not None else "风险：未知（暂无足够风险证据，不等于安全）"
-        )
+        risk_status = str(snapshot.get("risk_status") or "no_evidence")
+        if score is None:
+            unknown_reason = "尚未完成语义分析" if risk_status == "unreviewed" else "暂无足够风险证据"
+            risk_text = f"风险：未知（{unknown_reason}，不等于安全）"
+        else:
+            state_text = {
+                "ready": "当前语义分析有效",
+                "stale": "沿用上次成功画像",
+                "unreviewed": "仅规则/管理证据，语义未复核",
+            }.get(risk_status, "证据状态未知")
+            risk_text = f"风险：{score}/100（{snapshot['level']}，{scope_text}；{state_text}）"
         lines = [f"QQ：{qq}", risk_text]
         for label, value in conversation_sections(self, qq, event):
             lines.append(f"{label}：{clean_text(value, 240)}")
@@ -2085,7 +2134,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 f"   标签来源：{sources}｜历史管理事件：{item['management_count']}｜当前黑名单：{'是' if item['currently_banned'] else '否'}｜语义：{semantic}"
             )
             if "compat_score" in item:
-                lines.append(f"   原算法兼容分：{item['compat_score']}｜行为维度语义候选：{item.get('dimension_score')}（与原语义分取高）")
+                lines.append(f"   旧标签兼容分（仅审计）：{item['compat_score']}｜风险事件维度分：{item.get('dimension_score')}（同源标签不重复计分）")
         if model["page"] < model["pages"]:
             lines.append(f"下一页：/画像排名 {model['scope']} {model['page'] + 1}")
         lines.append("提示：快照不会主动刷新语义分析；材料不足或尚未分析不等于低风险。")
@@ -2466,6 +2515,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "risk_scope": str(result.get("risk_scope") or result.get("scene") or "group"),
             "review_level": result.get("review_level", self.config.get("risk_review_level", "中等")),
             "review_pending": bool(result.get("review_pending", True)),
+            "semantic_status": str(result.get("semantic_status") or result.get("status") or "not_requested"),
+            "semantic_time": safe_timestamp(result.get("semantic_time") or result.get("time"), int(time.time())),
+            "semantic_source": str(result.get("semantic_source") or "none"),
             "tags": tag_models,
             "impression": clean_text(result.get("impression"), 240),
             "sections": result.get("sections", {}),
@@ -2487,12 +2539,20 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
     def _review_lines(model: dict) -> list[str]:
         if model.get("audit_details") is not True:
             return []
-        state = "沿用历史结果/待复核（或尚未生成）" if model.get("review_pending", True) else "已按本档审查"
+        state = {
+            "ready": "当前语义分析有效",
+            "stale": "沿用上次成功画像/待复核",
+            "unreviewed": "尚未完成语义审查",
+            "no_evidence": "暂无画像证据",
+        }.get(model.get("risk_status"), "沿用历史结果/待复核" if model.get("review_pending", True) else "已按本档审查")
         lines = [f"审查：{model.get('review_level', '中等')} · {state}"]
+        if model.get("semantic_time"):
+            lines.append(f"最近成功语义分析：{_fmt_time(model['semantic_time'])}")
         if "compat_score" in model:
-            lines.append(f"原算法兼容分：{model['compat_score'] if model['compat_score'] is not None else '未知'}")
+            lines.append(f"旧标签算法兼容分（仅审计）：{model['compat_score'] if model['compat_score'] is not None else '未知'}")
         if model.get("dimension_score") is not None:
-            lines.append(f"行为维度语义候选：{model['dimension_score']}（与原语义分取高，不相加）")
+            source = {"risk_events": "风险事件台账", "legacy_tags": "旧标签兼容", "mixed": "事件台账+分场景兼容"}.get(model.get("semantic_source"), "无")
+            lines.append(f"风险事件维度分：{model['dimension_score']}；语义来源：{source}（同源标签不重复计分）")
             labels = {"content_boundary": "内容边界", "harassment": "骚扰", "fraud": "欺诈"}
             for key, value in (model.get("risk_dimensions") or {}).items():
                 if key in labels and isinstance(value, dict):
@@ -3696,7 +3756,7 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         if llm_status in ("error", "cached_error"):
             partial_errors.append("llm_analysis_failed")
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "provider": "astrbot_plugin_user_profile",
             "captured_at": captured_at,
             "data_freshness": {
@@ -3725,6 +3785,9 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             "risk_scope": str(result.get("risk_scope") or result.get("scene") or "group"),
             "review_level": result.get("review_level", self.config.get("risk_review_level", "中等")),
             "review_pending": bool(result.get("review_pending", True)),
+            "semantic_status": str(result.get("semantic_status") or result.get("status") or "not_requested"),
+            "semantic_time": safe_timestamp(result.get("semantic_time") or result.get("time"), int(time.time())),
+            "semantic_source": str(result.get("semantic_source") or "none"),
             "tags": tags,
             "impression": clean_text(result.get("impression"), 240),
             "traits": [clean_text(value, 48) for value in result.get("traits", []) if clean_text(value, 48)][:5],
@@ -3750,42 +3813,106 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
         return result.get("score")
 
     def _risk_assessment(self, qq: str, tags: list, scope: str = "") -> dict:
-        components = calculate_tag_components(
-            tags, self._risk_weights(),
+        """分别表达人物资料、语义审查状态与可计分风险证据。
+
+        新版风险事件是每个场景的语义计分来源；只有尚未迁移到事件台账的
+        场景才回退到旧标签分，不再对同一份材料同时取新旧两种语义分。
+        """
+        weights = self._risk_weights()
+        legacy_components = calculate_tag_components(
+            tags, weights,
             semantic_cap=self.config["risk_semantic_cap"],
             behavior_cap=self.config["risk_behavior_cap"],
         )
+        components = dict(legacy_components)
         components.update(self._mute_event_components(str(qq)))
         has_mute_risk = any(
             components.get(key, 0) > 0 for key in ("mute_operator", "mute_associated")
         )
-        has_evidence = bool(tags) or has_mute_risk
-        compat_score = max(0, min(100, sum(components.values()))) if has_evidence else None
+        compat_score = max(0, min(100, sum(components.values()))) if tags or has_mute_risk else None
+
+        selected = scope or "group"
+        semantic_review = cached_view(self, str(qq), scene=selected)
+        semantic_status = str(semantic_review.get("status") or "not_requested")
+        review_pending = bool(semantic_review.get("review_pending", True))
         dimensions = {"dimension_score": None, "risk_dimensions": {}, "dimension_status": "disabled"}
+        semantic_source = "legacy_tags" if legacy_components.get("semantic", 0) > 0 else "none"
+
         if self.config.get("risk_dimension_mode", True):
             root = (self._tags_cache or {}).get(str(qq)) or {}
-            evidence = root.get("risk_evidence") if isinstance(root, dict) else {}
-            evidence = evidence if isinstance(evidence, dict) else {}
+            root = root if isinstance(root, dict) else {}
+            evidence = root.get("risk_evidence") if isinstance(root.get("risk_evidence"), dict) else {}
+            slots = root.get("slots") if isinstance(root.get("slots"), dict) else {}
             expected = list(scene_policy(self))
-            selected = scope or "group"
             names = ("group", "private") if selected == "fused" and expected[1:] == [True, True] else (selected,)
             events = []
+            fallback_tags = []
+            canonical_scenes = []
+            fallback_scenes = []
             for name in names:
                 if name == "private" and not expected[1]:
                     continue
                 entry = evidence.get(name) or {}
                 if isinstance(entry, dict) and entry.get("policy") == expected:
+                    canonical_scenes.append(name)
                     events.extend(entry.get("events") or [])
+                    continue
+                slot = slots.get(name) or {}
+                if isinstance(slot, dict) and slot.get("policy") == expected:
+                    branch_tags = sanitize_llm_analysis(slot)["tags"]
+                    if branch_tags:
+                        fallback_scenes.append(name)
+                        fallback_tags.extend(branch_tags)
             dimensions = score_dimensions(events, int(time.time()), self.config)
-            components["semantic"] = max(components.get("semantic", 0), dimensions["dimension_score"])
-            has_evidence = has_evidence or dimensions["dimension_status"] == "evidence"
-        score = max(0, min(100, sum(components.values()))) if has_evidence else None
+            if canonical_scenes:
+                fallback_semantic = calculate_tag_components(
+                    fallback_tags, weights,
+                    semantic_cap=self.config["risk_semantic_cap"],
+                    behavior_cap=self.config["risk_behavior_cap"],
+                )["semantic"] if fallback_tags else 0
+                components["semantic"] = min(
+                    self.config["risk_semantic_cap"],
+                    dimensions["dimension_score"] + fallback_semantic,
+                )
+                semantic_source = "mixed" if fallback_scenes else "risk_events"
+            else:
+                components["semantic"] = legacy_components["semantic"]
+
+        has_hard_history = any(
+            isinstance(item, dict) and item.get("tag") in {
+                "ban_history", "astrbot_banned", "bot_deleted_friend",
+                "bot_mute_operator", "bot_mute_associated",
+            }
+            for item in tags
+        )
+        has_positive_risk = any(value > 0 for value in components.values())
+        has_dimension_evidence = dimensions.get("dimension_status") == "evidence"
+        has_semantic_review = semantic_status == "success"
+        has_score = (
+            has_semantic_review or has_positive_risk or has_hard_history
+            or has_dimension_evidence
+        )
+        score = round(max(0, min(100, sum(components.values()))), 2) if has_score else None
+        has_profile_evidence = (
+            bool(tags) or has_dimension_evidence or has_semantic_review
+            or has_positive_risk or has_hard_history
+        )
+        if not has_profile_evidence:
+            risk_status = "no_evidence"
+        elif has_semantic_review:
+            risk_status = "stale" if review_pending else "ready"
+        else:
+            risk_status = "unreviewed"
         return {
             "score": score, "compat_score": compat_score, **dimensions,
             "level": _risk_level(score, self.config),
-            "risk_status": "ready" if has_evidence else "no_evidence",
+            "risk_status": risk_status,
             "risk_components": components,
-            "risk_scope": scope or "group",
+            "risk_scope": selected,
+            "semantic_source": semantic_source,
+            "semantic_status": semantic_status,
+            "semantic_time": safe_timestamp(semantic_review.get("time"), int(time.time())),
+            "review_pending": review_pending,
         }
 
     def _score_tags(self, qq: str, tags: list) -> int | None:

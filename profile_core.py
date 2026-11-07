@@ -15,7 +15,7 @@ except ImportError:
 
 
 LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
-LLM_PROMPT_VERSION = 12  # 只触发刷新，不让旧成功画像在升级后消失
+LLM_PROMPT_VERSION = 13  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:
@@ -195,7 +195,7 @@ _FLOAT_RULES = {
 def _finite_number(value: Any, default: float) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) else default
 
@@ -203,6 +203,15 @@ def _finite_number(value: Any, default: float) -> float:
 def _bounded_int(value: Any, default: int, low: int, high: int) -> int:
     number = int(_finite_number(value, default))
     return max(low, min(high, number))
+
+
+def safe_timestamp(value: Any, now: Any = 0) -> int:
+    """把缓存时间规范为非负有限时间戳；明显未来时间按无效处理。"""
+    stamp = _bounded_int(value, 0, 0, 2**63 - 1)
+    current = _bounded_int(now, 0, 0, 2**63 - 1)
+    if current and stamp > current + 300:
+        return 0
+    return stamp
 
 
 def normalize_config(config: dict | None) -> dict:
@@ -304,13 +313,31 @@ def sanitize_long_term_traits(raw: Any) -> list[dict]:
         if not trait or key in seen or confidence < 0:
             continue
         seen.add(key)
-        result.append({
+        raw_days = item.get("evidence_days")
+        raw_days = raw_days if isinstance(raw_days, (list, tuple)) else []
+        raw_scenes = item.get("scenes")
+        raw_scenes = raw_scenes if isinstance(raw_scenes, (list, tuple)) else []
+        entry = {
             "trait": trait,
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
             "reason": clean_text(item.get("reason", item.get("evidence")), 160),
             "first_seen": _bounded_int(item.get("first_seen"), 0, 0, 2**63 - 1),
             "last_confirmed": _bounded_int(item.get("last_confirmed"), 0, 0, 2**63 - 1),
-        })
+            "evidence_refs": safe_tag_refs(item.get("evidence_refs"), 16),
+            "evidence_days": sorted({
+                _bounded_int(value, 0, 0, 2**31 - 1)
+                for value in raw_days
+                if isinstance(value, int) and not isinstance(value, bool)
+            })[-30:],
+            "scenes": list(dict.fromkeys(
+                value for value in raw_scenes if value in ("group", "private")
+            )),
+            "support_count": _bounded_int(item.get("support_count"), 0, 0, 1000000),
+            "first_evidence_at": _bounded_int(item.get("first_evidence_at"), 0, 0, 2**63 - 1),
+            "last_evidence_at": _bounded_int(item.get("last_evidence_at"), 0, 0, 2**63 - 1),
+            "stability": item.get("stability") if item.get("stability") in ("tentative", "established") else "tentative",
+        }
+        result.append(entry)
         if len(result) >= 5:
             break
     return result

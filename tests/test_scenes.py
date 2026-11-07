@@ -9,6 +9,7 @@ import test_plugin
 from test_plugin import Event, _new_stat
 from profile_core import normalize_quote, quota_quotes, quote_scene
 from scene_profiles import cached_view, policy
+from risk_dimensions import material_refs
 
 
 class SceneTests(unittest.IsolatedAsyncioTestCase):
@@ -26,7 +27,8 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
             name = quote_scene(quotes[0])
             return {"tags": [{"tag": "friendly", "confidence": 0.9, "reason": name + "_EVIDENCE"}],
                     "impression": name + "_IMPRESSION", "traits": [name + "_TRAIT"],
-                    "long_term_traits": [{"trait": name + "_MEMORY", "confidence": 0.9, "reason": "stable"}],
+                    "long_term_traits": [{"trait": name + "_MEMORY", "confidence": 0.9, "reason": "stable",
+                                          "evidence_refs": list(material_refs(qq, quotes))}],
                     "_long_term_traits_present": True}
         plugin._tag_engine.generate_llm_tags = AsyncMock(side_effect=branch)
         plugin.context.llm_generate = AsyncMock(return_value=types.SimpleNamespace(completion_text=json.dumps({
@@ -53,6 +55,10 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         result = await plugin.get_profile_tags_with_score("11111", Event({}, group=""))
         self.assertEqual(result["scene"], "fused")
         self.assertEqual(result["impression"], "FUSED_PRIVATE_DERIVED")
+        self.assertEqual({item["trait"] for item in result["long_term_traits"]}, {"group_MEMORY", "private_MEMORY"})
+        self.assertNotIn("FUSED_MEMORY", str(result["long_term_traits"]))
+        for item in result["long_term_traits"]:
+            self.assertTrue(set(item["evidence_refs"]).issubset(material_refs("11111", plugin._quotes["11111"])))
         self.assertIn("群聊表现", result["sections"])
         self.assertIn("私聊表现", result["sections"])
         self.assertEqual(len([t for t in result["tags"] if t["tag"] == "friendly"]), 1)
@@ -62,6 +68,30 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         await plugin.get_profile_tags_with_score("11111", Event({}, group=""))
         self.assertEqual(plugin.context.llm_generate.await_count, before)
         self.assertEqual(plugin._calc_risk_score(result["tags"] * 2), result["score"])
+
+    async def test_expired_fused_cache_refreshes_even_with_unchanged_fingerprint(self):
+        plugin = await self.prepared()
+        plugin.config.update(llm_tag_cache_ttl=60, llm_refresh_interval=3600)
+        event = Event({}, group="")
+        first = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(first["risk_status"], "ready")
+        slots = plugin._tags_cache["11111"]["slots"]
+        original_fingerprint = slots["fused"]["fingerprint"]
+        slots["fused"]["time"] = int(time.time()) - 120
+        expired = cached_view(plugin, "11111", event)
+        self.assertTrue(expired["review_pending"])
+        self.assertEqual(plugin._risk_assessment("11111", first["tags"], "fused")["risk_status"], "stale")
+        branch_calls = plugin._tag_engine.generate_llm_tags.await_count
+        fusion_calls = plugin.context.llm_generate.await_count
+        refreshed = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(plugin.context.llm_generate.await_count, fusion_calls + 1)
+        self.assertEqual(plugin._tag_engine.generate_llm_tags.await_count, branch_calls)
+        self.assertEqual(slots["fused"]["fingerprint"], original_fingerprint)
+        self.assertEqual(refreshed["risk_status"], "ready")
+        self.assertFalse(refreshed["review_pending"])
+        plugin.config["llm_tag_cache_ttl"] = 0
+        slots["fused"]["time"] = int(time.time()) - 120
+        self.assertFalse(cached_view(plugin, "11111", event)["review_pending"])
 
     async def test_public_text_tool_image_model_ranking_and_api_do_not_leak_derived_text(self):
         plugin = await self.prepared()
@@ -147,11 +177,12 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_plugin(config)
         await plugin._ensure_loaded()
         plugin._stats["11111"] = dict(_new_stat(), g_count=2)
-        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": int(time.time()), "text": "PUBLIC"})]
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
             "tags": [{"tag": "friendly", "confidence": 0.9, "reason": "stable"}],
             "impression": "LAST_GOOD", "traits": ["STABLE"],
-            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.9, "reason": "stable"}],
+            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.9, "reason": "stable",
+                                  "evidence_refs": list(material_refs("11111", plugin._quotes["11111"]))}],
             "_long_term_traits_present": True,
         })
         event = Event({}, group="22222")
@@ -180,10 +211,11 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         await restarted._ensure_loaded()
         self.assertEqual(cached_view(restarted, "11111", event)["impression"], "LAST_GOOD")
         restarted._stats["11111"] = dict(_new_stat(), g_count=2)
-        restarted._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        restarted._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": int(time.time()), "text": "PUBLIC"})]
         restarted._tag_engine.generate_llm_tags = AsyncMock(return_value={
             "tags": [], "impression": "RECOVERED", "traits": [],
-            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.95}],
+            "long_term_traits": [{"trait": "LONG_MEMORY", "confidence": 0.95,
+                                  "evidence_refs": list(material_refs("11111", restarted._quotes["11111"]))}],
             "_long_term_traits_present": True,
         })
         recovered = await restarted.get_profile_tags_with_score("11111", event)
@@ -197,34 +229,55 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         })
         await plugin._ensure_loaded()
         plugin._stats["11111"] = dict(_new_stat(), g_count=2)
-        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": 1, "text": "PUBLIC"})]
+        plugin._quotes["11111"] = [normalize_quote({"src": "群 22222", "t": int(time.time()), "text": "PUBLIC"})]
+        refs = list(material_refs("11111", plugin._quotes["11111"]))
         event = Event({}, group="22222")
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
             "tags": [], "impression": "V1", "traits": [],
             "long_term_traits": [
-                {"trait": "稳定偏好", "confidence": 0.7},
-                {"trait": "待删除特点", "confidence": 0.6},
+                {"trait": "稳定偏好", "confidence": 0.7, "evidence_refs": refs},
+                {"trait": "待删除特点", "confidence": 0.6, "evidence_refs": refs},
+                {"trait": "无证据新增", "confidence": 0.99},
             ],
             "_long_term_traits_present": True,
         })
-        await plugin.get_profile_tags_with_score("11111", event)
-        first_seen = plugin._tags_cache["11111"]["slots"]["group"]["long_term_traits"][0]["first_seen"]
+        first = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual({item["trait"] for item in first["long_term_traits"]}, {"稳定偏好", "待删除特点"})
+        first_seen = first["long_term_traits"][0]["first_seen"]
+        omitted = dict(first["long_term_traits"][1])
 
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
             "tags": [], "impression": "V2", "traits": [],
-            "long_term_traits": [{"trait": "稳定偏好", "confidence": 0.95, "reason": "再次确认"}],
+            "long_term_traits": [{"trait": "稳定偏好", "confidence": 0.95, "reason": "再次确认", "evidence_refs": refs}],
             "_long_term_traits_present": True,
         })
         reviewed = await plugin.get_profile_tags_with_score("11111", event)
-        self.assertEqual(len(reviewed["long_term_traits"]), 1)
+        self.assertEqual(len(reviewed["long_term_traits"]), 2)
         self.assertEqual(reviewed["long_term_traits"][0]["first_seen"], first_seen)
         self.assertEqual(reviewed["long_term_traits"][0]["confidence"], 0.95)
+        self.assertEqual(reviewed["long_term_traits"][1], omitted)
+        confirmed = dict(reviewed["long_term_traits"][0])
 
         plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
             "tags": [], "impression": "V3", "traits": [],
+            "long_term_traits": [{"trait": "稳定偏好", "confidence": 0.1}],
+            "_retired_long_term_traits": [{"trait": "待删除特点", "evidence_refs": ["r_" + "0" * 24]}],
+            "_long_term_traits_present": True,
         })
+        unsupported = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(unsupported["long_term_traits"][0], confirmed)
+        self.assertEqual(unsupported["long_term_traits"][1], omitted)
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={
+            "tags": [], "impression": "V4", "traits": [], "long_term_traits": [],
+            "_retired_long_term_traits": [{"trait": "待删除特点", "evidence_refs": refs}],
+            "_long_term_traits_present": True,
+        })
+        retired = await plugin.get_profile_tags_with_score("11111", event)
+        self.assertEqual(retired["long_term_traits"], [confirmed])
+
+        plugin._tag_engine.generate_llm_tags = AsyncMock(return_value={"tags": [], "impression": "V5", "traits": []})
         missing_field = await plugin.get_profile_tags_with_score("11111", event)
-        self.assertEqual(missing_field["long_term_traits"][0]["trait"], "稳定偏好")
+        self.assertEqual(missing_field["long_term_traits"], [confirmed])
         plugin.config["llm_long_term_memory"] = False
         self.assertEqual(cached_view(plugin, "11111", event)["long_term_traits"], [])
         await plugin.get_profile_tags_with_score("11111", event)

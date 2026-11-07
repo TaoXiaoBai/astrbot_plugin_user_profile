@@ -136,12 +136,14 @@ class UpgradeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(diagnostics["history_truncated"])
         self.assertTrue(diagnostics["private_history_included"])
 
-    async def test_old_semantic_is_not_added_to_lower_dimension_and_caps_hold(self):
+    async def test_canonical_mild_replaces_higher_legacy_semantic_and_caps_hold(self):
         plugin = await self.plugin(risk_semantic_cap=100)
         self.evidence(plugin, severity="mild")
         tags = [{"tag": "scam_suspect", "confidence": 1}]
         result = plugin._risk_assessment("11111", tags)
-        self.assertEqual(result["score"], 45)
+        self.assertEqual(result["score"], 20)
+        self.assertEqual(result["risk_components"]["semantic"], 20)
+        self.assertEqual(result["semantic_source"], "risk_events")
         self.assertEqual(result["compat_score"], 45)
         self.assertEqual(result["dimension_score"], 20)
         self.evidence(plugin)
@@ -150,7 +152,9 @@ class UpgradeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["score"], 0)
         self.assertEqual(result["risk_components"]["semantic"], 0)
         plugin.config.update(risk_semantic_cap=100, risk_weights={"scam_suspect": 500})
-        self.assertEqual(plugin._risk_assessment("11111", tags)["score"], 100)
+        self.assertEqual(plugin._risk_assessment("11111", tags)["score"], 85)
+        plugin.config["risk_semantic_cap"] = 40
+        self.assertEqual(plugin._risk_assessment("11111", tags)["score"], 40)
 
     async def test_age_group_isolation_even_when_daily_context_allows_private_fusion(self):
         plugin = await self.plugin(history_scan_enabled=True, cross_scene_link_enabled=True,

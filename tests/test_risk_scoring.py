@@ -1,5 +1,8 @@
 import copy
 import types
+import time
+
+from profile_core import LLM_PROMPT_VERSION
 import unittest
 from unittest.mock import AsyncMock
 
@@ -147,8 +150,13 @@ class RiskIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin._ensure_loaded()
         plugin._stats["11111"] = dict(_new_stat(), g_count=1)
+        unreviewed = await plugin.get_profile_tags_with_score("11111")
+        self.assertIn("active_low", [item["tag"] for item in unreviewed["tags"]])
+        self.assertIsNone(unreviewed["score"])
+        self.assertEqual(unreviewed["risk_status"], "unreviewed")
         plugin._tags_cache["11111"] = {"slots": {"group": {
-            "status": "success", "time": 1, "policy": list(policy(plugin)),
+            "status": "success", "time": int(time.time()), "policy": list(policy(plugin)),
+            "schema_version": LLM_PROMPT_VERSION, "review_level": plugin.config["risk_review_level"],
             "tags": [{"tag": "friendly", "confidence": 1, "reason": "礼貌"}],
         }}}
         friendly = await plugin.get_profile_tags_with_score("11111")
@@ -244,7 +252,7 @@ class RiskIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         decision = await plugin.get_decision_profile("66666")
         self.assertEqual(decision["score"], 15)
-        self.assertEqual(decision["schema_version"], 4)
+        self.assertEqual(decision["schema_version"], 5)
         plugin._fetch_stranger_info = AsyncMock(return_value={})
         model = await plugin._build_profile_model("66666", None)
         self.assertTrue(model["has_record"])
