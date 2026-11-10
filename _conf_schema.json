@@ -1,4 +1,12 @@
 {
+  "external_observations": {
+    "description": "外部检测联动 · 独立审核更新",
+    "type": "object",
+    "items": {
+      "external_observation_enable": {"description": "接收守卫检测材料并主动更新群聊画像", "type": "bool", "default": false, "hint": "须同时开启辱骂守卫的画像提交开关。仅可信内部Python调用，不是公网入口；接收双核验群聊原话、来源和上下文，最多每用户20个事件，遵守群采集范围/原话存储/保留期；不收私聊。请求内部模型独立分析，不直接添加标签/处罚分，不增加发言次数。关闭不删除历史材料，已有画像保留。"},
+      "external_observation_cooldown": {"description": "同用户主动更新最小间隔（秒）", "type": "int", "default": 300, "hint": "30–86400；冷却中材料仍有界留档，下一次允许请求时一起分析，不承诺到期定时刷新。队列最多32人、单工作协程，共用画像模型并发上限；跳过普通画像刷新间隔，但仍复用相同材料缓存。模型失败保留最后成功画像。"}
+    }
+  },
   "age_protection": {
     "description": "年龄保护内部评估（不执行处罚）",
     "type": "object",

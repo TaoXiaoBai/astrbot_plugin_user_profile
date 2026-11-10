@@ -148,7 +148,7 @@ async def analyze(plugin, qq, st, quotes, base_tags, event=None):
     return cached_view(plugin, qq, event)["tags"]
 
 
-async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, generation):
+async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, generation, *, force_refresh=False):
     if generation != plugin._user_generation(qq) or captured_policy != policy(plugin):
         return
     provider = plugin.config.get("llm_provider_id") or plugin._tag_engine._default_provider_id(plugin.context)
@@ -184,7 +184,7 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
             return
         entry_time = safe_timestamp(entry.get("time"), now)
         if (
-            scene != "fused" and entry.get("status") == "success"
+            not force_refresh and scene != "fused" and entry.get("status") == "success"
             and not refresh_status
             and entry.get("review_level") == review_level
             and entry.get("schema_version") == LLM_PROMPT_VERSION

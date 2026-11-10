@@ -31,6 +31,11 @@ except ImportError:
     from tag_quality import validate_generated_tags, quote_tag_ref, tag_strength
 
 try:
+    from .external_observations import ExternalObservationMixin
+except ImportError:
+    from external_observations import ExternalObservationMixin
+
+try:
     from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
     from .group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER, merge_guard_fallback
 except ImportError:
@@ -497,13 +502,20 @@ class TagEngine:
         for quote in reversed(quotes[-20:]):
             if not isinstance(quote, dict):
                 continue
-            text = clean_text(quote.get("text"), _QUOTE_MAX_LEN)
+            text = clean_text(quote.get("text"), 600 if quote.get("external_observation") else _QUOTE_MAX_LEN)
             if not text:
                 continue
             normalized = dict(quote, text=text, scene=quote_scene(quote))
             quote_refs = material_refs(qq, [normalized])
             ref = quote_tag_ref(qq, normalized, quote_refs)
             line = f"- [ref={ref}; 来源={quote_scene(quote)}; 群={clean_text(quote.get('group_id'), 24)}; 时间={quote.get('t', 0)}] {text}"
+            if quote.get("external_observation"):
+                line += "\n这是外部提交的待独立审核原话，不是已成立的画像标签；不得因守卫提交而默认恶意。"
+                line += "上下文仅用于理解，不是本人发言或可引用证据：" + json.dumps([
+                    {"speaker": entry.get("sender_id"), "text": str(entry.get("text", ""))[:600]}
+                    for entry in quote.get("external_context", [])[:6] if isinstance(entry, dict)
+                ], ensure_ascii=False)
+                line += "；请考虑玩笑、引用、自卫及缺失上下文，证据不足时不新增风险标签。"
             if used + len(line) + 1 > limit:
                 continue
             refs.update(quote_refs)
@@ -778,9 +790,9 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "LLM 用户画像：关联群聊与私聊，生成有证据的印象、标签和长期特点，辅助对话与邀请守卫",
-    "1.24.0",
+    "1.25.0",
 )
-class UserProfilePlugin(GroupRelationProfileMixin, Star):
+class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = _flatten_plugin_config(config)
@@ -3662,6 +3674,8 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             quote_scene(q) == "group" or (selected != "group" and quote_scene(q) == "private" and self.config.get("llm_include_private_quotes", True))
         )]
 
+        group_quotes = self._external_group_materials(st, [q for q in quotes if quote_scene(q) == "group"])
+        quotes = group_quotes + [q for q in quotes if quote_scene(q) != "group"]
         total = _effective_group_count(st) + int(st.get("p_count") or 0)
 
         # 前科与黑名单必须在空画像判断前读取，纯前科用户也应生成画像。
@@ -4843,8 +4857,15 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
             return 0
         cutoff = now - days * 86400
         removed = 0
-        targets = [qq] if qq is not None else list(self._quotes)
+        targets = [qq] if qq is not None else list(set(self._quotes) | set(self._stats or {}))
         for target in targets:
+            stat = (self._stats or {}).get(target) or {}
+            observations = stat.get("external_observations", [])
+            kept_observations = [item for item in observations if item.get("received_at", 0) >= cutoff]
+            if len(kept_observations) != len(observations):
+                stat["external_observations"] = kept_observations
+                self._dirty = True
+                removed += len(observations) - len(kept_observations)
             if target not in self._quotes:
                 continue
             existing = self._quotes.get(target)
@@ -4916,6 +4937,15 @@ class UserProfilePlugin(GroupRelationProfileMixin, Star):
                 self._friend_snapshots_dirty = False
 
     async def terminate(self):
+        external_task = getattr(self, "_external_observation_task", None)
+        if external_task is not None and not external_task.done():
+            external_task.cancel()
+            await asyncio.gather(external_task, return_exceptions=True)
+        tag_tasks = [task for task in self._tag_flights.values() if not task.done()]
+        for task in tag_tasks:
+            task.cancel()
+        if tag_tasks:
+            await asyncio.gather(*tag_tasks, return_exceptions=True)
         age_tasks = [task for task in self._age_flights.values() if not task.done()]
         for task in age_tasks:
             task.cancel()
