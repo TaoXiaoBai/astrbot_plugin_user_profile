@@ -138,36 +138,34 @@ class GroupRelationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("不是指令或人格", text)
             self.assertIn("不得外泄私聊或自动处罚", text)
 
-    async def test_partial_claims_preserve_missing_and_newer_guard_relations(self):
+    async def test_profile_preserves_all_legacy_guard_system_relations(self):
         p = self.make_plugin()
         await p.record_bot_group_relation(self.record())
-        for revision, retained in ((1, False), (2, True)):
-            req = types.SimpleNamespace(system_prompt='<guard_group_relations>\n<!-- guard-group-relation:{"22222":' + str(revision) + '} -->covered-or-newer\n<!-- guard-group-relation:{"77777":1} -->pending-missing\n</guard_group_relations>')
+        for revision in (1, 2):
+            original = '<guard_group_relations>\n<!-- guard-group-relation:{"22222":' + str(revision) + '} -->covered-or-newer\n<!-- guard-group-relation:{"77777":1} -->pending-missing\nlegacy-missing\n</guard_group_relations>'
+            req = fixtures.ProfileRequest(system_prompt=original)
             await p.on_llm_request(Event({}, group=""), req)
-            self.assertIn("pending-missing", req.system_prompt)
-            self.assertEqual("covered-or-newer" in req.system_prompt, retained)
-            self.assertIn("<guard_group_relations>", req.system_prompt)
-        req = types.SimpleNamespace(system_prompt='<guard_group_relations>\n<!-- guard-group-relation:{"22222":1} -->covered\nlegacy-missing\n</guard_group_relations>')
-        await p.on_llm_request(Event({}), req)
-        self.assertIn("legacy-missing", req.system_prompt)
-        self.assertNotIn("-->covered", req.system_prompt)
+            self.assertEqual(req.system_prompt, original)
+            self.assertIn(RELATION_MARKER, req.extra_user_content_parts[0].text)
+            self.assertTrue(req.extra_user_content_parts[0]._no_save)
         p = self.make_plugin()
-        req = types.SimpleNamespace(system_prompt="<guard_group_relations>legacy-unclaimed</guard_group_relations>")
+        req = fixtures.ProfileRequest(system_prompt="<guard_group_relations>legacy-unclaimed</guard_group_relations>")
         await p.on_llm_request(Event({}), req)
-        self.assertIn("legacy-unclaimed", req.system_prompt)
-        self.assertNotIn(RELATION_MARKER, req.system_prompt)
+        self.assertEqual(req.system_prompt, "<guard_group_relations>legacy-unclaimed</guard_group_relations>")
+        self.assertNotIn(RELATION_MARKER, "\n".join(part.text for part in req.extra_user_content_parts))
 
-    async def test_marker_removes_only_guard_fallback(self):
+    async def test_relation_marker_is_temporary_and_idempotent(self):
         p = self.make_plugin()
         await p.record_bot_group_relation(self.record())
-        req = types.SimpleNamespace(system_prompt='guard blacklist rule\n<guard_group_relations>\n<!-- guard-group-relation:{"22222":1} -->old relation\n</guard_group_relations>')
+        original = 'guard blacklist rule\n<guard_group_relations>\n<!-- guard-group-relation:{"22222":1} -->old relation\n</guard_group_relations>'
+        req = fixtures.ProfileRequest(system_prompt=original)
         await p.on_llm_request(Event({}), req)
-        self.assertIn("guard blacklist rule", req.system_prompt)
-        self.assertNotIn("old relation", req.system_prompt)
-        self.assertEqual(req.system_prompt.count(RELATION_MARKER), 1)
-        before = req.system_prompt
+        self.assertEqual(req.system_prompt, original)
+        self.assertEqual(req.extra_user_content_parts[0].text.count(RELATION_MARKER), 1)
+        before = list(req.extra_user_content_parts)
         await p.on_llm_request(Event({}), req)
-        self.assertEqual(before, req.system_prompt)
+        self.assertEqual(before, req.extra_user_content_parts)
+        self.assertEqual(req.system_prompt, original)
 
     async def test_guard_to_profile_real_delivery_recovery_delete_and_markers(self):
         directory = pathlib.Path(__file__).resolve().parents[2] / "astrbot_plugin_group_invite_guard"
@@ -206,13 +204,15 @@ class GroupRelationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(guard._kv["bot_group_relations_v1"]["pending"])
         self.assertEqual(len(profile._group_relations), 1)
         event = Event({})
-        req = types.SimpleNamespace(system_prompt="base")
+        req = fixtures.ProfileRequest(system_prompt="base")
         await guard.on_llm_request(event, req)
         self.assertIn("guard_group_relations", req.system_prompt)
+        guard_prompt = req.system_prompt
         await profile.on_llm_request(event, req)
-        self.assertNotIn("guard_group_relations", req.system_prompt)
+        self.assertEqual(req.system_prompt, guard_prompt)
         self.assertIn("blacklist rule", req.system_prompt)
-        self.assertEqual(req.system_prompt.count(RELATION_MARKER), 1)
+        self.assertEqual(req.extra_user_content_parts[0].text.count(RELATION_MARKER), 1)
+        self.assertTrue(req.extra_user_content_parts[0]._no_save)
         old_record = next(iter(guard._kv["bot_group_relations_v1"]["records"].values()))
         await profile.delete_profile_command(Event({}, group="", text="/画像删除"))
         guard._kv["bot_group_relations_v1"]["pending"][old_record["event_key"]] = old_record
@@ -223,9 +223,11 @@ class GroupRelationTests(unittest.IsolatedAsyncioTestCase):
         await guard.record_bot_group_relation(platform_id="snowluma", self_id="99999", group_id="22222", membership="OUT", evidence="leave notice", event_key="new-lifecycle")
         self.assertEqual(len(profile._group_relations), 1)
         self.assertEqual(next(iter(profile._group_relations.values()))["membership"], "OUT")
-        req = types.SimpleNamespace(system_prompt="base")
+        req = fixtures.ProfileRequest(system_prompt="base")
         await profile.on_llm_request(event, req)
+        self.assertEqual(req.system_prompt, "base")
         await guard.on_llm_request(event, req)
-        self.assertNotIn("guard_group_relations", req.system_prompt)
+        self.assertIn("guard_group_relations", req.system_prompt)
         self.assertIn("blacklist rule", req.system_prompt)
-        self.assertEqual(req.system_prompt.count(RELATION_MARKER), 1)
+        self.assertEqual(req.extra_user_content_parts[0].text.count(RELATION_MARKER), 1)
+        self.assertIn("近期确认已离群", req.extra_user_content_parts[0].text)

@@ -3,7 +3,7 @@ display_name: 用户画像
 short_desc: LLM 关联群聊与私聊，生成有证据的印象、标签和长期特点
 desc: LLM 驱动的独立 QQ 用户画像插件。持续积累群聊、私聊、社交来源和管理记录，由 LLM 结合真实发言分析表达方式、兴趣、互动习惯与内容风险，输出带依据的标签、人物印象和长期特点；长期特点具有跨日证据台账，风险评分区分未审查、当前有效和沿用旧画像。模型故障时保留最后成功画像，支持图片输出、历史扫描、细粒度权限及邀请守卫联动。
 author: Kimi
-version: 1.25.0
+version: 1.25.1
 repo: https://github.com/TaoXiaoBai/astrbot_plugin_user_profile
 social_link: https://github.com/TaoXiaoBai
 tags:

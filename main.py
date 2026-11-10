@@ -37,10 +37,10 @@ except ImportError:
 
 try:
     from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
-    from .group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER, merge_guard_fallback
+    from .group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER
 except ImportError:
     from scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
-    from group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER, merge_guard_fallback
+    from group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER
 
 try:
     from .profile_core import (
@@ -790,7 +790,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "LLM 用户画像：关联群聊与私聊，生成有证据的印象、标签和长期特点，辅助对话与邀请守卫",
-    "1.25.0",
+    "1.25.1",
 )
 class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -983,8 +983,10 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         if not self._enabled() or not self.config.get("llm_context_inject", True):
             return
         try:
-            existing = str(getattr(req, "system_prompt", None) or "")
-            if _LLM_CONTEXT_MARKER in existing:
+            parts = getattr(req, "extra_user_content_parts", None)
+            if not isinstance(parts, list):
+                return
+            if any(_LLM_CONTEXT_MARKER in str(getattr(part, "text", "")) for part in parts):
                 return
             qq = str(event.get_sender_id() or "").strip()
             if not re.fullmatch(r"\d{5,12}", qq):
@@ -1001,8 +1003,13 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             block = await self._build_conversation_profile_context(qq, event)
             if not block:
                 return
-            existing = merge_guard_fallback(existing, block)
-            req.system_prompt = f"{existing}\n\n{block}" if existing else block
+            from astrbot.core.agent.message import TextPart
+
+            part = TextPart(text=block)
+            mark_as_temp = getattr(part, "mark_as_temp", None)
+            if not callable(mark_as_temp):
+                return
+            parts.append(mark_as_temp())
         except asyncio.CancelledError:
             raise
         except Exception as exc:
