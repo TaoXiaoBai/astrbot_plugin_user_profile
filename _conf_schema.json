@@ -140,6 +140,72 @@
         "type": "bool",
         "default": true,
         "hint": "注入脱敏的当前好友关系。好友列表中消失只表示关系缺失且原因未知，不推断是谁删除了谁。"
+      },
+      "yellow_badge_enabled": {
+        "description": "启用趣味大小黄标",
+        "type": "bool",
+        "default": true,
+        "hint": "纯娱乐提醒：已有缓存画像中的刷屏、广告、抬杠/钓鱼、不适宜内容、敏感倾向或诈骗嫌疑标签达到置信阈值时，由插件在正常答复发送后单独发送一条黄标，不修改LLM正文。诈骗嫌疑或严重不适宜内容使用大黄标，其余使用小黄标；不把标签当成事实定性。独立于普通画像注入开关，只读缓存，不直接新增模型调用；静默临时拉黑由下方独立高风险开关控制，默认关闭。"
+      },
+      "yellow_badge_min_confidence": {
+        "description": "黄标标签置信阈值",
+        "type": "float",
+        "default": 0.6,
+        "hint": "范围0-1，默认0.6。任一允许场景的语义关注标签达到阈值才触发；正向、兴趣、统计和管理标签不触发。群聊只按群聊公开标签提醒，避免把私聊派生标签公开。"
+      },
+      "yellow_badge_review_tool": {
+        "description": "黄标前请求模型后台复核画像",
+        "type": "bool",
+        "default": true,
+        "hint": "仅当前请求实际提供且启用user_profile_query时，通过临时内容提示模型在最终回答前调用一次工具复核；提示明确禁止模型自己输出黄标。没有工具、工具关闭或权限拒绝时不注入复核任务，也不影响插件独立发送黄标。实际是否调用由聊天模型与框架决定；插件不强制新增Agent步骤。"
+      },
+      "yellow_badge_major_message": {
+        "description": "自定义大黄标文案",
+        "type": "string",
+        "default": "",
+        "hint": "最长200字符；留空使用内置文案。支持{level}替换为大黄标、{tags}替换为最多3个命中标签及置信度。正常答复完成后由插件单独发送一次，不经过LLM，不拼进正文。"
+      },
+      "yellow_badge_minor_message": {
+        "description": "自定义小黄标文案",
+        "type": "string",
+        "default": "",
+        "hint": "最长200字符；留空使用内置文案。支持{level}和{tags}占位符。正常答复完成后由插件单独发送一次。黄标只是历史画像趣味提醒，不代表当前发言违规，不应使用羞辱或定罪措辞。"
+      }
+    }
+  },
+  "yellow_badge_auto_ban": {
+    "description": "大黄标静默临时拉黑（高风险）",
+    "type": "object",
+    "items": {
+      "yellow_badge_auto_ban_enabled": {
+        "description": "启用持续严重违规自动临时拉黑",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭。开启后仍需启用大小黄标和QQ黑名单联动，并安装支持set_temporary_safety_ban的QQ Tools。只有当前大黄标对应维度存在足够的本人severe/critical风险事件，且不同episode数量和持续时长均达标，才静默写入source=yellow_badge的临时黑名单；不向用户通知，不停止本轮正常答复，仅记录后台日志。普通黄标、标签展示次数、第三人事件和没有严重事件台账的旧标签不会触发。管理员豁免。"
+      },
+      "yellow_badge_auto_ban_min_events": {
+        "description": "所需不同严重违规事件数",
+        "type": "int",
+        "default": 3,
+        "hint": "范围2-20，默认3。按不同episode去重，同一事件跨维度不重复计数；每次普通发言或黄标展示不增加次数。事件必须属于当前大黄标对应维度、subject=self、置信度达到黄标阈值，且severity为severe或critical。"
+      },
+      "yellow_badge_auto_ban_sustain_seconds": {
+        "description": "大黄标严重事件持续秒数",
+        "type": "int",
+        "default": 86400,
+        "hint": "范围0-2592000，默认86400（24小时）。从窗口内最早合格事件到当前的时间必须达到该值；0表示不等待。不是按本轮黄标展示开始计时，重启不会清零真实事件时间。"
+      },
+      "yellow_badge_auto_ban_window_days": {
+        "description": "严重违规统计窗口（天）",
+        "type": "int",
+        "default": 7,
+        "hint": "范围1-30，默认7天。只统计此窗口内带真实时间的合格风险事件；窗口过短可能导致持续时长永远无法达到，建议持续秒数不超过窗口天数。"
+      },
+      "yellow_badge_auto_ban_duration_seconds": {
+        "description": "临时黑名单时长（秒）",
+        "type": "int",
+        "default": 86400,
+        "hint": "范围60-604800，默认86400（24小时），由QQ Tools原子保存，最长7天。已有本功能活动限制时不重复写入；到期后必须出现晚于上次拉黑时间的新严重违规才允许再次执行，避免同一旧画像无限续封。误判可在QQ Tools配置中删除source=yellow_badge的条目。"
       }
     }
   },
@@ -281,6 +347,54 @@
       }
     }
   },
+  "behavior_tracking": {
+    "description": "行为轨迹与长期拉黑记忆清理",
+    "type": "object",
+    "items": {
+      "behavior_tracking_enabled": {
+        "description": "启用按日行为轨迹",
+        "type": "bool",
+        "default": true,
+        "hint": "在既有批量落盘路径中按本机日期聚合群/私发言、图片、链接、@、字符和夜间消息，不额外保存原话、不在采集热路径调用LLM或网络。画像展示近30天活跃天数、连续活跃和前后窗口趋势；聚合统计只能作为memory_kind=behavior的长期记忆证据，不能生成标签或风险事件。关闭后停止新增日聚合，旧数据保留。"
+      },
+      "behavior_history_days": {
+        "description": "按日行为聚合保留天数",
+        "type": "int",
+        "default": 90,
+        "hint": "范围7-365，默认90天。每个用户最多保留该数量的按日统计项，超限在新消息采集时清理；不根据旧会话伪造每日行为。"
+      },
+      "account_link_tracking_enabled": {
+        "description": "追踪近期拉黑后的换号续聊线索",
+        "type": "bool",
+        "default": true,
+        "hint": "默认开启。新账号明确尝试接续刚才/上次聊天，或召回此前互动、头像、昵称等资料，且近期存在仍有效的手动拉黑账号时，结合换号/封禁措辞、共同群和足够样本的行为统计生成疑似关联线索。单纯历史召回按弱证据处理。只保存规则信号和时间，不额外保存用于关联的原话；不确认同一人、不增加风险分、不自动拉黑或续封。依赖被动采集和QQ黑名单联动。"
+      },
+      "account_link_window_days": {
+        "description": "换号续聊关联窗口（天）",
+        "type": "int",
+        "default": 7,
+        "hint": "范围1-30，默认7天。只关联窗口内被手动拉黑且仍有效的账号；目标解封、记录过期或超出窗口后不再展示为当前关联。年龄/黄标等temporary_safety_ban不参与此功能。"
+      },
+      "banned_memory_cleanup_enabled": {
+        "description": "长期拉黑后安全删除画像记忆",
+        "type": "bool",
+        "default": true,
+        "hint": "默认开启。QQ Tools中当前仍有效的同一QQ拉黑达到保留天数后，复用手动删除的代际保护，删除统计、原话、LLM画像、长期特点、管理/禁言事件和群关系，不删除QQ Tools黑名单本身。清理期间暂停被动消息、社交事件、外部材料及查询驱动的画像重建；解封后从新数据重新开始。删除保护账本不可用时跳过，绝不强行删除。"
+      },
+      "banned_memory_retention_days": {
+        "description": "长期拉黑记忆保留天数",
+        "type": "int",
+        "default": 30,
+        "hint": "范围1-3650，默认30天。按当前仍有效拉黑记录的最早有效ban_time计算；已过期、未来时间、无效记录或QQ Tools读取失败均不清理。请谨慎设置较短天数，删除后旧记忆不可恢复。"
+      },
+      "banned_memory_cleanup_interval": {
+        "description": "长期拉黑清理检查间隔（秒）",
+        "type": "int",
+        "default": 3600,
+        "hint": "范围60-86400，默认3600秒。检查挂在既有定时落盘循环中，即使没有其他脏数据也会执行；不另建全库扫描线程，不发送用户通知，仅写后台日志。"
+      }
+    }
+  },
   "history_scan": {
     "description": "历史扫描",
     "type": "object",
@@ -349,7 +463,13 @@
         "description": "启用长期特点记忆",
         "type": "bool",
         "default": true,
-        "hint": "让 LLM 判断哪些稳定偏好、长期兴趣、持续沟通风格或反复行为值得保留。新特点必须引用本次真实且带时间的材料；程序累积有界证据日期和场景，support_count仅统计当前保留的不同证据ref（最多16），区分初步观察与跨日确认。近期没提及、模型省略或空数组不会删除旧特点，只有当前证据支持的明确撤回才移除；群私融合不伪造新确认。临时情绪、敏感信息和管理风险不应写入。模型失败保留最后成功画像。关闭后不再请求或展示，已有数据保留。"
+        "hint": "让 LLM 判断哪些稳定偏好、长期兴趣、持续沟通风格或反复行为值得保留，并用memory_kind=preference/interest/communication/behavior分类。新特点必须引用本次真实且带时间的材料并达到置信阈值；程序累积有界证据日期和场景，support_count仅统计当前保留的不同证据ref（最多16），区分初步观察与跨日确认。按日行为统计只能支持behavior记忆，不能支持偏好/兴趣/沟通或风险证据。近期没提及、模型省略或空数组不会删除旧特点，只有当前证据支持的明确撤回才移除；群私融合不伪造新确认。临时情绪、敏感信息和管理风险不应写入。模型失败保留最后成功画像。关闭后不再请求或展示，已有数据保留。"
+      },
+      "llm_long_term_min_confidence": {
+        "description": "长期记忆最低置信度",
+        "type": "float",
+        "default": 0.75,
+        "hint": "范围0-1，默认0.75。只拦本次新增或再次确认的长期记忆候选，低于阈值不写入；已保存特点不会仅因调高超限而被静默删除。该值是模型对证据可靠性的自评，不是事实概率。行为统计、第三人材料和无时间引用仍须通过独立程序校验。"
       },
       "llm_provider_id": {
         "description": "画像分析模型",
@@ -494,7 +614,7 @@
         "description": "联动 QQ 黑名单",
         "type": "bool",
         "default": true,
-        "hint": "只读QQ Tools活动黑名单生成ban_history；过期/无效条目及owned年龄保护临时限制不计处罚分，旧无duration条目兼容永久。命令静默仍识别所有活动限制。插件未安装或读取失败自动跳过，不执行写操作。"
+        "hint": "读取QQ Tools活动黑名单生成ban_history；过期/无效条目及owned年龄保护临时限制不计处罚分，旧无duration条目兼容永久。命令静默仍识别所有活动限制。插件未安装或读取失败自动跳过。默认只读；仅另行开启yellow_badge_auto_ban_enabled且满足严重事件门槛时，才通过QQ Tools安全API写入source=yellow_badge的临时限制，不直接修改配置。"
       },
       "silent_for_banned": {
         "description": "黑名单用户命令静默",

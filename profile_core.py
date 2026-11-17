@@ -15,7 +15,7 @@ except ImportError:
 
 
 LLM_SCHEMA_VERSION = 5  # 缓存隐私/可见性兼容版本
-LLM_PROMPT_VERSION = 13  # 只触发刷新，不让旧成功画像在升级后消失
+LLM_PROMPT_VERSION = 14  # 只触发刷新，不让旧成功画像在升级后消失
 
 
 def quote_scene(item: dict) -> str:
@@ -66,6 +66,23 @@ _DEFAULTS = {
     "llm_context_max_chars": 2000,
     "llm_context_include_management": True,
     "llm_context_include_social": True,
+    "yellow_badge_enabled": True,
+    "yellow_badge_min_confidence": 0.6,
+    "yellow_badge_review_tool": True,
+    "yellow_badge_major_message": "",
+    "yellow_badge_minor_message": "",
+    "yellow_badge_auto_ban_enabled": False,
+    "yellow_badge_auto_ban_min_events": 3,
+    "yellow_badge_auto_ban_sustain_seconds": 86400,
+    "yellow_badge_auto_ban_window_days": 7,
+    "yellow_badge_auto_ban_duration_seconds": 86400,
+    "behavior_tracking_enabled": True,
+    "behavior_history_days": 90,
+    "account_link_tracking_enabled": True,
+    "account_link_window_days": 7,
+    "banned_memory_cleanup_enabled": True,
+    "banned_memory_retention_days": 30,
+    "banned_memory_cleanup_interval": 3600,
     "friend_reconcile_enabled": True,
     "friend_reconcile_interval": 21600,
     "card_show_tags": True,
@@ -100,6 +117,7 @@ _DEFAULTS = {
     "llm_max_concurrency": 3,
     "llm_material_max_chars": 6000,
     "llm_long_term_memory": True,
+    "llm_long_term_min_confidence": 0.75,
     "age_protection_enabled": True,
     "age_protection_use_qq_age": True,
     "age_protection_qq_age_weight": 85,
@@ -181,6 +199,14 @@ _INT_RULES = {
     "risk_level_extreme": (0, 100),
     "tease_guard_window_seconds": (60, 86400),
     "tease_guard_min_queries": (2, 50),
+    "yellow_badge_auto_ban_min_events": (2, 20),
+    "yellow_badge_auto_ban_sustain_seconds": (0, 30 * 86400),
+    "yellow_badge_auto_ban_window_days": (1, 30),
+    "yellow_badge_auto_ban_duration_seconds": (60, 7 * 86400),
+    "behavior_history_days": (7, 365),
+    "account_link_window_days": (1, 30),
+    "banned_memory_retention_days": (1, 3650),
+    "banned_memory_cleanup_interval": (60, 86400),
 }
 
 _FLOAT_RULES = {
@@ -189,6 +215,8 @@ _FLOAT_RULES = {
     "tag_mention_threshold": (0.0, 1.0),
     "tag_night_threshold": (0.0, 1.0),
     "tease_guard_min_confidence": (0.0, 1.0),
+    "yellow_badge_min_confidence": (0.0, 1.0),
+    "llm_long_term_min_confidence": (0.0, 1.0),
 }
 
 
@@ -317,8 +345,10 @@ def sanitize_long_term_traits(raw: Any) -> list[dict]:
         raw_days = raw_days if isinstance(raw_days, (list, tuple)) else []
         raw_scenes = item.get("scenes")
         raw_scenes = raw_scenes if isinstance(raw_scenes, (list, tuple)) else []
+        memory_kind = item.get("memory_kind")
         entry = {
             "trait": trait,
+            "memory_kind": memory_kind if memory_kind in ("preference", "interest", "communication", "behavior") else "behavior",
             "confidence": round(max(0.0, min(1.0, confidence)), 2),
             "reason": clean_text(item.get("reason", item.get("evidence")), 160),
             "first_seen": _bounded_int(item.get("first_seen"), 0, 0, 2**63 - 1),

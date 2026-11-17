@@ -132,9 +132,12 @@ async def analyze(plugin, qq, st, quotes, base_tags, event=None):
     generation = plugin._user_generation(qq)
     for scene in allowed:
         material = [q for q in quotes if isinstance(q, dict) and quote_scene(q) == scene]
-        if not material:
+        if not material and not st.get("behavior_days"):
             continue
         branch_stats = {"g_count": max(int(st.get("g_count") or 0), int(st.get("platform_history_count") or 0))} if scene == "group" else {"p_count": st.get("p_count", 0)}
+        branch_stats["behavior_days"] = st.get("behavior_days", {})
+        branch_stats["g_last"] = st.get("g_last", 0)
+        branch_stats["p_last"] = st.get("p_last", 0)
         await slot_analysis(plugin, qq, scene, material, branch_stats, [], captured_policy, generation)
     if selected == "fused" and captured_policy == policy(plugin) and generation == plugin._user_generation(qq):
         root = (plugin._tags_cache or {}).get(qq) or {}
@@ -283,6 +286,7 @@ async def slot_analysis(plugin, qq, scene, material, st, tags, captured_policy, 
                                 analysis["long_term_traits"] = review_long_term_traits(
                                     previous_memory, analysis["long_term_traits"], retired_traits,
                                     materials, int(time.time()),
+                                    min_confidence=plugin.config["llm_long_term_min_confidence"],
                                 )
                             else:
                                 analysis["long_term_traits"] = previous_memory

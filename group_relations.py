@@ -83,6 +83,8 @@ class GroupRelationProfileMixin:
         generations = {qq: self._user_generation(qq) for qq in people}
         try:
             await self._ensure_loaded()
+            if any(self._is_long_banned(qq, int(time.time())) for qq in people):
+                return {"status": "long_banned_deleted"}
             if not await self._ensure_mute_delete_cutoffs_available():
                 return {"status": "failure"}
             async with self._store_lock:

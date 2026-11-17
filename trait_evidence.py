@@ -42,6 +42,8 @@ def _stability(item):
 def _record(item):
     result = deepcopy(item)
     result["trait"] = item["trait"].strip()
+    kind = item.get("memory_kind")
+    result["memory_kind"] = kind if kind in ("preference", "interest", "communication", "behavior") else "behavior"
     refs = _refs(item)
     result["evidence_refs"] = refs[-16:]
     result["evidence_days"] = _days(item)[-30:]
@@ -63,10 +65,14 @@ def _items(values):
 
 def _valid_refs(item, materials):
     result = []
+    kind = item.get("memory_kind") if item.get("memory_kind") in ("preference", "interest", "communication", "behavior") else "behavior"
     for ref in _refs(item):
         quote = materials.get(ref)
-        if isinstance(quote, dict) and _positive(quote.get("t")):
-            result.append(ref)
+        if not isinstance(quote, dict) or not _positive(quote.get("t")):
+            continue
+        if quote.get("evidence_kind") == "behavior" and kind != "behavior":
+            continue
+        result.append(ref)
     return result
 
 
@@ -79,7 +85,7 @@ def _evidence_times(item, timestamps):
         item["last_evidence_at"] = max(times)
 
 
-def review_long_term_traits(previous, current, retired, materials, now) -> list[dict]:
+def review_long_term_traits(previous, current, retired, materials, now, min_confidence=0.6) -> list[dict]:
     materials = materials if isinstance(materials, dict) else {}
     records = {}
     for item in _items(previous):
@@ -90,6 +96,9 @@ def review_long_term_traits(previous, current, retired, materials, now) -> list[
                 records[key]["first_seen"] = now
 
     for item in _items(current):
+        confidence = item.get("confidence")
+        if not _positive(confidence) or confidence > 1 or confidence < min_confidence:
+            continue
         refs = _valid_refs(item, materials)
         if not refs:
             continue
@@ -97,12 +106,16 @@ def review_long_term_traits(previous, current, retired, materials, now) -> list[
         if key in records:
             record = records[key]
         else:
+            kind = item.get("memory_kind")
             record = {"trait": item["trait"].strip(), "first_seen": now,
+                      "memory_kind": kind if kind in ("preference", "interest", "communication", "behavior") else "behavior",
                       "evidence_refs": [], "evidence_days": [], "scenes": [], "support_count": 0}
             records[key] = record
         for field in ("confidence", "reason"):
             if field in item:
                 record[field] = deepcopy(item[field])
+        if item.get("memory_kind") in ("preference", "interest", "communication", "behavior"):
+            record["memory_kind"] = item["memory_kind"]
         old_refs = record["evidence_refs"]
         record["evidence_refs"] = _unique(old_refs + refs)[-16:]
         record["support_count"] = len(record["evidence_refs"])
@@ -138,6 +151,7 @@ def merge_scene_long_term_traits(group_items, private_items) -> list[dict]:
         if confidence > record.get("confidence", 0):
             record["confidence"] = deepcopy(confidence)
             record["reason"] = deepcopy(incoming.get("reason", ""))
+            record["memory_kind"] = incoming["memory_kind"]
         first_seen = [value for value in (record.get("first_seen"), incoming.get("first_seen")) if _positive(value)]
         if first_seen:
             record["first_seen"] = min(first_seen)

@@ -67,6 +67,8 @@ class ExternalObservationMixin:
             return {"status": "collection_disabled"}
         generation = self._user_generation(qq)
         await self._ensure_loaded()
+        if self._is_long_banned(qq, int(time.time())):
+            return {"status": "long_banned_deleted"}
         if not hasattr(self, "_external_observation_queue"):
             self._external_observation_queue = asyncio.Queue(maxsize=32)
             self._external_observation_task = None

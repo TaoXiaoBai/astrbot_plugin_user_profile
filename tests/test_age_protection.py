@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from tests.test_plugin import Event
-from tests import test_plugin as fixtures
+import test_plugin as fixtures
 from age_protection import collect_materials, hard_age, sanitize
 
 

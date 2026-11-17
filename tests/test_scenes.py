@@ -226,6 +226,7 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.make_plugin({
             "cross_scene_link_enabled": False, "llm_tag_cache_ttl": 0,
             "llm_failure_cache_ttl": 0, "llm_refresh_interval": 0,
+            "llm_long_term_min_confidence": 0.6,
         })
         await plugin._ensure_loaded()
         plugin._stats["11111"] = dict(_new_stat(), g_count=2)

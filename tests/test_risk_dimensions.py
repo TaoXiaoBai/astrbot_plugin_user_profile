@@ -5,7 +5,7 @@ import types
 import unittest
 from unittest.mock import AsyncMock
 
-from tests import test_plugin as fixtures
+import test_plugin as fixtures
 from profile_core import sanitize_llm_analysis, sanitize_long_term_traits
 from risk_dimensions import material_refs, sanitize_events, merge_events, score_dimensions
 from scene_profiles import slot_analysis, policy

@@ -29,6 +29,8 @@ class Filter:
     command = staticmethod(decorator)
     regex = staticmethod(decorator)
     on_llm_request = staticmethod(decorator)
+    on_agent_done = staticmethod(decorator)
+    after_message_sent = staticmethod(decorator)
     llm_tool = staticmethod(decorator)
 
 
@@ -1011,7 +1013,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         req = types.SimpleNamespace(system_prompt="base")
         await plugin.on_llm_request(Event({}), req)
         plugin._build_conversation_profile_context.assert_not_awaited()
-        with patch.object(agent_message, "TextPart", lambda **kw: types.SimpleNamespace(**kw)):
+        with patch.object(sys.modules["astrbot.core.agent.message"], "TextPart", lambda **kw: types.SimpleNamespace(**kw)):
             req = ProfileRequest(system_prompt="base")
             await plugin.on_llm_request(Event({}), req)
         self.assertEqual(req.system_prompt, "base")

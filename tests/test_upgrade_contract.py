@@ -5,7 +5,7 @@ import types
 import unittest
 from unittest.mock import AsyncMock
 
-from tests import test_plugin as fixtures
+import test_plugin as fixtures
 from age_protection import collect_materials, hard_age, history_tail
 from risk_dimensions import material_refs, sanitize_events
 from scene_profiles import policy

@@ -36,6 +36,21 @@ except ImportError:
     from external_observations import ExternalObservationMixin
 
 try:
+    from .yellow_badge import enforcement_event_key, severe_violations
+except ImportError:
+    from yellow_badge import enforcement_event_key, severe_violations
+
+try:
+    from .behavior_tracking import memory_material as behavior_memory_material, record_message as record_behavior_message, summarize as summarize_behavior
+except ImportError:
+    from behavior_tracking import memory_material as behavior_memory_material, record_message as record_behavior_message, summarize as summarize_behavior
+
+try:
+    from .account_links import active_records as active_account_link_records, detect as detect_account_links, display_line as display_account_link, merge_records as merge_account_link_records
+except ImportError:
+    from account_links import active_records as active_account_link_records, detect as detect_account_links, display_line as display_account_link, merge_records as merge_account_link_records
+
+try:
     from .scene_profiles import analyze as analyze_scenes, cached_view, scene_for, conversation_sections, policy as scene_policy
     from .group_relations import GroupRelationProfileMixin, RELATIONS_KEY, RELATION_MARKER
 except ImportError:
@@ -126,6 +141,10 @@ _MANAGEMENT_RESOLUTIONS = frozenset({
 })
 _MANAGEMENT_CLEAR_RESOLUTIONS = frozenset({"appeal_approved", "false_positive"})
 _LLM_CONTEXT_MARKER = "<!-- astrbot-user-profile-context -->"
+_YELLOW_BADGE_MARKER = "<!-- astrbot-user-profile-yellow-badge -->"
+_YELLOW_BADGE_MAJOR_TAGS = frozenset({"scam_suspect"})
+_YELLOW_BADGE_EVENT_KEY = "_user_profile_yellow_badge_state"
+_YELLOW_BADGE_AGENT_DONE_SUPPORTED = hasattr(filter, "on_agent_done")
 
 
 def _normalize_guard_invite_records(records: Any) -> dict[str, list[dict]]:
@@ -168,6 +187,7 @@ _TAG_DISPLAY_NAMES = {
     "bot_deleted_friend": "曾被 bot 主动删除好友",
     "friend_relation_missing": "好友关系曾消失",
     "friend_relation_restored": "好友关系已恢复",
+    "possible_alt_account": "疑似换号续聊（待核实）",
     "image_spammer": "图片消息偏多",
     "link_spammer": "链接消息较多",
     "qr_spammer": "二维码内容较多",
@@ -212,7 +232,8 @@ def _long_term_display(items: Any, include_reason: bool = False) -> list[str]:
     result = []
     for item in sanitize_llm_analysis({"long_term_traits": items})["long_term_traits"]:
         stability = "跨日确认" if item.get("stability") == "established" else "初步观察"
-        text = f"{item['trait']}（{item['confidence']:.0%} · {stability}）"
+        kind = {"preference": "偏好", "interest": "兴趣", "communication": "沟通", "behavior": "行为"}.get(item.get("memory_kind"), "行为")
+        text = f"{item['trait']}（{kind} · {item['confidence']:.0%} · {stability}）"
         if include_reason and item["reason"]:
             text += f"：{item['reason']}"
         result.append(text)
@@ -486,7 +507,7 @@ class TagEngine:
 
     async def generate_llm_tags(self, qq: str, st: dict, quotes: list, base_tags: list, context: Context, config: dict, prior: dict | None = None) -> dict:
         empty = {"tags": [], "impression": "", "traits": [], "long_term_traits": []}
-        if not config.get("llm_tags", True) or not isinstance(quotes, list) or not quotes:
+        if not config.get("llm_tags", True) or not isinstance(quotes, list):
             return empty
         provider_id = config.get("llm_provider_id") or self._default_provider_id(context)
         if not provider_id:
@@ -523,9 +544,23 @@ class TagEngine:
             material_lines.append(line)
             used += len(line) + 1
         material = "\n".join(reversed(material_lines))
+        st = st if isinstance(st, dict) else {}
+        memory_materials = dict(tag_materials)
+        if config.get("llm_long_term_memory", True) and config.get("behavior_tracking_enabled", True):
+            behavior = behavior_memory_material(st, int(time.time()), quote_scene({"scene": "private" if st.get("p_count") and not st.get("g_count") else "group"}))
+            if behavior:
+                behavior_refs = material_refs(qq, [behavior])
+                behavior_ref = quote_tag_ref(qq, behavior, behavior_refs)
+                behavior_line = (
+                    f"- [ref={behavior_ref}; 来源={behavior['scene']}; 时间={behavior['t']}; "
+                    "证据类型=behavior_summary] " + behavior["text"]
+                    + "；仅可用于memory_kind=behavior的长期记忆，不得用于tags或risk_events。"
+                )
+                if used + len(behavior_line) + 1 <= limit:
+                    material = (material + "\n" if material else "") + behavior_line
+                    memory_materials[behavior_ref] = behavior
         if not material:
             return empty
-        st = st if isinstance(st, dict) else {}
         safe_base = [t for t in base_tags if isinstance(t, dict)] if isinstance(base_tags, list) else []
         base_desc = ", ".join(
             f"{_tag_display(str(t.get('tag') or ''))}({t.get('confidence', 0)})"
@@ -584,9 +619,12 @@ class TagEngine:
                 prior_block = "\n".join(lines) + "\n"
         memory_prompt = (
             "、long_term_traits、retired_long_term_traits。long_term_traits 是 0-5 个值得长期记忆的特点，"
-            "每项包含 trait、0 到 1 的 confidence、最多一句 reason、evidence_refs；只描述稳定偏好、"
-            "长期兴趣、持续沟通风格或反复出现的行为特点，不记录临时情绪、一次性事件、"
-            "敏感信息、管理前科或风险结论。新特点必须引用当前真实且有时间的r_材料；"
+            "每项包含 trait、memory_kind(preference/interest/communication/behavior)、0 到 1 的 confidence、"
+            "最多一句 reason、evidence_refs；只描述稳定偏好、长期兴趣、持续沟通风格或反复出现的行为特点，"
+            "不记录临时情绪、一次性事件、敏感信息、管理前科或风险结论。"
+            f"confidence低于{config.get('llm_long_term_min_confidence', 0.75):.2f}的候选不要输出。"
+            "新特点必须引用当前真实且有时间的r_材料；behavior_summary统计不是本人原话，"
+            "只能支持memory_kind=behavior，不能支持偏好/兴趣/沟通记忆，也不能用于tags或risk_events。"
             "已有特点只有获得当前材料支持时才再次填写refs进行确认，无新证据时保留原项且refs留空。"
             "近期没提及或返回空数组不会删除旧特点；只有当前材料明确反驳旧特点时，才把含trait和当前"
             "evidence_refs的项放入retired_long_term_traits。程序会累积证据日期并判断稳定程度"
@@ -685,7 +723,7 @@ class TagEngine:
         retired = decoded.get("retired_long_term_traits")
         analysis["_retired_long_term_traits"] = retired[:5] if isinstance(retired, list) else []
         # 仅用于写入前校验，不进入画像缓存或插件间快照。
-        analysis["_evidence_materials"] = tag_materials
+        analysis["_evidence_materials"] = memory_materials
         return analysis
 
     @staticmethod
@@ -790,7 +828,7 @@ class SocialEventFilter(filter.CustomFilter):
     "astrbot_plugin_user_profile",
     "Kimi",
     "LLM 用户画像：关联群聊与私聊，生成有证据的印象、标签和长期特点，辅助对话与邀请守卫",
-    "1.25.1",
+    "1.30.3",
 )
 class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Star):
     def __init__(self, context: Context, config: dict):
@@ -812,6 +850,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         self._friend_snapshots_dirty = False
         self._mute_delete_cutoffs_dirty = False
         self._flush_task: asyncio.Task | None = None
+        self._last_banned_cleanup = 0.0
         self._store_lock = asyncio.Lock()
         self._load_lock = asyncio.Lock()
         self._scan_lock = asyncio.Lock()
@@ -980,13 +1019,20 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
 
     @filter.on_llm_request(priority=0)
     async def on_llm_request(self, event, req):
-        if not self._enabled() or not self.config.get("llm_context_inject", True):
+        if not self._enabled():
+            return
+        inject_profile = self.config.get("llm_context_inject", True)
+        inject_badge = self.config.get("yellow_badge_enabled", True)
+        if not inject_profile and not inject_badge:
             return
         try:
             parts = getattr(req, "extra_user_content_parts", None)
             if not isinstance(parts, list):
                 return
-            if any(_LLM_CONTEXT_MARKER in str(getattr(part, "text", "")) for part in parts):
+            existing = [str(getattr(part, "text", "")) for part in parts]
+            has_profile = any(_LLM_CONTEXT_MARKER in text for text in existing)
+            has_badge = hasattr(event, _YELLOW_BADGE_EVENT_KEY)
+            if (has_profile or not inject_profile) and (has_badge or not inject_badge):
                 return
             qq = str(event.get_sender_id() or "").strip()
             if not re.fullmatch(r"\d{5,12}", qq):
@@ -1000,20 +1046,198 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             if qq == self_id:
                 return
             self._schedule_friend_reconcile(event)
-            block = await self._build_conversation_profile_context(qq, event)
-            if not block:
+            blocks = []
+            if inject_profile and not has_profile:
+                try:
+                    block = await self._build_conversation_profile_context(qq, event)
+                    if block:
+                        blocks.append(block)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"user_profile: profile context injection failed: {exc}")
+            if inject_badge and not has_badge:
+                state = {"message": "", "ready": False, "sent": False}
+                setattr(event, _YELLOW_BADGE_EVENT_KEY, state)
+                try:
+                    badge = await self._build_yellow_badge_context(qq, event, req)
+                    state["message"] = badge["message"]
+                    if badge["review"]:
+                        blocks.append(badge["review"])
+                    if badge["message"]:
+                        await self._maybe_auto_ban_yellow_badge(qq, event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"user_profile: yellow badge preparation failed: {exc}")
+            if not blocks:
                 return
             from astrbot.core.agent.message import TextPart
 
-            part = TextPart(text=block)
-            mark_as_temp = getattr(part, "mark_as_temp", None)
-            if not callable(mark_as_temp):
-                return
-            parts.append(mark_as_temp())
+            temporary = []
+            for block in blocks:
+                part = TextPart(text=block)
+                mark_as_temp = getattr(part, "mark_as_temp", None)
+                if not callable(mark_as_temp):
+                    return
+                temporary.append(mark_as_temp())
+            parts.extend(temporary)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(f"user_profile: conversation context injection failed: {exc}")
+
+    def _profile_tool_available(self, req) -> bool:
+        if not self.config.get("enable_llm_tool", True):
+            return False
+        toolset = getattr(req, "func_tool", None)
+        if toolset is None:
+            return False
+        try:
+            tool = toolset.get_tool("user_profile_query")
+            return tool is not None and getattr(tool, "active", True) is not False
+        except Exception:
+            return False
+
+    async def _maybe_auto_ban_yellow_badge(self, qq: str, event) -> dict:
+        """满足严重、多次、持续证据时调用 QQ Tools；绝不向聊天用户发通知。"""
+        if not (
+            self.config.get("yellow_badge_auto_ban_enabled", False)
+            and self.config.get("yellow_badge_enabled", True)
+            and self.config.get("link_qq_tools_ban", True)
+        ):
+            return {"status": "disabled"}
+        _, group_id, is_admin = self._event_identity(event)
+        if is_admin:
+            return {"status": "admin_exempt"}
+        try:
+            metadata = self.context.get_registered_star(QQ_TOOLS_STAR_NAME)
+            instance = getattr(metadata, "star_cls", None) if metadata else None
+            setter = getattr(instance, "set_temporary_safety_ban", None)
+            config = getattr(instance, "config", None)
+            entries = config.get("ban_list", []) if config is not None else []
+            if not callable(setter) or not isinstance(entries, list):
+                return {"status": "unavailable"}
+        except Exception as exc:
+            logger.warning(f"user_profile: yellow badge qq_tools lookup failed: {exc}")
+            return {"status": "unavailable"}
+
+        now = int(time.time())
+        owned = [
+            item for item in entries if isinstance(item, dict)
+            and str(item.get("user_id") or "") == qq
+            and item.get("temporary_safety_ban") is True
+            and item.get("source") == "yellow_badge"
+        ]
+        if any(self._active_ban(item, now) for item in owned):
+            return {"status": "already_active"}
+        analysis = cached_view(
+            self, qq, event, injection=True, scene="group" if group_id else None,
+        )
+        threshold = self.config["yellow_badge_min_confidence"]
+        events = severe_violations(
+            analysis, (self._tags_cache or {}).get(qq) or {}, now, threshold,
+            self.config["yellow_badge_auto_ban_window_days"] * 86400,
+        )
+        if len(events) < self.config["yellow_badge_auto_ban_min_events"]:
+            return {"status": "insufficient_events"}
+        if now - events[0]["observed_at"] < self.config["yellow_badge_auto_ban_sustain_seconds"]:
+            return {"status": "not_sustained"}
+        last_ban = max(
+            (int(_finite_float(item.get("ban_time"), 0)) for item in owned),
+            default=0,
+        )
+        if last_ban and events[-1]["observed_at"] <= last_ban:
+            return {"status": "no_new_violation"}
+        try:
+            result = await setter(
+                qq, duration=self.config["yellow_badge_auto_ban_duration_seconds"],
+                reason="大黄标持续严重违规", source="yellow_badge",
+                event_key=enforcement_event_key(events),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"user_profile: yellow badge temporary ban failed: {exc}")
+            return {"status": "failed"}
+        if not isinstance(result, dict) or result.get("status") != "success":
+            logger.error("user_profile: yellow badge temporary ban was not saved")
+            return {"status": "failed"}
+        if result.get("created") is True:
+            logger.warning(
+                f"user_profile: yellow badge temporary ban applied qq={qq} "
+                f"events={len(events)} duration={self.config['yellow_badge_auto_ban_duration_seconds']}"
+            )
+        return result
+
+    async def _build_yellow_badge_context(self, qq: str, event, req) -> dict:
+        """只读缓存准备独立黄标消息和可选后台复核；公开群聊不使用私聊派生标签。"""
+        await self._ensure_loaded()
+        _, group_id, _ = self._event_identity(event)
+        analysis = cached_view(
+            self, qq, event, injection=True, scene="group" if group_id else None,
+        )
+        threshold = self.config["yellow_badge_min_confidence"]
+        matched = [
+            item for item in analysis["tags"]
+            if item.get("tag") in SEMANTIC_RISK_TAGS
+            and _finite_float(item.get("confidence"), 0) >= threshold
+        ]
+        if not matched:
+            return {"message": "", "review": ""}
+        major = any(
+            item.get("tag") in _YELLOW_BADGE_MAJOR_TAGS
+            or (item.get("tag") == "nsfw_tendency" and item.get("severity") == "severe")
+            for item in matched
+        )
+        level = "大黄标" if major else "小黄标"
+        matched.sort(key=lambda item: _finite_float(item.get("confidence"), 0), reverse=True)
+        labels = "、".join(
+            f"{_tag_display(item['tag'])}（{_finite_float(item.get('confidence'), 0):.0%}）"
+            for item in matched[:3]
+        )
+        default_message = (
+            "我们发现你最近的消息持续违反我们的使用政策。如果这种情况继续，本次对话可能会受到更严格的安全限制。"
+            if major else
+            "我们发现你最近的消息可能违反了我们的使用政策。如果你认为这是误判，可以联系管理员复核。"
+        )
+        config_key = "yellow_badge_major_message" if major else "yellow_badge_minor_message"
+        message = clean_text(self.config.get(config_key), 200) or default_message
+        message = message.replace("{level}", level).replace("{tags}", labels)
+        review = ""
+        if self.config.get("yellow_badge_review_tool", True) and self._profile_tool_available(req):
+            review = (
+                _YELLOW_BADGE_MARKER + "\n<user_profile_yellow_review>\n"
+                f"后台画像复核：在最终答复前调用一次 user_profile_query(qq=\"{qq}\")，只调用一次。"
+                "工具失败或被权限拒绝时不得编造复核结果，不得反复调用。"
+                "复核仅作内部背景，正常回答中不要提及画像、黄标或复核过程，不要自行调用处罚工具；插件会独立处理黄标，无需你输出或附加任何提醒。\n"
+                "</user_profile_yellow_review>"
+            )
+        return {"message": message, "review": review}
+
+    if _YELLOW_BADGE_AGENT_DONE_SUPPORTED:
+        @filter.on_agent_done(priority=0)
+        async def on_yellow_badge_agent_done(self, event, run_context, response):
+            """Agent 最终完成后才允许发送，避免工具通知抢先消耗黄标。"""
+            state = getattr(event, _YELLOW_BADGE_EVENT_KEY, None)
+            if isinstance(state, dict):
+                state["ready"] = True
+
+    @filter.after_message_sent(priority=10001)
+    async def on_yellow_badge_after_message_sent(self, event):
+        """正常答复发出后，由插件另发一条黄标；不修改 LLM 答复。"""
+        state = getattr(event, _YELLOW_BADGE_EVENT_KEY, None)
+        if not isinstance(state, dict) or not state.get("message") or state.get("sent"):
+            return
+        if _YELLOW_BADGE_AGENT_DONE_SUPPORTED and not state.get("ready"):
+            return
+        state["sent"] = True
+        try:
+            await event.send(MessageChain(chain=[Plain(state["message"])]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"user_profile: independent yellow badge send failed: {exc}")
 
     async def _build_conversation_profile_context(self, qq: str, event=None) -> str:
         await self._ensure_loaded()
@@ -1048,9 +1272,10 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         mute_lines = self._format_personal_mute_events(qq)[-3:]
         social = self._format_friend_relation(st)
         relations = self._conversation_relation_lines(qq, event)
+        account_links = self._active_account_links(st)
         if not (has_activity or labels or analysis["impression"] or analysis["traits"]
                 or analysis["long_term_traits"] or management or mute_lines or social
-                or ban_lines or relations or snapshot.get("score") is not None
+                or ban_lines or relations or account_links or snapshot.get("score") is not None
                 or scene_for(self, qq, event, injection=True) == "fused"):
             return ""
         score = snapshot["score"]
@@ -1074,6 +1299,10 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             lines.append("动态群关系：本地资料不足，保留守卫关系补充；不能推断邀请人或在群状态")
         if labels:
             lines.append("标签：" + "、".join(labels))
+        if account_links:
+            lines.append("账号关联线索（仅疑似，不是同一人定论，不自动处罚）：" + "；".join(
+                display_account_link(item) for item in account_links[:2]
+            ))
         impression = clean_text(analysis["impression"], 240)
         if impression:
             lines.append("已有印象：" + impression)
@@ -1144,6 +1373,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         images, mentions = self._message_component_signals(event)
         now = int(time.time())
         await self._ensure_loaded()
+        if self._is_long_banned(qq, now):
+            return
         pruned = []
         async with self._store_lock:
             if generation != self._user_generation(qq):
@@ -1172,16 +1403,33 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
                 st["p_count"] = int(st.get("p_count") or 0) + 1
                 st["p_last"] = now
                 st["p_first"] = int(st.get("p_first") or now)
+            if text and not mentions:
+                mentions += len(re.findall(r"[@＠]\w+", text))
+            links = len(re.findall(r"https?://\S+|www\.\S+", text)) if text else 0
+            night = 0 <= datetime.fromtimestamp(now).hour < 6
             st["images"] = int(st.get("images") or 0) + images
             st["mentions"] = int(st.get("mentions") or 0) + mentions
             if text:
                 st["total_chars"] = int(st.get("total_chars") or 0) + len(text)
-                st["links"] = int(st.get("links") or 0) + len(re.findall(r"https?://\S+|www\.\S+", text))
+                st["links"] = int(st.get("links") or 0) + links
                 st["qrs"] = int(st.get("qrs") or 0) + int(bool(re.search(r"二维码|qr.?code|qrcode", text, re.I)))
-                if not mentions:
-                    st["mentions"] += len(re.findall(r"[@＠]\w+", text))
-            if 0 <= datetime.fromtimestamp(now).hour < 6:
+            if night:
                 st["night_count"] = int(st.get("night_count") or 0) + 1
+            if self.config.get("behavior_tracking_enabled", True):
+                record_behavior_message(
+                    st, now, group=bool(group_id), images=images, links=links,
+                    mentions=mentions, chars=len(text), night=night,
+                    retention_days=self.config["behavior_history_days"],
+                )
+            if self.config.get("account_link_tracking_enabled", True) and text:
+                incoming_links = detect_account_links(
+                    text, qq, st, self._stats, self._qq_tools_ban_list(), now,
+                    group_id, self.config["account_link_window_days"], self._active_ban,
+                )
+                if incoming_links:
+                    st["account_link_clues"] = merge_account_link_records(
+                        st.get("account_link_clues"), incoming_links,
+                    )
             may_store = (
                 text and not text.startswith("/") and self.config.get("store_quotes", True)
                 and (group_id or self.config.get("store_private_quotes", True))
@@ -1290,6 +1538,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             return
 
         await self._ensure_loaded()
+        if self._is_long_banned(qq, int(time.time())):
+            return
         changed = False
         async with self._store_lock:
             if generation != self._user_generation(qq):
@@ -1696,6 +1946,52 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         self._management_events_dirty = True
         return existed
 
+    async def _cleanup_long_banned_memories(self) -> list[str]:
+        """长期有效黑名单的画像安全清除；保留黑名单本身和删除保护账本。"""
+        if not self.config.get("banned_memory_cleanup_enabled", True):
+            return []
+        monotonic = time.monotonic()
+        if monotonic - self._last_banned_cleanup < self.config["banned_memory_cleanup_interval"]:
+            return []
+        self._last_banned_cleanup = monotonic
+        await self._ensure_loaded()
+        if not await self._ensure_mute_delete_cutoffs_available():
+            logger.warning("user_profile: skip banned memory cleanup while deletion cutoffs are unavailable")
+            return []
+        candidates = {
+            str(item.get("user_id") or "")
+            for item in self._qq_tools_ban_list() if isinstance(item, dict)
+            and re.fullmatch(r"\d{5,12}", str(item.get("user_id") or ""))
+        }
+        now = int(time.time())
+        deleted = []
+        for qq in sorted(candidates):
+            if not self._is_long_banned(qq, now):
+                continue
+            async with self._store_lock:
+                has_data = any(qq in store for store in (
+                    self._stats, self._quotes, self._tags_cache,
+                    self._mute_events, self._management_events,
+                )) or any(
+                    qq in (record.get("inviter"), record.get("operator"))
+                    for record in self._group_relations.values() if isinstance(record, dict)
+                )
+                if not has_data:
+                    continue
+                cutoff = int(time.time() * 1000)
+                existed = self._delete_profile_locked(qq)
+                self._mute_delete_cutoffs[qq] = max(
+                    cutoff, int(self._mute_delete_cutoffs.get(qq) or 0)
+                )
+                self._mute_delete_cutoffs_dirty = True
+            await self._cancel_guard_profile_deliveries(qq)
+            async with self._store_lock:
+                self._delete_profile_locked(qq)
+            if existed:
+                deleted.append(qq)
+                logger.warning(f"user_profile: safely purged long-banned memory qq={qq}")
+        return deleted
+
     @filter.command("画像删除")
     async def delete_profile_command(self, event: AstrMessageEvent):
         sender, _, is_admin = self._event_identity(event)
@@ -2071,8 +2367,9 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         )
         mute_tags = self._mute_event_tags(qq)
         management_tags = self._management_event_tags(qq)
+        link_tags = self._account_link_tags(st)
         unique = {}
-        for item in base_tags + mute_tags + management_tags + semantic_tags:
+        for item in base_tags + mute_tags + management_tags + link_tags + semantic_tags:
             name = item.get("tag")
             if name not in unique or tag_strength(item) > tag_strength(unique[name]):
                 unique[name] = item
@@ -2514,9 +2811,13 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
                 "severity": {"mild": "轻微", "clear": "明确", "severe": "严重"}.get(str(item.get("severity")), "明确"),
                 "evidence": clean_text(item.get("evidence"), 160),
             })
+        account_link_lines = [
+            display_account_link(item) for item in result.get("account_links", [])
+            if isinstance(item, dict)
+        ][:3]
         has_record = bool(
             tags or social_lines or criminal_lines or g_count or p_count or quotes
-            or result.get("impression") or result.get("traits")
+            or account_link_lines or result.get("impression") or result.get("traits")
             or result.get("long_term_traits") or result.get("score") is not None
         )
         return self._public_profile_view({
@@ -2549,6 +2850,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
                 ("图片 / 链接 / @", f"{int(_finite_float(stats.get('images'), 0))} / {int(_finite_float(stats.get('links'), 0))} / {int(_finite_float(stats.get('mentions'), 0))}"),
             ],
             "activity": self._format_activity(stats),
+            "account_links": account_link_lines,
             "social": social_lines,
             "criminal": criminal_lines[:10],
             "quotes": quotes,
@@ -2618,6 +2920,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             lines.append("长期特点：" + "、".join(model["long_term_traits"]))
         if model.get("activity"):
             lines.append(model["activity"])
+        if model.get("account_links"):
+            lines.append("账号关联线索（非身份定论）：\n" + "\n".join(model["account_links"]))
         if model.get("social"):
             lines.append("社交来源：\n" + "\n".join(model["social"]))
         if model.get("criminal"):
@@ -3241,6 +3545,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             raise
         except Exception as exc:
             return {"status": "failure", "error": clean_text(exc, 160)}
+        if event_type != "astrbot_unbanned" and self._is_long_banned(qq, int(time.time())):
+            return {"status": "long_banned_deleted"}
         if not await self._ensure_mute_delete_cutoffs_available():
             return {"status": "failure", "error": "delete_cutoffs_unavailable"}
         generation = self._user_generation(qq)
@@ -3375,6 +3681,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             raise
         except Exception as exc:
             return {"status": "failure", "error": clean_text(exc, 160)}
+        if self._is_long_banned(qq, int(time.time())):
+            return {"status": "long_banned_deleted"}
         if not await self._ensure_mute_delete_cutoffs_available():
             return {"status": "failure", "error": "delete_cutoffs_unavailable"}
         generation = self._user_generation(qq)
@@ -3642,7 +3950,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         assessment = self._risk_assessment(
             str(qq), tags, scope=str(analysis.get("scene") or "group")
         )
-        return dict(analysis, **assessment, tags=tags)
+        links = self._active_account_links(self._stats.get(str(qq)) or {})
+        return dict(analysis, **assessment, tags=tags, account_links=links)
 
     async def get_profile_tags(
         self, qq: str, event=None, exclude_request_key: str = ""
@@ -3669,6 +3978,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             return []
 
         await self._ensure_loaded()
+        if self._is_long_banned(qq, int(time.time())):
+            return []
         # 按需回填历史时间/原话（受开关、冷却与 history_complete 控制）
         await self._ensure_history_scanned(qq, event=event)
         st = self._stats.get(qq) or {}
@@ -3698,6 +4009,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         base_tags = self._tag_engine.generate_base_tags(qq, st, quotes, guard_records, ban_lines)
         base_tags.extend(self._mute_event_tags(qq))
         base_tags.extend(self._management_event_tags(qq))
+        base_tags.extend(self._account_link_tags(st))
         has_social = bool(
             int(st.get("friend_add_time") or 0)
             or str(st.get("friend_request_comment") or "").strip()
@@ -3709,7 +4021,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         ):
             return []
 
-        llm_tags = await self._get_or_make_llm_tags(qq, st, quotes, base_tags, event) if quotes else cached_view(self, qq, event)["tags"]
+        llm_tags = await self._get_or_make_llm_tags(qq, st, quotes, base_tags, event) if quotes or st.get("behavior_days") else cached_view(self, qq, event)["tags"]
         unique = {}
         for item in base_tags + llm_tags:
             name = item.get("tag")
@@ -3813,6 +4125,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
             "impression": clean_text(result.get("impression"), 240),
             "traits": [clean_text(value, 48) for value in result.get("traits", []) if clean_text(value, 48)][:5],
             "long_term_traits": copy.deepcopy(result.get("long_term_traits") or []),
+            "account_links": copy.deepcopy(result.get("account_links") or []),
             "activity": activity,
             "social_origin": social,
             "management": management,
@@ -3993,6 +4306,8 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         if total > 0:
             lines.append(f"- 图片/链接/@：{st.get('images', 0)} / {st.get('links', 0)} / {st.get('mentions', 0)}")
             lines.append(f"- 夜间发言：{st.get('night_count', 0)} 条")
+        if st.get("behavior_days"):
+            lines.append("- 行为轨迹：" + summarize_behavior(st, int(time.time()))["text"])
         return "\n".join(lines)
 
     # ---------------- 前科联动（均优雅降级） ----------------
@@ -4133,6 +4448,56 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
         except Exception as exc:
             logger.warning(f"user_profile: ban silence check failed: {exc}")
             return False
+
+    def _qq_tools_ban_list(self) -> list:
+        if not self.config.get("link_qq_tools_ban", True):
+            return []
+        try:
+            metadata = self.context.get_registered_star(QQ_TOOLS_STAR_NAME)
+            instance = getattr(metadata, "star_cls", None) if metadata else None
+            config = getattr(instance, "config", None)
+            entries = config.get("ban_list", []) if config is not None else []
+            return entries if isinstance(entries, list) else []
+        except Exception:
+            return []
+
+    def _long_ban_start(self, qq: str, now: int) -> int:
+        """当前仍有效的连续拉黑起点；读失败时返回0，绝不据此删除。"""
+        starts = []
+        for item in self._qq_tools_ban_list():
+            if not isinstance(item, dict) or str(item.get("user_id") or "") != qq:
+                continue
+            start = int(_finite_float(item.get("ban_time"), -1))
+            if 0 <= start <= now and self._active_ban(item, now):
+                starts.append(start)
+        return min(starts, default=0)
+
+    def _is_long_banned(self, qq: str, now: int) -> bool:
+        if not self.config.get("banned_memory_cleanup_enabled", True):
+            return False
+        start = self._long_ban_start(qq, now)
+        return bool(
+            start and now - start >= self.config["banned_memory_retention_days"] * 86400
+        )
+
+    def _active_account_links(self, st: dict, now: int | None = None) -> list[dict]:
+        if not self.config.get("account_link_tracking_enabled", True):
+            return []
+        now = int(time.time()) if now is None else now
+        return active_account_link_records(
+            st.get("account_link_clues"), self._qq_tools_ban_list(), now,
+            self.config["account_link_window_days"], self._active_ban,
+        )
+
+    def _account_link_tags(self, st: dict) -> list[dict]:
+        records = self._active_account_links(st)
+        if not records:
+            return []
+        best = max(records, key=lambda item: item.get("score", 0))
+        return [self._tag_engine._tag(
+            "possible_alt_account", best["score"], "account_link",
+            display_account_link(best),
+        )]
 
     @staticmethod
     def _active_ban(item: dict, now: float) -> bool:
@@ -4913,6 +5278,7 @@ class UserProfilePlugin(ExternalObservationMixin, GroupRelationProfileMixin, Sta
                 logger.warning(f"user_profile: flush failed: {exc}")
 
     async def _flush(self):
+        await self._cleanup_long_banned_memories()
         if self._stats is None or not (
             self._dirty or self._tags_dirty or self._mute_events_dirty
             or self._management_events_dirty or self._friend_snapshots_dirty
